@@ -811,10 +811,10 @@ class _BrowserSession:
         try:
             if text:
                 await page.get_by_text(text, exact=False).first.click(timeout=8_000)
-                return f"Clicked text: '{text}'"
+                return outcome.unverified("browser_control", "click dispatched; resulting application state was not checked", clicked=True)
             if selector:
                 await page.click(selector, timeout=8_000)
-                return f"Clicked selector: {selector}"
+                return outcome.unverified("browser_control", "click dispatched; resulting application state was not checked", clicked=True)
             return outcome.failed("browser_control",
                                   "no element was named to click")
         except PlaywrightTimeout:
@@ -830,12 +830,20 @@ class _BrowserSession:
         page = await self._get_page()
         try:
             el = page.locator(selector).first if selector else page.locator(":focus")
+            try:
+                before=await el.input_value()
+                is_input=True
+            except Exception:
+                before=await el.inner_text();is_input=False
             if clear_first:
-                await el.clear()
-            await el.type(text, delay=50)
-            # playwright raises when the field is not there, so reaching this
-            # line means the text went into a real input.
-            return outcome.done("browser_control", typed=True, verified=True)
+                await el.fill(text)
+            else:
+                await el.press("End")
+                await el.type(text,delay=15)
+            actual=await el.input_value() if is_input else await el.inner_text()
+            expected=text if clear_first else before+text
+            if actual==expected:return outcome.done("browser_control",typed=True,verified=True,characters=len(text))
+            return outcome.unverified("browser_control","field content did not match the requested text",typed=True,verified=False)
         except Exception as e:
             return f"Type error: {e}"
 

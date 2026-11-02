@@ -127,12 +127,12 @@ def _get_ddgs():
         return DDGS
 
 
-def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
+def _ddg_search(query: str, max_results: int = 6, backend: str = "auto") -> list[dict]:
     DDGS = _get_ddgs()
     results = []
     try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
+        with DDGS(timeout=4) as ddgs:
+            for r in ddgs.text(query, max_results=max_results, backend=backend):
                 results.append({
                     "title":   r.get("title",  ""),
                     "snippet": r.get("body",   ""),
@@ -148,7 +148,7 @@ def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
     DDGS = _get_ddgs()
     results = []
     try:
-        with DDGS() as ddgs:
+        with DDGS(timeout=4) as ddgs:
             for r in ddgs.news(query, max_results=max_results):
                 results.append({
                     "title":   r.get("title",  ""),
@@ -240,14 +240,27 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
 
 # ── Modes ──────────────────────────────────────────────────────────────────────
 
+_QUICK_SEARCH_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _quick_search(query: str) -> str:
+    """One bounded fetch. The live conversation model does the synthesis."""
+    if not _QUICK_SEARCH_SLOTS.acquire(blocking=False):
+        return "Search is busy finishing earlier requests. Try again shortly."
+    def fetch():
+        try:
+            results = _ddg_search(query, max_results=6, backend="duckduckgo")
+            return results or _ddg_search(query, max_results=6)
+        finally:
+            _QUICK_SEARCH_SLOTS.release()
+    results = _run_bounded(fetch, timeout=6.0, label="quick web search")
+    if results is None:
+        return "Search timed out after 6 seconds; no current sources were verified. Try again or request deep research."
+    return _format_ddg(query, results)
+
+
 def _search(query: str) -> str:
-    """Default search — Gemini grounded, DDG fallback."""
-    try:
-        return _gemini_search(query)
-    except Exception as e:
-        _log_gemini_failure("Gemini search", e)
-        results = _ddg_search(query)
-        return _format_ddg(query, results)
+    return _quick_search(query)
 
 
 def _news(query: str) -> str:
@@ -302,14 +315,7 @@ def _research(query: str) -> str:
 
 
 def _price(query: str) -> str:
-    """Product price lookup — searches for current market prices."""
-    price_query = f"current price of {query} — how much does it cost today"
-    try:
-        return _gemini_search(price_query)
-    except Exception as e:
-        _log_gemini_failure("Gemini price", e)
-        results = _ddg_search(f"{query} price buy", max_results=6)
-        return _format_ddg(query, results)
+    return _quick_search(f"{query} current price buy")
 
 
 def _compare(items: list[str], aspect: str) -> str:
@@ -402,7 +408,7 @@ def web_search(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "web_search",
-    "description": "Searches the web. Use for ANY question about current facts, events, prices, or topics — always prefer this over guessing. Modes: 'search' (default), 'news' (latest headlines on a topic), 'research' (deep comprehensive answer), 'price' (product cost lookup), 'compare' (side-by-side comparison of items).",
+    "description": "Searches the web. Use when current facts, events, prices or source verification are needed. Explain stable concepts directly unless the user asks to search or research. Modes: 'search' (default; fast source results without a second model call), 'news' (latest headlines on a topic), 'research' (deep comprehensive answer), 'price' (product cost lookup), 'compare' (side-by-side comparison of items).",
     "parameters": {
         "type": "OBJECT",
         "properties": {

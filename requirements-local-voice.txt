@@ -1,0 +1,3 @@
+# Optional local-command speech recognition
+faster-whisper>=1.2,<2
+av>=11,<17  # decoder API compatible with faster-whisper 1.2

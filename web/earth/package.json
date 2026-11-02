@@ -1,0 +1,1 @@
+{"name":"jarvis-earth-panel","private":true,"version":"1.0.0","description":"Local Earth and maps assets for the JARVIS desktop interface","dependencies":{"cesium":"^1.135.0","leaflet":"^1.9.4"}}

@@ -91,6 +91,13 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
 
 def _capture_screen() -> tuple[bytes, str]:
 
+    from core.screen_workspace import require_screen_permission
+    require_screen_permission()
+    from core.screen_focus import current, capture
+    selected=current()
+    if selected != {'mode':'display','monitor':1}:
+        return _compress(capture(selected), 'PNG')
+
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")
 
@@ -119,6 +126,8 @@ def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
 
     if not _CV2:
         return False
+    from core.camera_permission import require as require_camera_permission
+    require_camera_permission()
     cap = cv2.VideoCapture(index, backend)
     if not cap.isOpened():
         cap.release()
@@ -159,11 +168,14 @@ def _capture_camera() -> tuple[bytes, str]:
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
+    from core.camera_permission import require as require_camera_permission
+    require_camera_permission()
     index   = _get_camera_index()
     backend = _cv2_backend()
     cap     = cv2.VideoCapture(index, backend)
 
     if not cap.isOpened():
+        cap.release()
         raise RuntimeError(f"Camera index {index} could not be opened.")
 
     for _ in range(10):

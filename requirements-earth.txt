@@ -1,0 +1,2 @@
+# Interactive embedded Earth/maps renderer
+PyQt6-WebEngine>=6.11,<7

@@ -31,6 +31,10 @@ from PyQt6.QtCore import (
     QPoint, QPropertyAnimation, QRect, QRectF, QSize, QSizeF, Qt, QTimer,
     QUrl, pyqtSignal,
 )
+from PyQt6.QtCore import QCoreApplication
+if QCoreApplication.instance() is None:
+    QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
@@ -571,7 +575,7 @@ class HudCanvas(QWidget):
         sched = self._visemes
         if sched is not None:
             frames, t0, hop = sched
-            i = int((now - t0) / hop)
+            i = math.floor((now - t0) / hop)
             if 0 <= i < len(frames):
                 # Hand over *every* frame since the last tick, not just the one
                 # under the cursor. This timer runs at 60 Hz but the paint is
@@ -2402,6 +2406,125 @@ class AudioDeviceOverlay(_HudOverlay):
         # should not cost a reconnect.
         if changed:
             self.picked.emit()
+
+
+class RecoveryOverlay(_HudOverlay):
+    """Inspectable history and speech corrections, with disk work off the UI thread."""
+    _loaded = pyqtSignal(int, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedSize(min(620, parent.width() - 24), min(560, parent.height() - 24))
+        self.setStyleSheet(f"RecoveryOverlay {{ background: #000a10; border: 1px solid {C.BORDER_B}; border-radius: 6px; }} QLineEdit, QTextEdit {{ background: #00121a; color: {C.TEXT}; border: 1px solid {C.BORDER}; padding: 5px; }} QLabel {{ color: {C.TEXT}; background: transparent; }}")
+        self._generation = 0
+        self._capture_enabled = True
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        title = QLabel("CONVERSATION RECOVERY")
+        title.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        lay.addWidget(title)
+        info = QLabel("Completed conversation text is saved locally. Recent context can be restored on restart; audio is never recorded.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        search_row = QHBoxLayout()
+        self._query = QLineEdit()
+        self._query.setPlaceholderText("Search conversation keywords…")
+        self._query.returnPressed.connect(lambda: self._refresh())
+        search_row.addWidget(self._query, 1)
+        search_btn = QPushButton("Search / Refresh")
+        search_btn.clicked.connect(lambda: self._refresh())
+        search_row.addWidget(search_btn)
+        lay.addLayout(search_row)
+        self._history = QTextEdit()
+        self._history.setReadOnly(True)
+        lay.addWidget(self._history, 1)
+        self._status = QLabel("Loading…")
+        self._status.setTextFormat(Qt.TextFormat.PlainText)
+        self._status.setWordWrap(True)
+        lay.addWidget(self._status)
+        self._capture_btn = QPushButton("Pause saving")
+        self._capture_btn.clicked.connect(self._toggle_capture)
+        lay.addWidget(self._capture_btn)
+        lay.addWidget(QLabel("SPEECH CORRECTIONS"))
+        self._dictionary = QLabel("")
+        self._dictionary.setTextFormat(Qt.TextFormat.PlainText)
+        self._dictionary.setWordWrap(True)
+        lay.addWidget(self._dictionary)
+        corrections_row = QHBoxLayout()
+        self._heard = QLineEdit()
+        self._heard.setPlaceholderText("What JARVIS hears")
+        self._intended = QLineEdit()
+        self._intended.setPlaceholderText("What you mean")
+        self._heard.setMaxLength(100)
+        self._intended.setMaxLength(100)
+        corrections_row.addWidget(self._heard)
+        corrections_row.addWidget(self._intended)
+        add = QPushButton("Save correction")
+        add.clicked.connect(self._save_correction)
+        corrections_row.addWidget(add)
+        lay.addLayout(corrections_row)
+        close = QPushButton("Close")
+        close.clicked.connect(self.close)
+        lay.addWidget(close)
+        self._loaded.connect(self._render)
+        self._refresh()
+
+    def _toggle_capture(self):
+        from actions.conversation_recovery import recover
+        action = 'pause' if self._capture_enabled else 'resume'
+        self._refresh(lambda: recover({'action': action}))
+
+    def _save_correction(self):
+        from actions.speech_corrections import correct
+        heard, intended = self._heard.text().strip(), self._intended.text().strip()
+        if not heard or not intended:
+            self._status.setText("Enter both the heard phrase and the intended phrase.")
+            return
+        self._refresh(lambda: correct({'action': 'add', 'heard': heard, 'intended': intended}))
+
+    def _refresh(self, operation=None):
+        self._generation += 1
+        generation, query = self._generation, self._query.text()
+        self._status.setText("Loading…")
+        self._capture_btn.setEnabled(False)
+        def work():
+            try:
+                from memory import conversation_journal as journal
+                result = operation() if operation else ''
+                payload = {'rows': journal.search(query, limit=20), 'status': journal.status(),
+                           'corrections': journal.corrections(), 'result': result}
+            except Exception as exc:
+                payload = {'error': str(exc)}
+            try:
+                self._loaded.emit(generation, payload)
+            except RuntimeError:
+                pass  # The panel was closed while this worker finished.
+        threading.Thread(target=work, daemon=True, name='conversation-history-ui').start()
+
+    def _render(self, generation, payload):
+        if generation != self._generation:
+            return
+        self._capture_btn.setEnabled(True)
+        if 'error' in payload:
+            self._status.setText("Could not load history: " + payload['error'])
+            return
+        self._capture_enabled = payload['status']['capture_enabled']
+        self._capture_btn.setText("Pause saving" if self._capture_enabled else "Resume saving")
+        lines = [f"{r['created']} · {r['role'].title()}\n{r['text'][:4000]}" for r in reversed(payload['rows'])]
+        self._history.setPlainText('\n\n'.join(lines) or "No matching conversation text yet. New completed turns appear after you refresh.")
+        dictionary = payload['corrections']
+        preview = '; '.join(f'{heard} → {intended}' for heard, intended in list(dictionary.items())[:5])
+        self._dictionary.setText(preview or "No corrections yet. Example: Navy → Nivi")
+        self._dictionary.setTextFormat(Qt.TextFormat.PlainText)
+        self._dictionary.setToolTip('; '.join(f'{h} → {v}' for h, v in dictionary.items()))
+        result = payload.get('result', '')
+        if result.startswith('status=failed'):
+            self._status.setText("Correction could not be saved. Use phrases of at most 100 characters; the dictionary holds 40 entries.")
+        else:
+            status = payload['status']
+            message = 'Saving on' if self._capture_enabled else 'Saving paused'
+            self._status.setText(f"{message} · {status['turns']} saved turns. Showing up to 20 matches. Existing history stays available while paused.")
 
 
 class MemoryOverlay(_HudOverlay):
@@ -4237,6 +4360,10 @@ class RemoteKeyOverlay(QWidget):
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
+    _camera_permission_sig = pyqtSignal()
+    _screen_permission_sig = pyqtSignal()
+    _missions_sig = pyqtSignal()
+    _earth_sig = pyqtSignal(object)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
@@ -4521,6 +4648,10 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
+        self._earth_sig.connect(self._show_earth)
+        self._missions_sig.connect(self._open_missions)
+        self._screen_permission_sig.connect(self._show_screen_permissions)
+        self._camera_permission_sig.connect(self._show_camera_permissions)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
@@ -4598,6 +4729,8 @@ class MainWindow(QMainWindow):
 
     def _cam_loop(self) -> None:
         try:
+            from core.camera_permission import require as require_camera_permission
+            require_camera_permission()
             import cv2
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
             cam_idx = 0
@@ -4613,6 +4746,7 @@ class MainWindow(QMainWindow):
                 backend = 0
             cap = cv2.VideoCapture(cam_idx, backend)
             if not cap.isOpened():
+                cap.release()
                 cap = cv2.VideoCapture(0)
             if not cap.isOpened():
                 return
@@ -5274,6 +5408,11 @@ class MainWindow(QMainWindow):
         self._ctrl_btn.clicked.connect(self._toggle_controls)
         lay.addSpacing(4)
         lay.addWidget(self._ctrl_btn)
+        self._screen_badge = _badge('SCREEN OFF · REC OFF', C.TEXT_DIM)
+        lay.addWidget(self._screen_badge)
+        self._screen_status_timer = QTimer(self)
+        self._screen_status_timer.timeout.connect(self._refresh_screen_controls)
+        self._screen_status_timer.start(750)
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
@@ -5541,6 +5680,14 @@ class MainWindow(QMainWindow):
         mem_btn.clicked.connect(self._open_memory_panel)
         lay.addWidget(mem_btn)
 
+        recovery_btn = QPushButton("↻  CONVERSATION RECOVERY")
+        recovery_btn.setFixedHeight(26)
+        recovery_btn.setFont(QFont("Courier New", 7))
+        recovery_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        recovery_btn.setStyleSheet(_BTN_STYLE_DIM)
+        recovery_btn.clicked.connect(self._open_recovery_panel)
+        lay.addWidget(recovery_btn)
+
         plugin_btn = QPushButton("🧩  PLUGINS")
         plugin_btn.setFixedHeight(26)
         plugin_btn.setFont(QFont("Courier New", 7))
@@ -5622,8 +5769,160 @@ class MainWindow(QMainWindow):
         self._hud_btn.clicked.connect(self._toggle_hud_style)
         self._refresh_hud_btn()
 
+        from core.voice_style import get_style
+        self._voice_style_btn = _row(QPushButton('VOICE: BRITISH ASSISTANT' if get_style() == 'british' else 'VOICE: STANDARD'))
+        self._voice_style_btn.setToolTip('Original composed British assistant delivery. Applies by reconnecting the voice session; does not clone an actor.')
+        self._voice_style_btn.clicked.connect(self._toggle_voice_delivery)
+
+        from core.response_speed import get_profile
+        self._response_speed_btn = _row(QPushButton('RESPONSE: '+get_profile().upper()))
+        self._response_speed_btn.setToolTip('Fast: shorter end-of-speech pause, no proactive relevance filtering and no thinking budget. It may respond to room speech or clip long pauses; switch to Standard if needed.')
+        self._response_speed_btn.clicked.connect(self._toggle_response_speed)
+
+        self._missions_btn = _row(QPushButton('MISSION CONTROL'))
+        self._missions_btn.clicked.connect(self._open_missions)
+
+        self._earth_btn = _row(QPushButton('EARTH & MAPS'))
+        self._earth_btn.clicked.connect(lambda:self._show_earth({'toggle':True}))
+
+        self._workspace_btn = _row(QPushButton('PROJECTS & WORKSPACE'))
+        self._workspace_btn.clicked.connect(self._open_work_panel)
+
+        self._camera_permission_btn = _row(QPushButton('CAMERA PERMISSION'))
+        self._camera_permission_btn.clicked.connect(self._show_camera_permissions)
+        self._screen_permission_btn = _row(QPushButton('SCREEN RECORDING PERMISSION'))
+        self._screen_permission_btn.clicked.connect(self._show_screen_permissions)
+        self._screen_record_btn = _row(QPushButton('RECORD SCREEN'))
+        self._screen_record_btn.clicked.connect(lambda: self._screen_control('record'))
+        self._screen_folder_btn = _row(QPushButton('OPEN RECORDINGS'))
+        self._screen_folder_btn.clicked.connect(self._open_screen_recordings)
+        self._screen_analyze_btn = _row(QPushButton('ANALYZE SCREEN NOW'))
+        self._screen_analyze_btn.clicked.connect(lambda: self._screen_control('analyze'))
+        self._screen_watch_btn = _row(QPushButton('WORK WITH ME: OFF'))
+        self._screen_watch_btn.clicked.connect(lambda: self._screen_control('watch'))
+        self._screen_watch_btn.setToolTip('Shares changed screenshots with your configured vision model every 30 seconds while idle. Suggestions only; no automatic clicks.')
+
         w.adjustSize()
         return w
+
+    def _show_earth(self,options):
+        if options.get('close') or (options.get('toggle') and getattr(self,'_earth_panel',None) is not None and self._hud_cam_stack.currentWidget() is self._earth_panel):
+            self._hud_cam_stack.setCurrentIndex(0)
+            self._earth_btn.setText('EARTH & MAPS')
+            return
+        if getattr(self,'_earth_panel',None) is None:
+            try:
+                from core.earth_panel import EarthPanel
+                self._earth_panel=EarthPanel(self)
+                self._hud_cam_stack.addWidget(self._earth_panel)
+            except Exception as exc:
+                self._log.append_log('SYS: Earth panel could not open: '+str(exc))
+                return
+        self._hud_cam_stack.setCurrentWidget(self._earth_panel)
+        self._earth_panel.apply({k:v for k,v in options.items() if k not in ('toggle','close')})
+        self._earth_btn.setText('RETURN TO ASSISTANT')
+
+    def _open_missions(self):
+        from core.mission_panel import MissionPanel
+        old=getattr(self,'_mission_panel',None)
+        if old is not None:
+            old.show();old.raise_();old.timer.start(2000);return
+        self._mission_panel=MissionPanel(self)
+        self._mission_panel.show();self._mission_panel.raise_()
+
+    def _open_work_panel(self):
+        from core.workspace_panel import WorkspacePanel
+        old=getattr(self,'_work_panel',None)
+        if old is not None:old.close()
+        self._work_panel=WorkspacePanel(self)
+        self._work_panel.show()
+        self._work_panel.raise_()
+
+    def _toggle_response_speed(self):
+        from core.response_speed import get_profile,set_profile
+        profile='standard' if get_profile()=='fast' else 'fast'
+        set_profile(profile)
+        self._response_speed_btn.setText('RESPONSE: '+profile.upper())
+        self._log.append_log('SYS: Applying '+profile+' response profile — reconnecting.')
+        if self.on_voice_change:self.on_voice_change()
+
+    def _toggle_voice_delivery(self):
+        from core.voice_style import get_style, set_style
+        selected = 'standard' if get_style() == 'british' else 'british'
+        set_style(selected)
+        self._voice_style_btn.setText('VOICE: BRITISH ASSISTANT' if selected == 'british' else 'VOICE: STANDARD')
+        self._log.append_log('SYS: Applying ' + selected + ' voice delivery.')
+        if self.on_voice_change:
+            self.on_voice_change()
+
+    def _show_camera_permissions(self):
+        from PyQt6.QtWidgets import QDialog,QVBoxLayout,QLabel,QPushButton
+        from PyQt6.QtGui import QDesktopServices
+        from core import camera_permission
+        old=getattr(self,'_camera_permission_dialog',None)
+        if old is not None and old.isVisible():old.raise_();return
+        dialog=QDialog(self);self._camera_permission_dialog=dialog
+        dialog.setWindowTitle('Mark LVI — Camera permission');dialog.resize(540,240)
+        layout=QVBoxLayout(dialog);label=QLabel('Camera access is optional. Approving access alone captures nothing. When you ask JARVIS to see you, a camera image is sent to your configured vision conversation service.');label.setWordWrap(True);layout.addWidget(label)
+        result=QLabel();result.setWordWrap(True);layout.addWidget(result)
+        def refresh(state=None):
+            state=state or camera_permission.status()
+            result.setText('Camera access granted. Ask JARVIS again when ready.' if state['granted'] else 'Camera access is not granted. Request permission or enable Mark LVI in System Settings → Privacy & Security → Camera.')
+        def request():
+            try:camera_permission.request(refresh)
+            except Exception as exc:result.setText(str(exc))
+        for text,fn in [('Request macOS camera permission',request),('Open Camera settings',lambda:QDesktopServices.openUrl(QUrl('x-apple.systempreferences:com.apple.preference.security?Privacy_Camera'))),('Recheck',refresh),('Close',dialog.close)]:
+            button=QPushButton(text);button.clicked.connect(fn);layout.addWidget(button)
+        refresh();dialog.show();dialog.raise_()
+
+    def _show_screen_permissions(self):
+        from PyQt6.QtWidgets import QDialog,QVBoxLayout,QLabel,QPushButton
+        from PyQt6.QtGui import QDesktopServices
+        from core.screen_workspace import screen_permission_status,permission_instructions,request_screen_permission,SCREEN_SETTINGS_URL
+        old=getattr(self,'_screen_permission_dialog',None)
+        if old is not None and old.isVisible():old.raise_();return
+        dialog=QDialog(self);self._screen_permission_dialog=dialog
+        dialog.setWindowTitle('Mark LVI — Screen Recording permission');dialog.resize(580,280)
+        layout=QVBoxLayout(dialog);message=QLabel();message.setWordWrap(True);message.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(message)
+        def refresh():
+            state=screen_permission_status()
+            message.setText(('Screen Recording access is granted to '+state['app_name']+'. You can start recording from Controls. No capture was started by this dialog.') if state['granted'] else permission_instructions(state))
+        def request():
+            try:request_screen_permission();refresh()
+            except Exception as exc:message.setText(str(exc))
+        for label,callback in [('Request macOS permission',request),('Open Screen Recording settings',lambda:QDesktopServices.openUrl(QUrl(SCREEN_SETTINGS_URL))),('Recheck permission',refresh),('Close',dialog.close)]:
+            button=QPushButton(label);button.clicked.connect(callback);layout.addWidget(button)
+        refresh();dialog.show();dialog.raise_()
+
+    def _open_screen_recordings(self):
+        from core.screen_workspace import RECORDINGS
+        from PyQt6.QtGui import QDesktopServices
+        RECORDINGS.mkdir(parents=True, exist_ok=True, mode=0o700)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(RECORDINGS)))
+
+    def _screen_control(self, action):
+        from core.screen_workspace import workspace
+        state = workspace.status()
+        if action == 'record' and state['recorder']['recording']:
+            action = 'stoprecord'
+        if action == 'watch' and state['watching']:
+            action = 'stop'
+        if self.on_text_command:
+            threading.Thread(target=self.on_text_command, args=('/screen ' + action,), daemon=True).start()
+
+    def _refresh_screen_controls(self):
+        from core.screen_workspace import workspace
+        state = workspace.status()
+        recording = state['recorder']['recording']
+        watching = state['watching']
+        local=getattr(self,'local_voice_status',lambda:{'enabled':False,'state':'off'})()
+        if hasattr(self, '_screen_badge'):
+            self._screen_badge.setText(('SCREEN ON' if watching else 'ANALYZING' if state['analysis_active'] or state['analysis_requested'] else 'SCREEN OFF') + (' · REC ON' if recording else ' · REC OFF') + ('\nLOCAL MIC: '+local['state'] if local['enabled'] else ''))
+            self._screen_badge.setStyleSheet(f'color: {C.RED if recording else C.GREEN if watching else C.TEXT_DIM}; background: transparent;')
+            self._screen_badge.setToolTip(state['error'] or state['recorder']['error'] or 'Screen sharing and recording are independent. Turn both off to stop all capture.')
+        if hasattr(self, '_screen_record_btn'):
+            self._screen_record_btn.setText('STOP RECORDING' if recording else 'RECORD SCREEN — PERMISSION NEEDED' if state['recorder'].get('permission_required') else 'RECORD SCREEN')
+            self._screen_watch_btn.setText('WORK WITH ME: ON' if watching else 'WORK WITH ME: OFF')
 
     def _warm_wake_state(self) -> None:
         """Work out the wake-word state off the UI thread, once.
@@ -5698,7 +5997,7 @@ class MainWindow(QMainWindow):
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Type a command or question…")
+        self._input.setPlaceholderText("Ask JARVIS, or type /help for instant local commands…")
         self._input.setFont(QFont("Courier New", 9))
         self._input.setFixedHeight(30)
         self._input.setStyleSheet(f"""
@@ -6449,39 +6748,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_hud_btn(self):
         from memory.config_manager import get_hud_style
-        face = get_hud_style() == "face"
-        # Neither state is "off", so both read as active — this is a choice
-        # between two things, not a switch with a disabled side.
-        style = f"""
-            QPushButton {{ background: {C.PANEL2}; color: {C.PRI};
-                border: 1px solid {C.BORDER_A}; border-radius: 3px;
-                text-align: left; padding: 0 8px; }}
-            QPushButton:hover {{ color: {C.WHITE}; border: 1px solid {C.BORDER_B}; }}"""
-        self._hud_btn.setText("🧑  HUD: ANIMATED FACE" if face
-                              else "◉  HUD: REACTOR CORE")
-        self._hud_btn.setStyleSheet(style)
-        self._hud_btn.setToolTip(
-            "An animated head that speaks your words and shows what JARVIS is "
-            "doing. Tap to switch to the reactor core."
-            if face else
-            "A reactor core that turns with the state and moves with your voice. "
-            "Tap to switch to the animated head.")
+        labels = {'face': 'ANIMATED HOLOGRAM', 'core': 'REACTOR CORE'}
+        self._hud_btn.setText('HUD: ' + labels[get_hud_style()])
+        self._hud_btn.setStyleSheet(self._BTN_DIM)
+        self._hud_btn.setToolTip('Switch between the original holographic face and reactor core.')
 
     def _toggle_hud_style(self):
-        """Swap the centrepiece. Both objects stay in memory, so the change is
-        instant and switching back costs nothing."""
         from memory.config_manager import get_hud_style, save_hud_style
-        want = "core" if get_hud_style() == "face" else "face"
+        styles = ('face', 'core')
+        want = styles[(styles.index(get_hud_style()) + 1) % len(styles)]
         save_hud_style(want)
-        try:
-            self.hud.hud_style = want
-            self.hud.update()
-        except Exception:
-            pass
+        self.hud.hud_style = want
+        self.hud.update()
         self._refresh_hud_btn()
-        self._log.append_log(
-            "SYS: HUD switched to the animated face." if want == "face"
-            else "SYS: HUD switched to the reactor core.")
+        self._log.append_log('SYS: HUD switched to ' + want + '.')
 
     def _toggle_ptt(self):
         from memory.config_manager import (get_push_to_talk_enabled,
@@ -6750,6 +7030,14 @@ class MainWindow(QMainWindow):
 
     # ── Memory panel ─────────────────────────────────────────────────────────
 
+    def _open_recovery_panel(self):
+        old = getattr(self, '_recovery_overlay', None)
+        if old is not None:
+            old.close()
+        ov = RecoveryOverlay(parent=self.centralWidget())
+        self._centre_overlay(ov)
+        self._recovery_overlay = ov
+
     def _open_memory_panel(self):
         ov = MemoryOverlay(parent=self.centralWidget())
         self._centre_overlay(ov)
@@ -6945,6 +7233,12 @@ class JarvisUI:
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
         self._win = MainWindow(face_path)
+        self._win._mission_player = self
+        from core.mission_notifications import Notifications
+        self._mission_notifications = Notifications(self._win)
+        self._mission_timer = QTimer(self._win)
+        self._mission_timer.timeout.connect(self._mission_notifications.tick)
+        self._mission_timer.start(3000)
         self.root = _RootShim(self._app)
         self._win.show()
 
@@ -7104,6 +7398,18 @@ class JarvisUI:
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)
+
+    def request_camera_permission(self):
+        self._win._camera_permission_sig.emit()
+
+    def request_screen_permission(self):
+        self._win._screen_permission_sig.emit()
+
+    def show_missions(self):
+        self._win._missions_sig.emit()
+
+    def show_earth(self,options):
+        self._win._earth_sig.emit(dict(options))
 
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
