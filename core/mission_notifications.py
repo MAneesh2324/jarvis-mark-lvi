@@ -8,6 +8,8 @@ class Notifications:
         from core.mission_engine import engine
         engine();self.host=host;self.seen={r['id']:r['state'] for r in store.listing()};self.briefing_busy=False;self.checks=0
     def tick(self):
+        from core.auto_learning import tick as learn_tick
+        learn_tick()
         for row in store.listing():
             old=self.seen.get(row['id']);new=row['state'];self.seen[row['id']]=new
             if old!=new and new in ('completed','failed','interrupted'):

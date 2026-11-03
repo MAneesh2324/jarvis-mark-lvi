@@ -80,3 +80,17 @@ config/voice-interaction.json
 
 # Private isolated project copies, edit proposals and rollback baselines
 memory/sandboxes/
+
+# Private learning journal, market/security caches and automatic-refresh state
+memory/intelligence/
+memory/auto-learning-state.json
+config/auto-learning.json
+memory/knowledge-brief.json
+
+# Personal encrypted vaults, restore staging/rollback and scenario reports
+*.jarvismem
+memory/restore-pending.json
+memory/restore-state.json
+memory/restore-rollback/
+memory/scenarios/
+memory/restore-work/

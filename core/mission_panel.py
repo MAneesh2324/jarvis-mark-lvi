@@ -3,7 +3,7 @@ from pathlib import Path
 import json,threading
 from PyQt6.QtCore import Qt,QTimer,QUrl,pyqtSignal
 from PyQt6.QtGui import QDesktopServices
-from PyQt6.QtWidgets import (QDialog,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QLineEdit,QPlainTextEdit,QPushButton,QComboBox,QListWidget,QTabWidget,QWidget,QSpinBox,QCheckBox,QFileDialog,QAbstractItemView,QScrollArea)
+from PyQt6.QtWidgets import (QDialog,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QLineEdit,QPlainTextEdit,QPushButton,QComboBox,QListWidget,QTabWidget,QWidget,QSpinBox,QCheckBox,QFileDialog,QAbstractItemView,QScrollArea,QStackedWidget,QToolButton,QMenu)
 from core import mission_store as store
 from core.mission_engine import engine
 
@@ -14,9 +14,17 @@ class MissionPanel(QDialog):
         self.setWindowTitle('JARVIS Mission Control');self.resize(1040,800)
         self.setStyleSheet('QWidget{background:#06151e;color:#d4eef4;} QLineEdit,QPlainTextEdit,QListWidget,QComboBox,QSpinBox{background:#102935;color:#e3f7fa;border:1px solid #285061;padding:5px;} QPushButton{background:#16465a;color:#e2f5ff;border:1px solid #3286a3;padding:8px;border-radius:5px;} QPushButton:hover{background:#226079;} QTabBar::tab{padding:10px;}')
         layout=QVBoxLayout(self);title=QLabel('MISSION CONTROL  /  Plan · Act · Verify');title.setStyleSheet('font-size:22px;font-weight:bold;padding:8px;');layout.addWidget(title)
-        tabs=QTabWidget();layout.addWidget(tabs);self.message=QLabel('Ready. Create a plan, inspect it, then start.');self.message.setWordWrap(True);self.message.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(self.message)
-        for name,build in [('Missions',self._missions),('Earth intelligence',self._earth),('Briefing',self._briefing),('Smart home',self._home),('Voice & screen',self._voice_screen),('Sandbox',self._sandbox),('Skills',self._skills)]:
-            page=QWidget();box=QVBoxLayout(page);build(box);scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(page);tabs.addTab(scroll,name)
+        navigation=QHBoxLayout();layout.addLayout(navigation)
+        pages=QStackedWidget();layout.addWidget(pages);self.message=QLabel('Ready. Create a plan, inspect it, then start.');self.message.setWordWrap(True);self.message.setTextFormat(Qt.TextFormat.PlainText);layout.addWidget(self.message)
+        self._tool_pages={};self._pages=pages
+        more=QToolButton();more.setText('More tools');more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup);menu=QMenu(more);more.setMenu(menu)
+        for name,build in [('Missions',self._missions),('Sandbox',self._sandbox),('Skills',self._skills),('Earth intelligence',self._earth),('Briefing',self._briefing),('Smart home',self._home),('Voice & screen',self._voice_screen),('Portable memory',self._portable),('Scenario simulator',self._scenarios)]:
+            page=QWidget();box=QVBoxLayout(page);build(box);scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(page);index=pages.addWidget(scroll);self._tool_pages[name]=index
+            if name in ('Missions','Sandbox','Skills'):
+                button=QPushButton(name);button.clicked.connect(lambda checked=False,i=index:pages.setCurrentIndex(i));navigation.addWidget(button)
+            else:
+                action=menu.addAction(name);action.triggered.connect(lambda checked=False,i=index:pages.setCurrentIndex(i))
+        navigation.addStretch();navigation.addWidget(more)
         self.finished.connect(self._finish)
         self.timer=QTimer(self);self.timer.timeout.connect(self.refresh);self.timer.start(2000);self.refresh()
     def say(self,text):self.message.setText(str(text))
@@ -198,3 +206,13 @@ class MissionPanel(QDialog):
     def _skills(self,box):
         from core.development_panel import skills_tab
         skills_tab(self,box)
+
+
+    def show_page(self,name):
+        self._pages.setCurrentIndex(self._tool_pages[name])
+    def _portable(self,box):
+        from core.portability_scenario_panel import memory_view
+        memory_view(self,box)
+    def _scenarios(self,box):
+        from core.portability_scenario_panel import scenario_view
+        scenario_view(self,box)

@@ -142,7 +142,7 @@ class ScreenPermissionTests(unittest.TestCase):
         with patch.object(screen.platform,'system',return_value='Darwin'),patch.dict(sys.modules,{'Quartz':quartz,'Foundation':foundation}):
             state=screen.screen_permission_status();self.assertFalse(state['granted'])
             with self.assertRaisesRegex(PermissionError,'not granted to Mark LVI'):screen.require_screen_permission()
-            text=screen.permission_instructions(state);self.assertIn('/Users/maneesh/Desktop/Mark LVI.app',text);self.assertNotIn('Enable Screen Recording for Python/Terminal',text)
+            text=screen.permission_instructions(state);self.assertIn(str(screen.ROOT.parent/'Mark LVI.app'),text);self.assertNotIn('Enable Screen Recording for Python/Terminal',text);self.assertIn('switch is already on',text);self.assertIn('Audio-only access',text)
             quartz.CGRequestScreenCaptureAccess.assert_not_called()
     def test_request_is_explicit_and_uses_native_api(self):
         from unittest.mock import Mock
@@ -162,3 +162,21 @@ class ScreenPermissionTests(unittest.TestCase):
         with patch('actions.screen_recording.workspace',type('State',(),{'recorder':recorder})()),patch.object(screen,'require_screen_permission',side_effect=PermissionError('Enable Mark LVI')):
             result=recording({'action':'start'},player=ui)
         self.assertIn('status=failed',result);self.assertIn('permission_required=true',result);ui.request_screen_permission.assert_called_once();self.assertFalse(recorder.status()['recording'])
+
+class AudioRecordingTests(unittest.TestCase):
+    def test_native_audio_dispatch_and_final_status(self):
+        import threading
+        recorder=screen.ScreenRecorder()
+        def native(owner,monitor,fps):
+            self.assertEqual((monitor,fps),(1,8))
+            owner._path.write_bytes(b'test-only')
+            owner._frames=1;owner._ready.set();owner._stop.wait(2)
+            owner._audio_recorded=True
+        with tempfile.TemporaryDirectory() as folder,patch.object(screen,'RECORDINGS',Path(folder)),patch.object(screen,'require_screen_permission'),patch.object(screen.platform,'system',return_value='Darwin'),patch('core.native_screen_recording.record',side_effect=native):
+            self.assertEqual(recorder.start(audio='system')['audio_source'],'system')
+            state=recorder.stop();self.assertTrue(state['audio_recorded']);self.assertTrue(state['saved'])
+    def test_audio_failure_is_not_reported_as_success(self):
+        recorder=screen.ScreenRecorder()
+        with tempfile.TemporaryDirectory() as folder,patch.object(screen,'RECORDINGS',Path(folder)),patch.object(screen,'require_screen_permission'),patch.object(screen.platform,'system',return_value='Darwin'),patch('core.native_screen_recording.record',side_effect=RuntimeError('audio initialization failed')):
+            with self.assertRaisesRegex(RuntimeError,'audio initialization failed'):recorder.start(audio='system')
+            self.assertFalse(recorder.stop()['audio_recorded'])

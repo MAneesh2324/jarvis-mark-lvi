@@ -25,10 +25,10 @@ def screen_permission_status():
 def permission_instructions(state=None):
     state=state or screen_permission_status()
     if state.get('bundle_id')=='com.maneesh.marklvi':
-        host='Mark LVI';addition='If Mark LVI is missing, click + and add /Users/maneesh/Desktop/Mark LVI.app. '
+        host='Mark LVI';addition='If Mark LVI is missing, click + and add '+str(ROOT.parent/'Mark LVI.app')+'. '
     else:
         host=state['app_name'];addition='For the Desktop installation, launch Mark LVI.app and grant access to Mark LVI. '
-    return ('Screen Recording access is not granted to '+host+'. Open System Settings → Privacy & Security → Screen & System Audio Recording. '+addition+'Enable that app, then fully quit and reopen JARVIS if macOS requests it. Granting Terminal or a different Python version does not grant Mark LVI access.')
+    return ('macOS reports Screen Recording access is not granted to '+host+'. Open System Settings → Privacy & Security → Screen & System Audio Recording. '+addition+'Enable that app, then fully quit and reopen Mark LVI. If the switch is already on but this check still fails, turn that app’s Screen & System Audio Recording switch off and back on, authenticate if asked, then quit and reopen Mark LVI. If it still fails, remove only Mark LVI from that list and add the current Desktop app again. Audio-only access does not grant screen access. Granting Terminal or a different Python version does not grant Mark LVI access.')
 
 def request_screen_permission():
     # Called only by the local permission dialog's explicit button on the GUI thread.
@@ -58,6 +58,10 @@ class ScreenRecorder:
         self._notes = None
         self._notes_error = ''
         self._permission_required = False
+        self._audio_mode = 'none'
+        self._audio_recorded = False
+        self._finalizing = False
+        self._echo_reduced = False
 
     def status(self):
         with self._lock:
@@ -65,9 +69,11 @@ class ScreenRecorder:
             return {'recording': active, 'frames': self._frames, 'path': str(self._path or ''),
                     'error': self._error, 'fps': self._fps,
                     'elapsed_seconds': round(time.monotonic() - self._started, 1) if active else 0,
-                    'audio_recorded': False, 'notes_error':self._notes_error,'permission_required':self._permission_required}
+                    'audio_recorded': self._audio_recorded, 'audio_source': self._audio_mode, 'finalizing': self._finalizing, 'echo_reduced': self._echo_reduced, 'notes_error':self._notes_error,'permission_required':self._permission_required}
 
-    def start(self, monitor=1, fps=8):
+    def start(self, monitor=1, fps=8, audio="none"):
+        if audio not in ("none", "system", "both"):raise ValueError("Audio must be both, system or none.")
+        if audio != "none" and platform.system() != "Darwin":raise RuntimeError("System audio currently requires macOS.")
         try:require_screen_permission()
         except PermissionError as exc:
             with self._lock:self._error=str(exc);self._permission_required=True
@@ -84,21 +90,27 @@ class ScreenRecorder:
             self._frames, self._error = 0, ''
             self._notes, self._notes_error = None, ''
             self._fps, self._started = fps, time.monotonic()
+            self._audio_mode, self._audio_recorded = audio, False
+            self._finalizing, self._echo_reduced = False, False
             self._stop = threading.Event()
             self._ready = threading.Event()
             self._thread = threading.Thread(target=self._record, args=(monitor, fps), daemon=True, name='screen-recorder')
             self._thread.start()
-        if not self._ready.wait(4):
+        if not self._ready.wait(15):
             self._stop.set()
             raise RuntimeError('Screen capture did not start in time. Check screen permissions.')
         state = self.status()
-        if state['error'] or not state['frames']:
+        if state['error'] or (not state['frames'] and self._audio_mode == 'none'):
             raise RuntimeError(state['error'] or 'No screen frames could be recorded.')
         return state
 
     def _record(self, monitor, fps):
         writer = None
         try:
+            if self._audio_mode in ("system", "both"):
+                from core.native_screen_recording import record
+                record(self, monitor, fps)
+                return
             import cv2
             import mss
             import numpy as np
@@ -156,7 +168,7 @@ class ScreenRecorder:
         self._stop.set()
         thread = self._thread
         if thread:
-            thread.join(timeout=4)
+            thread.join(timeout=25)
         state = self.status()
         path = Path(state['path']) if state['path'] else None
         state['saved'] = bool(not state['recording'] and state['frames'] and path and path.exists() and path.stat().st_size > 0)

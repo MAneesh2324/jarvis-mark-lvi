@@ -84,6 +84,7 @@ from core                      import confirm as confirm_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
+from core.voice_health import enqueue_latest, microphone_stalled, playback_drained, has_answer_progress
 from core.viseme               import VisemeStream
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -1347,6 +1348,12 @@ class JarvisLive:
         from core.mission_store import resume_context
         mission_context=resume_context()
         if mission_context:parts.append(mission_context)
+        from core.auto_learning import context as public_knowledge_context
+        public_brief=public_knowledge_context()
+        if public_brief:parts.append(public_brief)
+        from core.learning_journal import context as learning_context
+        lessons=learning_context()
+        if lessons:parts.append(lessons)
         from core.voice_style import instruction as voice_style_instruction
         delivery = voice_style_instruction()
         if delivery:
@@ -1654,6 +1661,11 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
+        if str(result).startswith('status=failed') or str(result).startswith("Tool '") and 'failed:' in str(result):
+            try:
+                from core.learning_journal import reflect_tool
+                await asyncio.to_thread(reflect_tool,name,str(result))
+            except Exception:pass
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
 
         # A tool that declared itself NON_BLOCKING also says when its answer may
@@ -1681,18 +1693,21 @@ class JarvisLive:
             # mic / phone PCM through the new `audio` field instead. Queue items
             # are {"data": <bytes>, "mime_type": <str>} from _listen_audio and
             # the phone relay.
-            await self.session.send_realtime_input(
+            await asyncio.wait_for(self.session.send_realtime_input(
                 audio=types.Blob(
                     data=msg["data"],
                     mime_type=msg.get("mime_type", "audio/pcm"),
                 )
-            )
+            ), timeout=8)
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        last_callback = [time.monotonic()]
+
         def callback(indata, frames, time_info, status):
+            last_callback[0] = time.monotonic()
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
             # streamed, so JARVIS can't respond to speech not addressed to it and
@@ -1724,7 +1739,7 @@ class JarvisLive:
                     def interrupt_and_replay():
                         self.interrupt();self._tail_until=0.0
                         for data in blocks:
-                            self.out_queue.put_nowait({'data':data,'mime_type':'audio/pcm'})
+                            enqueue_latest(self.out_queue, {'data':data,'mime_type':'audio/pcm'})
                     loop.call_soon_threadsafe(interrupt_and_replay)
                 return
             self._voice_interrupt.reset()
@@ -1758,7 +1773,7 @@ class JarvisLive:
             if not self.ui.muted and not self._phone_active:
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
+                    enqueue_latest, self.out_queue,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
@@ -1804,9 +1819,13 @@ class JarvisLive:
                 _mic_stream = _open_mic(None)
 
             with _mic_stream:
+                last_callback[0] = time.monotonic()
                 print("[JARVIS] 🎤 Mic stream open")
                 while True:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.5)
+                    if microphone_stalled(_mic_stream.active, last_callback[0], time.monotonic()):
+                        self.ui.write_log("SYS: Microphone stream stopped responding — reconnecting audio.")
+                        raise RuntimeError("Microphone callback stalled or input device stopped")
         except Exception as e:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
@@ -1861,11 +1880,9 @@ class JarvisLive:
         try:
             while True:
                 async for response in self.session.receive():
-                    # Anything at all from the server proves the return path is
-                    # alive, so the stall clock stops here rather than in any of
-                    # the branches below — a tool call, a transcript or a bare
-                    # keepalive all count.
-                    self._clear_stall()
+                    # Input transcripts and keepalives do not prove an answer is coming.
+                    if has_answer_progress(response):
+                        self._clear_stall()
 
                     # ── Session resumption ───────────────────────────────────
                     # The server sends this periodically. `resumable` goes false
@@ -1879,6 +1896,11 @@ class JarvisLive:
                             if self._resume_handle is None:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
+
+                    if getattr(response, "go_away", None) is not None:
+                        self.ui.write_log("SYS: Refreshing the expiring voice session — keeping conversation context.")
+                        self.request_reconnect(keep_context=True, reason="server session expiry")
+                        return
 
                     if response.data:
                         performance.first_audio()
@@ -1921,6 +1943,7 @@ class JarvisLive:
                                 self._screen_readonly = False
                                 self._conversation_busy = True
                                 self._last_user_speech = time.monotonic()
+                                self._rx_deadline = self._last_user_speech + _STALL_LIMIT
 
                         if sc.turn_complete:
                             self._conversation_busy = False
@@ -2043,6 +2066,7 @@ class JarvisLive:
         except Exception:
             pass
 
+        last_write = time.monotonic()
         try:
             while True:
                 try:
@@ -2058,6 +2082,9 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    if playback_drained(self._is_speaking, self.audio_in_queue.empty(),
+                                        time.monotonic(), last_write, self._out_latency):
+                        self.set_speaking(False)
                     continue
 
                 self.set_speaking(True)
@@ -2123,7 +2150,8 @@ class JarvisLive:
                     pass
 
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
+                    await asyncio.wait_for(asyncio.to_thread(stream.write, bytes(batch)), timeout=8)
+                    last_write = time.monotonic()
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
@@ -2723,7 +2751,7 @@ class JarvisLive:
                     self.session          = session
                     self._conversation_busy = False
                     self.audio_in_queue   = asyncio.Queue()
-                    self.out_queue        = asyncio.Queue(maxsize=200)
+                    self.out_queue        = asyncio.Queue(maxsize=24)
                     self._turn_done_event = asyncio.Event()
                     self._rx_deadline     = None
 
@@ -2936,6 +2964,15 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    try:
+        from core.portable_memory import apply_pending
+        restored=apply_pending()
+        if restored.get('restored'):print('[Memory] Portable memory restore applied before startup.')
+    except Exception as exc:
+        from PyQt6.QtWidgets import QApplication,QMessageBox
+        app=QApplication.instance() or QApplication(sys.argv)
+        QMessageBox.critical(None,'Memory restore could not finish','JARVIS stopped before loading memory. The restore did not finish safely. Check the local rollback state before retrying. '+str(exc))
+        return
     ui = JarvisUI("face.png")
 
     def runner():

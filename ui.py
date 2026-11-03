@@ -436,6 +436,7 @@ class HudCanvas(QWidget):
         except Exception:
             self.hud_style = "face"
         self._core_phase = 0.0
+        self.gesture_yaw=0.0;self.gesture_pitch=0.0;self.gesture_zoom=1.0
 
         self._tick       = 0
         self._scale      = 1.0
@@ -471,6 +472,17 @@ class HudCanvas(QWidget):
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
+
+    def apply_hand_gesture(self,event):
+        kind=event.get('kind')
+        if kind=='rotate':
+            self.gesture_yaw=max(-1.2,min(1.2,self.gesture_yaw+event.get('dx',0)*3))
+            self.gesture_pitch=max(-.65,min(.65,self.gesture_pitch+event.get('dy',0)*2))
+        elif kind=='zoom':self.gesture_zoom=max(.65,min(1.6,self.gesture_zoom*event.get('factor',1)))
+        elif kind=='reset':self.gesture_yaw=0.;self.gesture_pitch=0.;self.gesture_zoom=1.
+        if self._avatar is not None:
+            self._avatar.gesture_yaw=self.gesture_yaw;self._avatar.gesture_pitch=self.gesture_pitch
+        self.update()
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
@@ -885,7 +897,7 @@ class HudCanvas(QWidget):
                     _acc = qcol(C.GREEN)
                 else:
                     _acc = qcol(C.PRI)
-            self._avatar.paint(p, cx, _head_cy, _r_head, _main, _acc, qcol(C.BG))
+            self._avatar.paint(p, cx, _head_cy, _r_head*self.gesture_zoom, _main, _acc, qcol(C.BG))
 
         # reactor core — the other centrepiece, and the fallback if the head
         # could not be built. There is no third path: the old face.png branch
@@ -895,7 +907,10 @@ class HudCanvas(QWidget):
             _band_t = 12.0
             _band_h = max(60.0, _sy_status - 12.0 - _band_t)
             _r = min(W * 0.46, _band_h / 2.0)
-            self._paint_core(p, cx, _band_t + _band_h / 2.0, _r, W, _band_h)
+            _gcy=_band_t+_band_h/2.0
+            p.save();p.translate(cx,_gcy);p.rotate(math.degrees(self.gesture_yaw));p.scale(1,max(.6,math.cos(self.gesture_pitch)));p.translate(-cx,-_gcy)
+            self._paint_core(p,cx,_gcy,_r*self.gesture_zoom,W,_band_h)
+            p.restore()
 
         # status text
         sy = _sy_status
@@ -4360,6 +4375,9 @@ class RemoteKeyOverlay(QWidget):
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
+    _hand_gesture_sig = pyqtSignal(object)
+    _gesture_control_sig = pyqtSignal(str)
+    _portable_sig = pyqtSignal()
     _camera_permission_sig = pyqtSignal()
     _screen_permission_sig = pyqtSignal()
     _missions_sig = pyqtSignal()
@@ -4650,6 +4668,9 @@ class MainWindow(QMainWindow):
         self._content_sig.connect(self._show_content)
         self._earth_sig.connect(self._show_earth)
         self._missions_sig.connect(self._open_missions)
+        self._portable_sig.connect(self._open_portable_memory)
+        self._hand_gesture_sig.connect(self._apply_hand_gesture)
+        self._gesture_control_sig.connect(self._gesture_control)
         self._screen_permission_sig.connect(self._show_screen_permissions)
         self._camera_permission_sig.connect(self._show_camera_permissions)
         self._reconfig_sig.connect(self._show_setup)
@@ -4728,7 +4749,10 @@ class MainWindow(QMainWindow):
         t.start()
 
     def _cam_loop(self) -> None:
+        cap=None;camera_lease=None
         try:
+            from core import camera_access
+            camera_lease=camera_access.acquire("live camera preview")
             from core.camera_permission import require as require_camera_permission
             require_camera_permission()
             import cv2
@@ -4762,6 +4786,8 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[Camera] Stream error: {e}")
         finally:
+            if cap is not None:cap.release()
+            if camera_lease is not None:camera_access.release(camera_lease)
             self._cam_stream_sig.emit(False)
 
     def stop_camera_stream(self) -> None:
@@ -5767,6 +5793,9 @@ class MainWindow(QMainWindow):
 
         self._hud_btn = _row(QPushButton())
         self._hud_btn.clicked.connect(self._toggle_hud_style)
+        self._gestures_btn = _row(QPushButton('HAND GESTURES: OFF'))
+        self._gestures_btn.setToolTip('Local camera hand tracking: pinch and drag to rotate; two open hands apart/together to zoom; hold a fist to reset. Off by default. No frames are saved or shared.')
+        self._gestures_btn.clicked.connect(lambda:self._gesture_control('toggle'))
         self._refresh_hud_btn()
 
         from core.voice_style import get_style
@@ -5793,6 +5822,7 @@ class MainWindow(QMainWindow):
         self._screen_permission_btn = _row(QPushButton('SCREEN RECORDING PERMISSION'))
         self._screen_permission_btn.clicked.connect(self._show_screen_permissions)
         self._screen_record_btn = _row(QPushButton('RECORD SCREEN'))
+        self._screen_record_btn.setToolTip('Records display, system sound and microphone together on macOS, including your voice and JARVIS playback. Stop to finalize the MP4.')
         self._screen_record_btn.clicked.connect(lambda: self._screen_control('record'))
         self._screen_folder_btn = _row(QPushButton('OPEN RECORDINGS'))
         self._screen_folder_btn.clicked.connect(self._open_screen_recordings)
@@ -5821,6 +5851,10 @@ class MainWindow(QMainWindow):
         self._hud_cam_stack.setCurrentWidget(self._earth_panel)
         self._earth_panel.apply({k:v for k,v in options.items() if k not in ('toggle','close')})
         self._earth_btn.setText('RETURN TO ASSISTANT')
+
+    def _open_portable_memory(self):
+        self._open_missions()
+        self._mission_panel.show_page('Portable memory')
 
     def _open_missions(self):
         from core.mission_panel import MissionPanel
@@ -5854,6 +5888,29 @@ class MainWindow(QMainWindow):
         self._log.append_log('SYS: Applying ' + selected + ' voice delivery.')
         if self.on_voice_change:
             self.on_voice_change()
+
+    def _gesture_control(self,action):
+        from core.hand_gestures import controller
+        try:
+            if action=='reset':self.hud.apply_hand_gesture({'kind':'reset'});return
+            if action=='stop' or action=='toggle' and controller.status()['enabled']:controller.stop()
+            elif action in ('start','toggle'):
+                controller.start(self._hand_gesture_sig.emit)
+                self._log.append_log('SYS: Local hand gestures enabled. Camera frames stay on this Mac. Pinch + drag to rotate; two open hands to zoom; hold a fist to reset. Stop with Hand Gestures in Controls.')
+        except PermissionError as exc:
+            self._log.append_log('SYS: '+str(exc));self._show_camera_permissions()
+        except Exception as exc:self._log.append_log('SYS: Hand gestures: '+str(exc))
+        self._refresh_screen_controls()
+
+    def _apply_hand_gesture(self,event):
+        from core.hand_gestures import controller
+        state=controller.status()
+        if event.get('generation')!=state['generation'] or not state['enabled']:return
+        if event.get('kind')=='idle':return
+        earth=getattr(self,'_earth_panel',None)
+        if earth is not None and self._hud_cam_stack.currentWidget() is earth and earth.ready:
+            earth.page.runJavaScript('window.JarvisEarth.gesture('+json.dumps(event)+');')
+        else:self.hud.apply_hand_gesture(event)
 
     def _show_camera_permissions(self):
         from PyQt6.QtWidgets import QDialog,QVBoxLayout,QLabel,QPushButton
@@ -5913,15 +5970,20 @@ class MainWindow(QMainWindow):
     def _refresh_screen_controls(self):
         from core.screen_workspace import workspace
         state = workspace.status()
+        from core.hand_gestures import controller as hand_controller
+        hand_state=hand_controller.status()
+        if hasattr(self,'_gestures_btn'):
+            self._gestures_btn.setText('HAND GESTURES: '+(hand_state['gesture'].upper() if hand_state['enabled'] else 'ERROR' if hand_state['state']=='failed' else 'OFF'))
+            self._gestures_btn.setToolTip(hand_state['error'] or 'Local camera tracking only. Pinch + drag: rotate. Two open hands: zoom. Hold fist: reset. No frames saved or uploaded.')
         recording = state['recorder']['recording']
         watching = state['watching']
         local=getattr(self,'local_voice_status',lambda:{'enabled':False,'state':'off'})()
         if hasattr(self, '_screen_badge'):
-            self._screen_badge.setText(('SCREEN ON' if watching else 'ANALYZING' if state['analysis_active'] or state['analysis_requested'] else 'SCREEN OFF') + (' · REC ON' if recording else ' · REC OFF') + ('\nLOCAL MIC: '+local['state'] if local['enabled'] else ''))
+            self._screen_badge.setText(('SCREEN ON' if watching else 'ANALYZING' if state['analysis_active'] or state['analysis_requested'] else 'SCREEN OFF') + (' · REC ON' if recording else ' · REC OFF') + ('\nLOCAL MIC: '+local['state'] if local['enabled'] else '') + ('\nHAND CAMERA: LOCAL ONLY' if hand_state['enabled'] else ''))
             self._screen_badge.setStyleSheet(f'color: {C.RED if recording else C.GREEN if watching else C.TEXT_DIM}; background: transparent;')
             self._screen_badge.setToolTip(state['error'] or state['recorder']['error'] or 'Screen sharing and recording are independent. Turn both off to stop all capture.')
         if hasattr(self, '_screen_record_btn'):
-            self._screen_record_btn.setText('STOP RECORDING' if recording else 'RECORD SCREEN — PERMISSION NEEDED' if state['recorder'].get('permission_required') else 'RECORD SCREEN')
+            self._screen_record_btn.setText('FINALIZING AUDIO' if state['recorder'].get('finalizing') else 'STOP RECORDING' if recording else 'RECORD SCREEN — PERMISSION NEEDED' if state['recorder'].get('permission_required') else 'RECORD SCREEN')
             self._screen_watch_btn.setText('WORK WITH ME: ON' if watching else 'WORK WITH ME: OFF')
 
     def _warm_wake_state(self) -> None:
@@ -7398,6 +7460,12 @@ class JarvisUI:
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)
+
+    def control_hand_gestures(self,action):
+        self._win._gesture_control_sig.emit(action)
+
+    def show_portable_memory(self):
+        self._win._portable_sig.emit()
 
     def request_camera_permission(self):
         self._win._camera_permission_sig.emit()

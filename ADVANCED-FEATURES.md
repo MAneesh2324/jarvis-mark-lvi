@@ -193,3 +193,166 @@ approval and per-run city requirements. The available regression set passed
 92 tests; the existing Earth loopback-server test was excluded in this restricted
 shell (it passed in the earlier full suite). Both new tabs rendered in a local
 Qt UI check. Live AI edit generation was not called during this validation.
+
+## Conversational learning, forex and cybersecurity
+
+These features are part of ordinary JARVIS conversation, without new dashboard
+tabs. The dashboard tab bar has been replaced with compact Missions, Sandbox and
+Skills buttons; other existing setup screens are under More tools.
+
+Automatic public refresh is enabled at the user's request, once per hour while
+Mark LVI is running. It refreshes BBC world headlines, NASA science headlines,
+ECB reference data and CISA KEV intelligence. Sources retain their original data
+and fetch dates. An offline fallback is explicitly labeled and never gets a new
+observation timestamp. The first forex cache contains the available 90-calendar-
+day reference series; this is not a real-time broker feed. No trading account is
+connected and no trade is executed. No network scanning/exploitation is performed.
+
+Completed/failed missions automatically record deterministic outcome lessons
+locally, so JARVIS can remember to check evidence, handle failures honestly and
+avoid blindly repeating an unsuccessful workflow. These are not proof that a
+research answer is correct. Evidence-backed factual corrections are drafts until
+the user explicitly approves that lesson. Lessons expire, can be revoked, and
+are retrieved into conversation rather than modifying model weights or code.
+
+Try saying: “What have you learned recently?”, “Remember this correction with
+this evidence…”, “Review my recorded mistakes”, “Give me the EUR/USD reference
+update”, “Calculate a position-size scenario using these inputs…”, “Save this
+realized trade result”, “Analyze my USD trade journal”, “What known-exploited
+vulnerabilities affect [product]?”, “Look up CVE-…”, or “Give me world updates.”
+Ask “Stop automatic learning” to disable the hourly refresh. Current conversation
+can use the knowledge tool to access refreshed data; the compact source brief
+and retained lessons are included when the voice session next connects.
+
+Forex analytics include observation change, SMA20/50, simple RSI14 and historical
+log-return volatility. These use daily observations, not OHLC candles, live
+spreads or actionable signals. Position sizing is arithmetic on user-supplied
+risk, equity, stop and currency-conversion inputs, excluding fees/slippage/gaps.
+Trade-journal statistics use explicitly entered realized results and keep account
+currencies separate. Journal data stays local and is not automatically shared.
+
+Security intelligence uses CISA's public KEV JSON (with its official cisagov
+GitHub mirror as fallback), NVD CVE records, and primary-source filtered research.
+KEV absence does not establish safety; severity is not proof of your system's
+exposure. Verify vendor guidance and affected versions. Headlines are attributed
+reports, not independently verified universal knowledge. Automatic ingestion does
+not authorize actions found in source content.
+
+Private files: memory/learning.db, memory/intelligence/, memory/knowledge-brief.json,
+memory/auto-learning-state.json and config/auto-learning.json. They are ignored by
+Git. No model retraining, self-modification, unrestricted crawling or background
+broker activity occurs. The automatic feed scope is bounded and inspectable.
+
+Validation: 13 dedicated learning/data tests passed; the available regression set
+passed 114 tests (the existing loopback-only Earth server test was excluded).
+Public ECB, CISA and world-feed requests were verified successfully. The dashboard
+render check confirms there is no tab bar. No actual trades or device scans were
+performed.
+
+## Portable memory and scenario simulator
+
+Both tools are under Mission Control → More tools, without adding tabs.
+“Open portable memory” opens the local vault controls. Passphrases are entered
+only in masked local fields, never through voice, chat, model prompts or tools.
+The .jarvismem format uses AES-256-GCM authenticated encryption, a random
+16-byte salt, a random 12-byte nonce and Scrypt (N=32768, r=8, p=1). A passphrase
+of at least 12 characters is required and cannot be recovered. Export creates a
+new owner-only local file and never uploads it. Copy it yourself to another
+device and keep the passphrase separately. Install requirements-portable.txt
+when setting up the app on another device.
+
+Vaults include personal facts, selected non-secret display/voice preferences,
+projects/tasks, lessons, trade journal and skill definitions. Saved routines are
+converted to draft skill recipes. Conversation text and summaries are opt-in.
+Credentials, tokens, recordings, screenshots, caches, calendar exports, mission
+artifacts, app binaries and OS permissions are excluded. Personal facts or notes
+can still contain information you saved yourself; choose a strong passphrase.
+SQLite export uses a consistent per-database online snapshot, not a guaranteed
+single instant across all stores. File/row limits prevent runaway vault sizes.
+
+Restore authenticates and validates the entire vault before previewing component
+counts. Queuing restore does not replace live data: selected stores are replaced
+at the next full app startup before memory writers/mission workers begin. It is
+replacement, not a merge. A private local rollback snapshot and recovery journal
+protect against failed/interrupted application. Existing device credentials are
+preserved; skill approvals are revoked, lessons become drafts, project roots are
+cleared, conversation capture stays off, and current local routines are retained.
+Imported routines need review as draft skills before reuse. The exported vault
+is encrypted; ordinary app memory and pending/rollback files are private local
+application data, not an encrypted-at-rest memory system. These files and vaults
+are excluded from Git. No personal vault was created during development tests.
+
+Scenario simulator supports seeded forex Monte Carlo paths, single-trade stress
+arithmetic and service-outage recovery arithmetic. Every run includes explicit
+assumptions, method and limitations. The forex chart shows conditional 5th–95th
+percentile bands, not forecast confidence or executable prices. Annual return
+is a continuously compounded drift assumption; volatility is constant. Neither
+jumps nor leverage, transaction costs or regimes are modeled in this mode.
+Trade stress allows explicit spread/slippage costs and quote-to-account
+conversion. Outage estimates use a constant-rate recovery queue and report when
+capacity cannot clear it. No trades, scans or service changes occur.
+
+Run an illustrative scenario, pin it as baseline, change assumptions and compare
+with the baseline. Results can be saved as private reproducible JSON reports.
+The voice scenario_simulator tool can calculate or compare explicitly supplied
+parameters; it never invents expected returns or infers trading permission.
+
+Validation: 15 dedicated vault/scenario tests passed and the available regression
+set passed 129 tests (the existing loopback Earth test was excluded). Tests cover
+authenticated round-trip, wrong passwords/tampering, credential exclusion,
+startup replacement/rollback, imported approval reset, scenario bounds,
+reproducibility, costs and unstable outage recovery. Both views rendered locally
+without tabs. All backup/restore tests used temporary fictional data.
+
+## Local hologram hand gestures
+
+Enable **Controls → Hand Gestures** after granting Camera permission to Mark LVI.
+It is off at startup. Pinch thumb and index, then drag to rotate the holographic
+assistant/reactor. With Earth visible, the same action orbits the globe or pans
+the map. Move two open hands apart/together to zoom. Hold a closed fist for about
+0.8 seconds to reset the view. Rotation/zoom are bounded, pinch has hysteresis,
+loss of tracking releases the grab, and old events are ignored after stopping.
+
+The voice tool can request start, stop, reset or status. A start request is not
+proof that camera/model initialization succeeded. The header shows HAND CAMERA:
+LOCAL ONLY while tracking is active. Stop via the same Controls button or by
+asking to stop hand gestures. No gestures can approve dialogs, submit forms,
+trade, change files or control unrelated apps.
+
+Camera frames are processed by Google's MediaPipe Hand Landmarker locally and
+are not saved, recorded or sent to a model/API. The tracker runs in a separate
+native worker process, so native SDK failure does not terminate the main app.
+Only navigation metadata crosses back to the UI. Camera snapshots/previews and
+gestures share an exclusive camera lease; stop one mode before using another.
+Screen recording and AI screen sharing retain their separate controls.
+
+Dependencies are in requirements-gestures.txt. The tested model is downloaded
+from Google's official Hand Landmarker model URL by native/setup_gestures.py;
+it is checked against SHA-256
+fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1.
+The local model and library cache under models/ are excluded from Git. Gestures
+need ordinary camera lighting and visible hands; room/camera tracking accuracy
+has not been calibrated during development. This is screen-based interaction,
+not a physical free-space projection.
+
+Validation: synthetic landmark tests cover grab/rotate, bounded zoom, held-fist
+reset, tracking loss, stale events, permission denial, camera ownership, HUD
+limits and isolated native-worker failure. The actual MediaPipe model initialized
+successfully in the native Mac graphics environment on a synthetic blank image.
+No personal camera frames or live hand movements were captured during testing.
+
+
+Screen recording with system audio (macOS 15+)
+---------------------------------------------
+Controls → Record Screen and screen_recording start now capture system sound and display together through Apple ScreenCaptureKit. JARVIS playback is included; microphone is excluded. Say stop recording to finalize the MP4. The result reports audio_recorded only after the saved file has an audio track. Set audio=none in the tool for video only. Local sampled keyframe notes remain available; they do not transcribe audio. Install requirements-recording.txt on another Mac. Existing Screen & System Audio Recording permission is required.
+
+Validated on this Mac with a 14-second H.264/AAC MP4 containing a generated test tone; 13 recorder tests passed.
+
+
+Intermittent voice recovery
+---------------------------
+The app now honors Gemini GoAway warnings by reconnecting with its latest resumption handle. A callback heartbeat detects a stopped microphone even when the driver still reports it active. Mic sends and speaker writes have an 8-second timeout; stalled sessions use the existing context-preserving reconnect path. A drained playback queue releases the speaking gate after 1.5 seconds even when the server never sends turn_complete. Mic backlog is limited to 24 blocks (about 1.5 seconds); congestion drops oldest queued audio instead of accumulating 12.8 seconds of delay. Input transcripts arm the no-answer watchdog; keepalives cannot clear it. No speech or tool action is automatically replayed after reconnection. Speech during a network interruption can still need repeating.
+
+Microphone recording update: macOS recordings now default to audio=both, mixing microphone and system sound into one track on this Mac (macOS 27). audio=system keeps only system sound; audio=none is silent. Existing microphone authorization is checked before starting. Older silent/system-only recordings cannot recover missing microphone audio.
+
+Recording echo reduction: both-mode captures system and microphone as separate tracks. On stop, local FFmpeg NLMS filtering uses the system track as the echo reference, then mixes the cleaned microphone with system sound. No audio uploads. Video is copied without re-encoding; final audio is mono AAC at 16 kHz. The original file survives processing failure; processing runs in a private temporary directory and atomically replaces only a verified result. This is adaptive echo reduction, not a guarantee for every room or simultaneous speech. Headphones avoid acoustic speaker leakage. Finalizing status remains visible while processing.

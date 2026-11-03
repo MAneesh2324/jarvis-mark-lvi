@@ -62,6 +62,11 @@ class MissionEngine:
             if signal:signal.set()
             store.event(key,'Paused at the next safe boundary.' if pause else 'Cancelled. In-flight network requests may finish, but their results will not continue the mission.')
             return store.get(key)
+    def _learn(self,key):
+        try:
+            from core.learning_journal import reflect
+            reflect(store.get(key))
+        except Exception:pass # Learning failure must not alter the actual mission result.
     def _worker(self):
         while True:
             key,player,stop=self.jobs.get()
@@ -86,11 +91,13 @@ class MissionEngine:
                 if isinstance(result,dict) and result.get('verification')=='incomplete':
                     export_report(store.get(key));store.transition(key,{'running'},'failed','Routine evidence contains failed or unverified actions. Review before creating a fresh plan.');return
             check();export_report(store.get(key))
-            if store.transition(key,{'running'},'completed'):store.event(key,'Completed. Evidence and artifacts are ready to review.')
+            if store.transition(key,{'running'},'completed'):
+                store.event(key,'Completed. Evidence and artifacts are ready to review.');self._learn(key)
         except Cancelled:pass
         except Exception as exc:
             # Never include credentials or provider response bodies in the log.
-            if store.transition(key,{'running'},'failed',str(exc)[:1200]):store.event(key,'Failed: '+str(exc)[:1200])
+            if store.transition(key,{'running'},'failed',str(exc)[:1200]):
+                store.event(key,'Failed: '+str(exc)[:1200]);self._learn(key)
 
 _engine=None;_lock=threading.Lock()
 def engine():

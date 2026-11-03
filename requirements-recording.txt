@@ -1,0 +1,4 @@
+pyobjc-framework-ScreenCaptureKit>=13,<14
+pyobjc-framework-AVFoundation>=13,<14
+pyobjc-framework-Quartz>=13,<14
+pyobjc-framework-CoreLocation>=13,<14

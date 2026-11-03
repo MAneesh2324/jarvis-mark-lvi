@@ -12,10 +12,12 @@ exports, recordings, development copies, generated reports, virtual environments
 and downloaded speech models are deliberately excluded. Configure credentials
 locally after cloning; never commit them, even to this private repository.
 
-The current native Mac launcher targets this installation's Desktop paths and
-Homebrew Python. Rebuild/adapt native/launcher.c and native/build_launcher.py if
-moving the installation. macOS camera, microphone and screen-recording access
-remain separate per-app permissions and are not copied through GitHub.
+For a fresh Mac installation, follow [INSTALL-MAC.md](INSTALL-MAC.md). The native
+launcher build script configures paths for the clone on that Mac. Rebuild after
+moving the folder or changing the Python installation. macOS camera, microphone
+and screen-recording access are separate per-app permissions and do not transfer
+through GitHub. Rebuilding an ad-hoc-signed app can require removing its stale
+permission entry and adding the new app again.
 
 The upstream origin is FatihMakes/Mark-LVI. This private personal repository
 stores the customized source and does not publish changes upstream.

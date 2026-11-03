@@ -3,13 +3,14 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <fcntl.h>
-#define VENV_PYTHON "/Users/maneesh/Desktop/Mark-LVI/.venv/bin/python"
-#define MAIN_SCRIPT "/Users/maneesh/Desktop/Mark-LVI/main.py"
+#if !defined(VENV_PYTHON) || !defined(MAIN_SCRIPT) || !defined(PROJECT_ROOT) || !defined(STARTUP_LOG)
+#error "Build with native/build_launcher.py to configure local installation paths"
+#endif
 int main(int argc, char **argv) {
     setenv("JARVIS_NATIVE_APP", "1", 1);
     if (argc == 1) {
-        if (chdir("/Users/maneesh/Desktop/Mark-LVI") != 0) return 1;
-        int fd = open("/Users/maneesh/Desktop/Mark-LVI/native-startup.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (chdir(PROJECT_ROOT) != 0) return 1;
+        int fd = open(STARTUP_LOG, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
         setvbuf(stdout, NULL, _IOLBF, 0);
         setvbuf(stderr, NULL, _IOLBF, 0);

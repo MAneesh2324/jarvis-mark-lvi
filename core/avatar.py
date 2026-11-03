@@ -456,8 +456,8 @@ class HoloAvatar:
             v[:, 1] = py + dy * ca - dz * sa
             v[:, 2] = pz + dy * sa + dz * ca
 
-        cy, sy = math.cos(self._yaw), math.sin(self._yaw)
-        cp, sp = math.cos(self._pitch), math.sin(self._pitch)
+        cy, sy = math.cos(self._yaw + getattr(self,"gesture_yaw",0)), math.sin(self._yaw + getattr(self,"gesture_yaw",0))
+        cp, sp = math.cos(self._pitch + getattr(self,"gesture_pitch",0)), math.sin(self._pitch + getattr(self,"gesture_pitch",0))
         m = np.array([
             [cy, 0.0, sy],
             [sp * sy, cp, -sp * cy],

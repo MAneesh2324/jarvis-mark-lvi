@@ -165,6 +165,12 @@ def _get_camera_index() -> int:
 
 
 def _capture_camera() -> tuple[bytes, str]:
+    from core.camera_access import claim
+    with claim('camera vision snapshot'):
+        return _capture_camera_unlocked()
+
+
+def _capture_camera_unlocked() -> tuple[bytes, str]:
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 

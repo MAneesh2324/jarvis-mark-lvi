@@ -28,7 +28,7 @@ def diagnose(parameters, **kwargs):
     report = {'checks': checks, 'voice': cfg.get_voice(), 'push_to_talk': cfg.get_push_to_talk_enabled(),
               'wake_word': cfg.get_wake_word_enabled(), 'turn_tuning': cfg.get_turn_tuning(),
               'available_devices': [{'name': d['name'], 'input': d['max_input_channels'] > 0, 'output': d['max_output_channels'] > 0} for d in devices],
-              'help': 'If replies are clipped, try headphones and disable aggressive turn tuning. On macOS, check Microphone permission for Python/Terminal. This check does not record audio or play a sound.'}
+              'help': 'If replies are clipped, try headphones and disable aggressive turn tuning. On macOS, check Microphone permission for Mark LVI when using the Desktop app. This check does not record audio or play a sound.'}
     return outcome.untrusted('audio-diagnostics', json.dumps(report, ensure_ascii=False))
 
 

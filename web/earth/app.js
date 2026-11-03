@@ -16,7 +16,7 @@ function setFix(data){if(!valid(Number(data.latitude),Number(data.longitude)))re
 function locate(){if(bridge){bridge.requestDeviceLocation();return;}status('Device location requires the JARVIS desktop host. Enter coordinates to browse.');}
 function beginDeviceLocation(){status('Requesting device location…');navigator.geolocation.getCurrentPosition(p=>setFix({latitude:p.coords.latitude,longitude:p.coords.longitude,accuracy:p.coords.accuracy,source:'device',timestamp:Date.now()}),error=>status('Device location unavailable: '+error.message+'. Use approximate location or enter coordinates.'),{enableHighAccuracy:false,timeout:15000,maximumAge:60000});}
 function clear(){fix=null;if(marker&&map)map.removeLayer(marker);if(accuracyCircle&&map)map.removeLayer(accuracyCircle);if(globeMarker&&viewer)viewer.entities.remove(globeMarker);marker=accuracyCircle=globeMarker=null;if(bridge)bridge.clearLocation();status('Location cleared from this session. Map tiles already requested cannot be recalled.');}
-window.JarvisEarth={setView,fly,setFix,locate,beginDeviceLocation,clear,setPaused(value){paused=!!value;if(viewer)viewer.useDefaultRenderLoop=!paused&&currentView==='globe';},async apply(options){if(options.view)await setView(options.view);if(options.latitude!==undefined&&options.longitude!==undefined)fly(options.latitude,options.longitude,options.zoom||13);if(options.markers)plotMarkers(options.markers);if(options.route)plotRoute(options.route);if(options.locate)locate();}};
+window.JarvisEarth={gesture:handGesture,setView,fly,setFix,locate,beginDeviceLocation,clear,setPaused(value){paused=!!value;if(viewer)viewer.useDefaultRenderLoop=!paused&&currentView==='globe';},async apply(options){if(options.view)await setView(options.view);if(options.latitude!==undefined&&options.longitude!==undefined)fly(options.latitude,options.longitude,options.zoom||13);if(options.markers)plotMarkers(options.markers);if(options.route)plotRoute(options.route);if(options.locate)locate();}};
 document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
 $('go').addEventListener('submit',event=>{event.preventDefault();fly($('latitude').value,$('longitude').value);});$('places').addEventListener('change',()=>{if($('places').value){const [lat,lon]=$('places').value.split(',').map(Number);fly(lat,lon,11);}});$('locate').addEventListener('click',locate);$('approx').addEventListener('click',()=>bridge?bridge.requestApproximateLocation():status('Approximate lookup requires the JARVIS desktop host.'));$('clear').addEventListener('click',clear);$('home').addEventListener('click',()=>{setView('globe');if(viewer)viewer.camera.flyHome(1.5);});$('rotate').addEventListener('click',()=>{rotating=!rotating;$('rotate').textContent='Auto-rotate '+(rotating?'on':'off');$('rotate').setAttribute('aria-pressed',String(rotating));if(viewer){viewer.scene.requestRenderMode=!rotating;viewer.scene.requestRender();}});
 if(window.qt&&window.QWebChannel)new QWebChannel(qt.webChannelTransport,channel=>{bridge=channel.objects.earth;bridge.ready();});
@@ -26,3 +26,15 @@ function plotMarkers(rows){ensureMap();if(researchMarkers)map.removeLayer(resear
 function plotRoute(data){ensureMap();if(routeLine)map.removeLayer(routeLine);routeLine=L.geoJSON(data.geometry,{style:{color:'#00cce8',weight:5}}).addTo(map);map.invalidateSize();map.fitBounds(routeLine.getBounds(),{padding:[45,45]});status('Estimated driving route: '+(data.distance_m/1000).toFixed(1)+' km · '+Math.round(data.duration_s/60)+' min. OSRM / OpenStreetMap. No live traffic.');}
 
 $('clear-research').addEventListener('click',()=>{if(map&&researchMarkers)map.removeLayer(researchMarkers);if(map&&routeLine)map.removeLayer(routeLine);researchMarkers=routeLine=null;status('Research overlays cleared.');});
+
+function handGesture(event){
+ if(event.kind==='reset'){if(viewer&&currentView==='globe')viewer.camera.flyHome(1);else if(map)map.setView([0,0],3);return;}
+ if(currentView==='globe'&&viewer){
+  if(event.kind==='rotate'){viewer.camera.rotateRight(-(event.dx||0)*1.4);viewer.camera.rotateUp((event.dy||0)*1.1);}
+  if(event.kind==='zoom'){const h=viewer.camera.positionCartographic.height;const amount=h*(1-1/event.factor);if(amount>=0)viewer.camera.zoomIn(amount);else viewer.camera.zoomOut(-amount);}
+  viewer.scene.requestRender();
+ }else if(map){
+  if(event.kind==='rotate')map.panBy([-(event.dx||0)*map.getSize().x*2,-(event.dy||0)*map.getSize().y*2],{animate:false});
+  if(event.kind==='zoom'){map.options.zoomSnap=.1;map.setZoom(Math.max(2,Math.min(19,map.getZoom()+Math.log2(event.factor))),{animate:false});}
+ }
+}

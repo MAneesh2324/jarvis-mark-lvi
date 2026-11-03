@@ -3,12 +3,12 @@ os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 from pathlib import Path
 import json,tempfile,threading,unittest
 from unittest.mock import patch,Mock
-from core import mission_store as store,mission_engine,mission_workflows as flows,place_intelligence as places,engineering_workspace as engineering,home_bridge,personal_briefing as briefing,work_projects,earth_maps
+from core import learning_journal,mission_store as store,mission_engine,mission_workflows as flows,place_intelligence as places,engineering_workspace as engineering,home_bridge,personal_briefing as briefing,work_projects,earth_maps
 
 class MissionsTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)
-        self.patches=[patch.object(store,'DB_PATH',self.root/'missions.db'),patch.object(store,'ARTIFACTS',self.root/'artifacts'),patch.object(work_projects,'DB_PATH',self.root/'projects.db'),patch.object(home_bridge,'CONFIG',self.root/'home.json'),patch.object(briefing,'CALENDAR',self.root/'calendar.ics'),patch.object(briefing,'SETTINGS',self.root/'briefing.json'),patch.object(places,'SERVICES',self.root/'services.json')]
+        self.patches=[patch.object(learning_journal,'DB_PATH',self.root/'learning.db'),patch.object(store,'DB_PATH',self.root/'missions.db'),patch.object(store,'ARTIFACTS',self.root/'artifacts'),patch.object(work_projects,'DB_PATH',self.root/'projects.db'),patch.object(home_bridge,'CONFIG',self.root/'home.json'),patch.object(briefing,'CALENDAR',self.root/'calendar.ics'),patch.object(briefing,'SETTINGS',self.root/'briefing.json'),patch.object(places,'SERVICES',self.root/'services.json')]
         for p in self.patches:p.start()
         self.engine=mission_engine.MissionEngine()
     def tearDown(self):
