@@ -1,6 +1,7 @@
-"""Opt-in local hand landmarks → hologram navigation. Never saves or sends camera frames."""
+"""Opt-in local hand landmarks → hologram navigation. Camera preview stays in local process memory; no frame storage or network transfer."""
 from pathlib import Path
 from contextlib import ExitStack
+import base64
 import atexit,hashlib,importlib.util,math,threading,time,os,json,subprocess,sys,select
 MODEL=Path(__file__).resolve().parent.parent/'models'/'gestures'/'hand_landmarker.task'
 MODEL_SHA256='fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1'
@@ -102,7 +103,10 @@ class GestureController:
         if event.get('kind')=='worker_status':
          if event.get('state')=='failed':self.state='failed';self.error=str(event.get('error','Tracking failed.'))[:500]
          continue
-        if event.get('kind') not in ('idle','rotate','zoom','reset'):continue
+        if event.get('kind')=='preview':
+         payload=event.get('jpeg','')
+         if not isinstance(payload,str) or len(payload)>48000:continue
+        elif event.get('kind') not in ('idle','rotate','zoom','reset'):continue
         self.state='tracking';self.frames+=1;self.label=str(event.get('label','Tracking'))[:100]
        if not stop.is_set():callback(event)
      if process.poll() is not None:break
@@ -133,7 +137,7 @@ class GestureController:
      from actions.screen_processor import _load_config,_cv2_backend
      index=int(_load_config().get('camera_index',0));cap=cv2.VideoCapture(index,_cv2_backend());resources.callback(cap.release)
      if not cap.isOpened():raise RuntimeError('Camera could not open for gestures. Close other camera apps and try again.')
-     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);interpreter=Interpreter();last_stamp=0;misses=0
+     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);interpreter=Interpreter();last_stamp=0;misses=0;last_preview=0
      with self._lock:
       if generation==self.generation:self.state='tracking'
      while not stop.is_set():
@@ -149,6 +153,15 @@ class GestureController:
        if generation!=self.generation:return
        self.frames+=1;self.label=event['label']
       if not stop.is_set():callback(event)
+      if time.monotonic()-last_preview>=.15 and not stop.is_set():
+       last_preview=time.monotonic();preview=cv2.resize(frame,(320,240))
+       edges=((0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),(13,17),(0,17),(17,18),(18,19),(19,20))
+       for hand in hands:
+        points=[(int(x*320),int(y*240)) for x,y in hand]
+        for a,b in edges:cv2.line(preview,points[a],points[b],(255,220,0),2)
+        for point in points:cv2.circle(preview,point,3,(0,255,120),-1)
+       ok,encoded=cv2.imencode('.jpg',preview,[cv2.IMWRITE_JPEG_QUALITY,45])
+       if ok and len(encoded)<=36000:callback({'kind':'preview','generation':generation,'jpeg':base64.b64encode(encoded).decode('ascii'),'label':event['label'],'hands':len(hands)})
       stop.wait(max(0,.05-(time.monotonic()-before)))
   except Exception as exc:
    with self._lock:

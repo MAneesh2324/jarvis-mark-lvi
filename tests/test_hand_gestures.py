@@ -64,3 +64,20 @@ class IsolatedTrackerTests(unittest.TestCase):
    controller._supervise(1,threading.Event(),callback)
   self.assertEqual(controller.state,'failed');self.assertIn('Mark LVI is still running',controller.error);callback.assert_not_called()
   with camera_access.claim('after tracker failure'):pass
+
+class PreviewTests(unittest.TestCase):
+ def test_local_preview_displays_valid_image_and_rejects_oversized_payload(self):
+  import base64,cv2,numpy as np
+  from types import SimpleNamespace
+  from PyQt6.QtWidgets import QApplication,QLabel
+  from ui import MainWindow
+  app=QApplication.instance() or QApplication(['PreviewTest'])
+  preview=QLabel();preview.resize(180,132);status=QLabel();host=SimpleNamespace(_hand_preview=preview,_hand_preview_status=status)
+  ok,jpeg=cv2.imencode('.jpg',np.zeros((240,320,3),dtype=np.uint8));self.assertTrue(ok)
+  event={'generation':3,'kind':'preview','jpeg':base64.b64encode(jpeg).decode(),'hands':1,'label':'Grab / rotate'}
+  with patch('core.hand_gestures.controller.status',return_value={'generation':3,'enabled':True}):
+   MainWindow._apply_hand_gesture(host,event)
+   self.assertFalse(preview.pixmap().isNull());self.assertIn('1 hand(s)',status.text())
+   event['jpeg']='A'*48001
+   MainWindow._apply_hand_gesture(host,event)
+  preview.close();status.close()

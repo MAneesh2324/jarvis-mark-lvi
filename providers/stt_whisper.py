@@ -217,7 +217,8 @@ class WhisperSTT:
                         data=data,
                         files={"file": ("speech.wav", wav, "audio/wav")})
             if r.status_code >= 400:
-                raise RuntimeError(f"{r.status_code} {_terse(r.text)}")
+                from core.quota_failover import response_error
+                raise response_error(r,_terse(r.text))
             payload = r.json()
         # The hosted endpoint reports no confidence, so a language it names is
         # taken as it always was — but through the same door, so the first-vs-

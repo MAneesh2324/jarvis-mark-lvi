@@ -94,3 +94,6 @@ memory/restore-state.json
 memory/restore-rollback/
 memory/scenarios/
 memory/restore-work/
+
+# Persistent provider quota cooldowns
+memory/provider-cooldowns.json

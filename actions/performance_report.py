@@ -5,6 +5,8 @@ from core.performance import snapshot
 def report(parameters, **kwargs):
     data=snapshot()
     from core.response_speed import get_profile,effective_turn_tuning
+    from core.quota_failover import status as fallback_status
+    data['provider_fallback']=fallback_status()
     data['response_profile']=get_profile()
     data['effective_turn_detection']=effective_turn_tuning()
     return json.dumps(data, ensure_ascii=False)

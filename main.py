@@ -958,6 +958,28 @@ class JarvisLive:
                 getattr(self._dashboard, "_bind_error", "") or "")
 
     def _on_text_command(self, text: str):
+        from core import quota_failover
+        provider=quota_failover.command_provider(text)
+        if text.startswith('/provider '):provider=text.split(maxsplit=1)[1].strip().lower()
+        if provider:
+            try:
+                state=quota_failover.prefer(provider)
+                self.interrupt()
+                seconds=state['cooldown_seconds'].get(provider,0)
+                if seconds>0:
+                    message=provider.title()+' is rate limited. I will switch when its cooldown ends, sir.'
+                elif getattr(self,'_active_provider','gemini')==provider:
+                    message='I am already using '+provider.title()+', sir.'
+                else:
+                    self.interrupt()
+                    self.request_reconnect(keep_context=False,reason='requested '+provider)
+                    self.ui.write_log('SYS: Switching to '+provider.title()+' as requested.')
+                    return
+                self.ui.write_log('SYS: '+message)
+                loop=getattr(self,'_loop',None)
+                if loop:loop.call_soon_threadsafe(lambda:asyncio.create_task(self._speak_provider_notice(message)))
+            except Exception as exc:self.ui.write_log('SYS: Provider switch: '+str(exc))
+            return
         if text.startswith('/voiceinterrupt '):
             from core.voice_interaction import set_enabled
             value=text.split(maxsplit=1)[1].strip().lower()
@@ -1321,6 +1343,12 @@ class JarvisLive:
                 print(f"[JARVIS] {len(_blocked)} tool(s) withheld — "
                       f"this engine cannot serve them")
 
+        from core import quota_failover
+        _quota_groq=quota_failover.enabled() and getattr(self,'_active_provider','gemini')=='groq'
+        if _quota_groq:
+            from providers.schema import budget
+            from providers.schema import CORE_TOOLS
+            _all_decls=budget(_all_decls,max_tools=12,max_chars=6000,core_names=('provider_control',*CORE_TOOLS))
         _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
                   for d in _all_decls}
         sys_prompt = _render_prompt(sys_prompt, {
@@ -1368,6 +1396,8 @@ class JarvisLive:
         except Exception as exc:
             print(f"[Memory] Recovery context unavailable for this connection: {exc}")
 
+        if _quota_groq:
+            parts=[quota_failover.compact_system(time_ctx,identity_ctx,mem_str,self._recovered_context)]
         cfg = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
@@ -1940,6 +1970,12 @@ class JarvisLive:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
                                 in_buf.append(txt)
+                                from core.quota_failover import command_provider
+                                requested=command_provider(' '.join(in_buf),speech=True)
+                                if requested:
+                                    self._on_text_command('/provider '+requested)
+                                    in_buf=[];out_buf=[]
+                                    continue
                                 self._screen_readonly = False
                                 self._conversation_busy = True
                                 self._last_user_speech = time.monotonic()
@@ -2553,6 +2589,8 @@ class JarvisLive:
     # "providers are not installed" — the assistant then runs exactly as it did
     # before any of this existed.
     def _engine_mode(self) -> str:
+        from core import quota_failover
+        if quota_failover.enabled():return 'pipeline' if getattr(self,'_active_provider','gemini')=='groq' else 'gemini'
         try:
             from memory.config_manager import get_provider_mode
             return get_provider_mode()
@@ -2570,6 +2608,10 @@ class JarvisLive:
         """
         if self._engine_mode() != "pipeline":
             return None
+        from core import quota_failover
+        if quota_failover.enabled() and getattr(self,'_active_provider','gemini')=='groq':
+            self._quota_parts=quota_failover.parts(self.ui.write_log,lambda voice:setattr(self.ui._win,'_active_voice_output',voice))
+            return {**self._quota_parts[0].caps,'audio_out':True}
         try:
             from memory.config_manager import get_pipeline, get_provider_config
             from providers import registry
@@ -2640,8 +2682,11 @@ class JarvisLive:
         from providers.engine_pipeline import PipelineEngine
 
         pipe = get_pipeline()
+        from core import quota_failover
+        automatic=quota_failover.enabled() and getattr(self,'_active_provider','gemini')=='groq'
 
         def part(slot):
+            if automatic:return self._quota_parts[{'llm':0,'stt':1,'tts':2}[slot]]
             pid = str(pipe.get(slot) or "").strip()
             if not pid:
                 return None
@@ -2653,7 +2698,7 @@ class JarvisLive:
             return registry.build(pid, cfg)
 
         engine = PipelineEngine(part("llm"), part("stt"), part("tts"),
-                                config=config, log=self.ui.write_log)
+                                config=config, log=self.ui.write_log, on_error=self._on_pipeline_error if automatic else None, history_chars=4000 if automatic else 24000)
         # Without push-to-talk nothing else knows when a sentence ended, so the
         # engine finds it in the audio. With push-to-talk the key release is the
         # signal and the detector stays out of the way.
@@ -2664,6 +2709,57 @@ class JarvisLive:
         finally:
             self._engine = None
             await engine.close()
+
+    def _on_pipeline_error(self,what,provider,error):
+        from core import quota_failover
+        if quota_failover.enabled() and quota_failover.policy.note('groq',error):
+            self.ui.write_log('SYS: Groq usage limit reached. Switching providers after respecting cooldowns; please repeat any unanswered question.')
+            self.request_reconnect(keep_context=False,reason='Groq quota')
+
+    async def _speak_provider_notice(self,message):
+        if self.ui.muted or not self._awake:return
+        from core import quota_failover
+        from providers.tts_system import SystemTTS
+        cfg=quota_failover.settings()
+        speaker=SystemTTS({'voice':cfg.get('groq_voice','')})
+        if cfg.get('groq_voice_engine')=='gemini':
+            from providers.tts_gemini import GeminiTTS
+            speaker=GeminiTTS({'log':self.ui.write_log,'fallback_voice':cfg.get('groq_voice','')})
+        try:
+            async for chunk in speaker.speak(message):self.audio_in_queue.put_nowait(chunk)
+            self._turn_done_event.set()
+        except Exception as exc:self.ui.write_log('SYS: Spoken provider notice unavailable ('+type(exc).__name__+').')
+
+    async def _announce_provider_change(self):
+        provider=getattr(self,'_active_provider','gemini')
+        if provider==getattr(self,'_last_announced_provider','gemini'):return
+        self._last_announced_provider=provider
+        if self.ui.muted or not self._awake:return
+        from core import quota_failover
+        from providers.tts_system import SystemTTS
+        message=('Sir, I am now using Groq for replies, with '+('your Gemini voice.' if quota_failover.settings().get('groq_voice_engine')=='gemini' else 'a local British voice.') if provider=='groq' else 'Sir, I have switched back to Gemini and your original voice.')
+        self.ui.write_log('SYS: '+message)
+        try:
+            voice=quota_failover.settings().get('groq_voice','')
+            speaker=SystemTTS({'voice':voice})
+            if quota_failover.settings().get('groq_voice_engine')=='gemini':
+                from providers.tts_gemini import GeminiTTS
+                speaker=GeminiTTS({'log':self.ui.write_log,'fallback_voice':voice,'on_voice':lambda name:setattr(self.ui._win,'_active_voice_output',name)})
+            async for chunk in speaker.speak(message):
+                self.audio_in_queue.put_nowait(chunk)
+            self._turn_done_event.set()
+        except Exception as exc:self.ui.write_log('SYS: Provider changed; spoken notice unavailable ('+type(exc).__name__+').')
+
+    async def _watch_provider_recovery(self):
+        from core import quota_failover
+        while True:
+            await asyncio.sleep(2)
+            if not quota_failover.enabled():continue
+            target=quota_failover.policy.choose()
+            active=getattr(self,'_active_provider','gemini')
+            if target and target!=active and not self._conversation_busy and not self._is_speaking and time.monotonic()-self._last_user_speech>5:
+                self.request_reconnect(keep_context=False,reason='preferred provider available')
+                return
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
@@ -2704,6 +2800,25 @@ class JarvisLive:
 
         while True:
             try:
+                from core import quota_failover
+                if quota_failover.enabled():
+                    selected=quota_failover.policy.choose()
+                    if selected is None:
+                        self.ui.write_log('SYS: Gemini and Groq are both usage-limited. Waiting for the next allowed retry; typed local commands remain available.')
+                        await asyncio.sleep(min(30,max(1,min(quota_failover.policy.remaining().values()))))
+                        continue
+                    if not hasattr(self,'_active_provider'):self.ui.write_log('SYS: Automatic quota fallback enabled; preferred provider: '+quota_failover.settings().get('preferred','gemini')+'. Groq speech: '+('Gemini Charon' if quota_failover.settings().get('groq_voice_engine')=='gemini' else 'local Mac voice')+'.')
+                    previous=getattr(self,'_active_provider','gemini')
+                    self._active_provider=selected
+                    self.ui._win._active_voice_provider=selected
+                    self.ui._win._active_voice_output='gemini' if selected=='gemini' or quota_failover.settings().get('groq_voice_engine')=='gemini' else 'local'
+                    if selected!=previous:
+                        self._resume_handle=None
+                        try:
+                            from memory.conversation_journal import recovery_context
+                            self._recovered_context=recovery_context()
+                        except Exception:pass
+                        self.ui.write_log('SYS: Provider switched to '+(('Groq with Gemini speech' if quota_failover.settings().get('groq_voice_engine')=='gemini' else 'Groq with local Mac voice') if selected=='groq' else 'Gemini Live')+'. Recent saved conversation context is retained; unanswered actions are not replayed.')
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
                 # Pick the rung to open the conversation on. A model resting
@@ -2806,10 +2921,12 @@ class JarvisLive:
                     self._reconnect_event.clear()  # ignore requests from before this session
                     tg.create_task(self._watch_reconnect())
                     tg.create_task(self._watch_stall())
+                    tg.create_task(self._watch_provider_recovery())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
+                    if quota_failover.enabled():tg.create_task(self._announce_provider_change())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_screen_copilot())
@@ -2851,6 +2968,13 @@ class JarvisLive:
                         # handle so the next connect really does start empty.
                         self._resume_handle = None
                     self._conn_backoff = 0
+                    continue
+
+                from core import quota_failover
+                if quota_failover.enabled() and quota_failover.policy.note(getattr(self,'_active_provider','gemini'),e):
+                    self._resume_handle=None
+                    self.ui.write_log('SYS: Usage limit reached. Switching to an available provider; please repeat any unanswered question.')
+                    self._conn_backoff=0
                     continue
 
                 # A resumption handle the server will not accept — expired, or

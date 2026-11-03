@@ -590,10 +590,14 @@ def _provider_rungs(tier: str) -> tuple[str, ...]:
     if tier == SEARCH:
         return ()
     pid, _ = _provider_settings()
+    from core import quota_failover
+    if quota_failover.enabled() and quota_failover.policy.remaining()["groq"]>0:return ()
     return (PROVIDER_PREFIX + pid,) if pid else ()
 
 
 def _provider_first() -> bool:
+    from core import quota_failover
+    if quota_failover.enabled() and quota_failover.policy.choose()=="groq":return True
     return _provider_settings()[1]
 
 
@@ -720,6 +724,8 @@ def call(contents, tier: str = FAST, config=None,
         except Exception as e:
             msg = str(e)
             if is_quota_error(msg):
+                from core import quota_failover
+                if quota_failover.enabled() and model.startswith(PROVIDER_PREFIX):quota_failover.policy.note("groq",e)
                 _cool(model)
                 print(f"[Gemini] {model}: out of quota — skipping it for "
                       f"{_COOLDOWN_SECONDS // 60} minutes")

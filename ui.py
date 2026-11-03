@@ -5531,6 +5531,19 @@ class MainWindow(QMainWindow):
         lay.addWidget(info_panel)
         lay.addSpacing(4)
 
+        self._hand_preview = QLabel("Hand camera off")
+        self._hand_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._hand_preview.setFixedHeight(132)
+        self._hand_preview.setStyleSheet(f"background: {C.PANEL2}; color: {C.PRI}; border: 1px solid {C.BORDER};")
+        self._hand_preview.setAccessibleName("Local hand camera preview")
+        self._hand_preview.hide()
+        lay.addWidget(self._hand_preview)
+        self._hand_preview_status = QLabel()
+        self._hand_preview_status.setWordWrap(True)
+        self._hand_preview_status.setStyleSheet(f"color: {C.PRI}; font-size: 10px;")
+        self._hand_preview_status.hide()
+        lay.addWidget(self._hand_preview_status)
+
         lay.addStretch()
 
         for txt, col in [
@@ -5906,6 +5919,20 @@ class MainWindow(QMainWindow):
         from core.hand_gestures import controller
         state=controller.status()
         if event.get('generation')!=state['generation'] or not state['enabled']:return
+        if event.get('kind')=='preview':
+            import base64
+            encoded=event.get('jpeg','')
+            if not isinstance(encoded,str) or len(encoded)>48000:return
+            try:
+                raw=base64.b64decode(encoded,validate=True)
+                pixmap=QPixmap()
+                if not pixmap.loadFromData(raw,'JPG') or pixmap.width()>640 or pixmap.height()>480:return
+                self._hand_preview.setPixmap(pixmap.scaled(max(1,self._hand_preview.width()-4),128,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.SmoothTransformation))
+                self._hand_preview.show()
+                self._hand_preview_status.setText(str(event.get('hands',0))+' hand(s) · '+str(event.get('label','Tracking'))[:100])
+                self._hand_preview_status.show()
+            except (ValueError,TypeError):pass
+            return
         if event.get('kind')=='idle':return
         earth=getattr(self,'_earth_panel',None)
         if earth is not None and self._hud_cam_stack.currentWidget() is earth and earth.ready:
@@ -5975,11 +6002,15 @@ class MainWindow(QMainWindow):
         if hasattr(self,'_gestures_btn'):
             self._gestures_btn.setText('HAND GESTURES: '+(hand_state['gesture'].upper() if hand_state['enabled'] else 'ERROR' if hand_state['state']=='failed' else 'OFF'))
             self._gestures_btn.setToolTip(hand_state['error'] or 'Local camera tracking only. Pinch + drag: rotate. Two open hands: zoom. Hold fist: reset. No frames saved or uploaded.')
+        if hasattr(self,'_hand_preview') and not hand_state['enabled']:
+            self._hand_preview.clear();self._hand_preview.hide()
+            self._hand_preview_status.setText(hand_state['error'][:180] if hand_state['state']=='failed' else '')
+            self._hand_preview_status.setVisible(hand_state['state']=='failed')
         recording = state['recorder']['recording']
         watching = state['watching']
         local=getattr(self,'local_voice_status',lambda:{'enabled':False,'state':'off'})()
         if hasattr(self, '_screen_badge'):
-            self._screen_badge.setText(('SCREEN ON' if watching else 'ANALYZING' if state['analysis_active'] or state['analysis_requested'] else 'SCREEN OFF') + (' · REC ON' if recording else ' · REC OFF') + ('\nLOCAL MIC: '+local['state'] if local['enabled'] else '') + ('\nHAND CAMERA: LOCAL ONLY' if hand_state['enabled'] else ''))
+            self._screen_badge.setText(('SCREEN ON' if watching else 'ANALYZING' if state['analysis_active'] or state['analysis_requested'] else 'SCREEN OFF') + (' · REC ON' if recording else ' · REC OFF') + ('\nLOCAL MIC: '+local['state'] if local['enabled'] else '') + ('\nHAND CAMERA: LOCAL ONLY' if hand_state['enabled'] else '') + (('\nAI: GROQ · VOICE: GEMINI' if getattr(self,'_active_voice_output','local')=='gemini' else '\nAI: GROQ · LOCAL VOICE') if getattr(self,'_active_voice_provider','')=='groq' else '\nAI: GEMINI' if getattr(self,'_active_voice_provider','')=='gemini' else ''))
             self._screen_badge.setStyleSheet(f'color: {C.RED if recording else C.GREEN if watching else C.TEXT_DIM}; background: transparent;')
             self._screen_badge.setToolTip(state['error'] or state['recorder']['error'] or 'Screen sharing and recording are independent. Turn both off to stop all capture.')
         if hasattr(self, '_screen_record_btn'):

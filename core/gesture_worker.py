@@ -1,4 +1,4 @@
-"""Private local landmark process. stdout contains navigation metadata, never images."""
+"""Private local landmark process. stdout carries bounded local preview images and navigation metadata only."""
 from pathlib import Path
 import sys,json,threading
 sys.path.insert(0,str(Path(__file__).resolve().parent.parent))

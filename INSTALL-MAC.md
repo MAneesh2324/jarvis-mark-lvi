@@ -1,9 +1,9 @@
 # Install the customized JARVIS on another Mac
 
-Only people invited to this **private** GitHub repository can clone it. The owner
-can add a collaborator in GitHub → repository Settings → Collaborators. Each
-person uses their own GitHub login, Gemini API key and local memory. No API key,
-personal memory, recordings or macOS permission grants are included here.
+This source repository is public, so anyone can clone it. Each person uses their
+own Gemini/Groq API keys and local memory. No API keys, personal memory,
+recordings or macOS permission grants are included here. GitHub collaborators
+are needed only for contributing changes, not installing the app.
 
 ## Requirements
 

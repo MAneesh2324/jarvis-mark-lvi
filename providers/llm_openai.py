@@ -412,7 +412,8 @@ class OpenAICompatLLM:
                             headers=self._headers(),
                             json=self._body(messages, tools, False, temperature))
                 if r.status_code >= 400:
-                    raise RuntimeError(f"{r.status_code} {_terse(r.text)}")
+                    from core.quota_failover import response_error
+                    raise response_error(r,_terse(r.text))
                 data = r.json()
         except Exception as e:
             raise _with_address(e, self.base) from None
@@ -445,7 +446,8 @@ class OpenAICompatLLM:
                 r = await cl.post(f"{self.base}/chat/completions",
                                   headers=self._headers(), json=body)
                 if r.status_code >= 400:
-                    raise RuntimeError(f"{r.status_code} {_terse(r.text)}")
+                    from core.quota_failover import response_error
+                    raise response_error(r,_terse(r.text))
                 msg = ((r.json().get("choices") or [{}])[0].get("message") or {})
                 if msg.get("content"):
                     yield {"text": msg["content"]}
@@ -461,7 +463,8 @@ class OpenAICompatLLM:
                                  headers=self._headers(), json=body) as r:
                 if r.status_code >= 400:
                     detail = _terse((await r.aread()).decode("utf-8", "replace"))
-                    raise RuntimeError(f"{r.status_code} {detail}")
+                    from core.quota_failover import response_error
+                    raise response_error(r,detail)
                 async for line in r.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue
@@ -610,7 +613,10 @@ def _with_address(exc: Exception, base: str) -> Exception:
     if base and base not in text:
         text = f"{text} (at {base})" if text else f"could not reach {base}"
     try:
-        return type(exc)(text)
+        result=type(exc)(text)
+        for name in ("status_code","retry_after"):
+            if hasattr(exc,name):setattr(result,name,getattr(exc,name))
+        return result
     except Exception:
         # Some exception types will not take a plain message.
         return RuntimeError(f"{type(exc).__name__}: {text}")

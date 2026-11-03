@@ -107,7 +107,8 @@ class PipelineEngine:
     """STT -> LLM -> TTS, wearing the Live session's interface."""
 
     def __init__(self, llm, stt=None, tts=None, *, config=None,
-                 log=None, history_chars: int = _DEFAULT_HISTORY_CHARS):
+                 log=None, history_chars: int = _DEFAULT_HISTORY_CHARS, on_error=None):
+        self._on_error = on_error
         self._llm = llm
         self._stt = stt
         self._tts = tts
@@ -719,6 +720,8 @@ class PipelineEngine:
         """
         import traceback
 
+        if self._on_error is not None:
+            self._on_error(what,provider,exc)
         where = _target_of(provider)
         detail = " ".join(str(exc).split())[:160] or exc.__class__.__name__
         self._log(f"SYS: {what} failed{f' ({where})' if where else ''} - "

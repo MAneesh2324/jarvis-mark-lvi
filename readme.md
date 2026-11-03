@@ -1,4 +1,4 @@
-> Customized private edition: see [INSTALL-MAC.md](INSTALL-MAC.md) for installing on another Mac, and [ADVANCED-FEATURES.md](ADVANCED-FEATURES.md) for the added capabilities. Each user configures their own credentials and permissions.
+> Customized edition: see [INSTALL-MAC.md](INSTALL-MAC.md) for installing on another Mac, and [ADVANCED-FEATURES.md](ADVANCED-FEATURES.md) for the added capabilities. Each user configures their own credentials and permissions.
 
 # ⚙️ MARK LVI (56)
 ### The Ultimate Cross-Platform Personal AI Assistant — By FatihMakes
