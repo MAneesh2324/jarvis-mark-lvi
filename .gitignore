@@ -109,3 +109,4 @@ config/owner-guard.json
 memory/owner/
 memory/agents/
 memory/voice-baseline.json
+memory/last-diagnostic.md
