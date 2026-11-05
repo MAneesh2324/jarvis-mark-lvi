@@ -1728,8 +1728,9 @@ class JarvisLive:
             #  support it, and it never reliably detected tone in practice.
             #  To restore it on a 2.5 native-audio model, add back:
             #  cfg["enable_affective_dialog"] = True )
-            from core.response_speed import get_profile
-            if get_proactive_audio_enabled() and get_profile() != "fast":
+            # On in the fast profile too: answering every conversation in the room was
+            # worse than the occasional reply that waits for the next sentence.
+            if get_proactive_audio_enabled():
                 cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
 
         if self._tuned_live:
@@ -3021,11 +3022,10 @@ class JarvisLive:
         client being rebuilt on every reconnect.
         """
         if self._engine_caps is None:
-            from core.response_speed import get_profile
             client = genai.Client(
                 api_key=_get_api_key(),
                 http_options={"api_version":
-                              "v1alpha" if self._enhanced_live and get_proactive_audio_enabled() and get_profile() != "fast" else "v1beta"},
+                              "v1alpha" if self._enhanced_live and get_proactive_audio_enabled() else "v1beta"},
             )
             async with client.aio.live.connect(model=live_model,
                                                config=config) as session:

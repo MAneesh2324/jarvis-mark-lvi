@@ -36,4 +36,14 @@ class SpeedProfileTests(unittest.TestCase):
     def test_invalid_profile_rejected(self):
         with self.assertRaises(ValueError):speed.set_profile('invalid')
 
+    def test_fast_profile_keeps_jarvis_out_of_room_conversations(self):
+        root = Path(__file__).resolve().parent.parent
+        src = (root / 'main.py').read_text()
+        block = src[src.index('ProactivityConfig') - 400: src.index('ProactivityConfig')]
+        self.assertNotIn('get_profile() != "fast"', block)              # proactive audio is not dropped for speed
+        self.assertNotIn('get_proactive_audio_enabled() and get_profile()', src)
+        prompt = (root / 'core' / 'prompt.txt').read_text()
+        self.assertIn('[WHO YOU ANSWER]', prompt)
+        self.assertIn('never ignore your name', prompt)
+
 if __name__=='__main__':unittest.main()
