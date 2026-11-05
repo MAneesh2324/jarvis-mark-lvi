@@ -122,6 +122,19 @@ class SimulationHologram(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
         t = self.elapsed()
+        fly = getattr(self, '_fly', None)
+        if fly is not None:                                  # thrown: slide off that way, spin a little, fade
+            k = min(1.0, (time.monotonic() - fly[0]) / .55)
+            if k >= 1:
+                self._fly = None
+                QTimer.singleShot(0, self._finish_throw)
+            ease = k * k
+            p.fillRect(self.rect(), self.col['bg'])
+            p.translate(fly[1] * w * 1.3 * ease + w / 2, fly[2] * h * 1.3 * ease + h / 2)
+            p.rotate(fly[1] * 18 * ease)
+            p.scale(1 - .35 * ease, 1 - .35 * ease)
+            p.translate(-w / 2, -h / 2)
+            p.setOpacity(1 - ease)
         if self.finished() and self._timer.isActive():
             # idle shimmer only — but a live session's hologram keeps turning smoothly
             self._timer.setInterval(50 if self.result.get('session') or self.shown.get('scene') else 120)
@@ -173,6 +186,10 @@ class SimulationHologram(QWidget):
             self._scene(p, eq, t, scene)
         if self._deferred:                                   # hover readouts sit on top of everything
             self._readout(p, *self._deferred)
+        if getattr(self, '_exploded', False) or time.monotonic() - getattr(self, '_explode_at', -99) < .5:
+            self._exploded_view(p, chart, w, h)
+        if getattr(self, '_hood', False) or time.monotonic() - getattr(self, '_hood_at', -99) < .35:
+            self._under_the_hood(p, w, h)
         self._gesture_layer(p, w, h, chart)
         self._scanlines(p, w, h, t)
 
@@ -592,7 +609,153 @@ class SimulationHologram(QWidget):
         p.drawEllipse(at, 4, 4)
 
     # ── hand gestures ───────────────────────────────────────────────────────
-    GESTURE_HINT = '☝ point  ·  🤏 drag = scrub time  ·  👐 spread = zoom  ·  ✋ swipe = attempts  ·  ✋ hold = replay  ·  ✊ hold = reset'
+    GESTURE_HINT = ('☝ point · 🤏 drag = scrub · 👐 spread = zoom, burst = explode, turn = twist · ✋ swipe ←→ attempts, '
+                    '↑ under the hood, ↓ close · ✋ push = re-run · ✊ fling = throw away, hold = reset')
+
+    def _finish_throw(self):
+        self._exploded = self._hood = False
+        self._zoom, self._zoom_center = 1.0, None
+        self._timer.stop()
+        self.closed.emit()
+
+    def _cycle_focus(self, step):
+        """Twist: turn through the model's quantities like a dial (process models), keeping the session."""
+        series = self.result.get('series') or (self.shown.get('series') if hasattr(self, 'shown') else None)
+        if not series:
+            self._toast('↻ TWIST')
+            return
+        names = list(series)
+        current = self.shown.get('focus') if self.shown.get('focus') in names else names[0]
+        name = names[(names.index(current) + step) % len(names)]
+        from core.scenario_simulator import headline
+        ts = self.shown.get('series_t') or []
+        rows = [{'day': t, 'p05': v, 'median': v, 'p95': v} for t, v in zip(ts, series[name])]
+        shown = dict(self.shown, focus=name, fan_chart=rows, y_unit=(self.shown.get('units') or {}).get(name, ''),
+                     band_label='line = ' + name.replace('_', ' ') + '  ·  twist again for the next one')
+        self.shown, self.rows = shown, rows
+        self.head = headline(dict(self.result, **{k: shown[k] for k in ('focus', 'fan_chart', 'y_unit')}))
+        self._toast('↻ ' + name.replace('_', ' ').upper())
+
+    def _panels(self):
+        """What the exploded view breaks the model into: one panel per quantity."""
+        sh = self.shown
+        if sh.get('series'):
+            ts = sh.get('series_t') or []
+            return [(n.replace('_', ' '), (sh.get('units') or {}).get(n, ''), list(zip(ts, v))) for n, v in sh['series'].items()]
+        out = [('median' if sh.get('kind') != 'backtest' else ('balance' if sh.get('y_unit') == 'money' else 'equity R'),
+                sh.get('y_unit', ''), [(r['day'], r['median']) for r in self.rows])]
+        if any(abs(r['p95'] - r['p05']) > 1e-9 for r in self.rows) and sh.get('kind') != 'backtest':
+            out += [('95th percentile', sh.get('y_unit', ''), [(r['day'], r['p95']) for r in self.rows]),
+                    ('5th percentile', sh.get('y_unit', ''), [(r['day'], r['p05']) for r in self.rows])]
+        if sh.get('trades'):
+            out.append(('trade R', 'R', [(tr['n'], tr.get('r') or 0) for tr in sh['trades']]))
+            peak, dd = float('-inf'), []
+            for r in self.rows:
+                peak = max(peak, r['median'])
+                dd.append((r['day'], peak - r['median']))
+            out.append(('drawdown', sh.get('y_unit', ''), dd))
+        return out
+
+    def _exploded_view(self, p, chart, w, h):
+        panels = self._panels()[:6]
+        if not panels:
+            return
+        k = min(1.0, (time.monotonic() - getattr(self, '_explode_at', 0)) / .5)
+        k = 1 - (1 - k) ** 3
+        if not getattr(self, '_exploded', False):
+            k = 1 - k                                        # imploding: fly back in
+        area = QRectF(chart.left() - 40, chart.top() - 6, chart.width() + 46, chart.height() + 12)
+        p.fillRect(area, self._c('bg', 225 * k))
+        cols = 2 if len(panels) <= 4 else 3
+        rows = math.ceil(len(panels) / cols)
+        gw, gh = area.width() / cols, area.height() / rows
+        hover = getattr(self, '_hover', None)
+        day = None
+        if hover is not None and hasattr(self, '_w0') and chart.width():
+            day = self._w0 + (hover.x() - chart.left()) / chart.width() * self._span
+        cx, cy = area.center().x(), area.center().y()
+        for i, (name, unit, pts) in enumerate(panels):
+            target = QRectF(area.left() + (i % cols) * gw + 6, area.top() + (i // cols) * gh + 6, gw - 12, gh - 12)
+            box = QRectF(cx + (target.left() - cx) * k, cy + (target.top() - cy) * k, target.width() * (.3 + .7 * k),
+                         target.height() * (.3 + .7 * k))
+            p.setPen(QPen(self._c('pri', 200 * k), 1.2))
+            p.setBrush(self._c('bg', 235 * k))
+            p.drawRoundedRect(box, 6, 6)
+            if k < .6 or len(pts) < 2:
+                continue
+            vals = [v for _, v in pts]
+            lo, hi = min(vals), max(vals)
+            hi = hi if hi > lo else lo + 1
+            t0, t1 = pts[0][0], pts[-1][0] if pts[-1][0] > pts[0][0] else pts[0][0] + 1
+            inner = QRectF(box.left() + 10, box.top() + 34, box.width() - 20, box.height() - 46)
+            path = QPainterPath()
+            for j, (tt, v) in enumerate(pts):
+                q = QPointF(inner.left() + inner.width() * (tt - t0) / (t1 - t0), inner.bottom() - inner.height() * (v - lo) / (hi - lo))
+                path.moveTo(q) if j == 0 else path.lineTo(q)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for width, alpha in ((5, 40), (1.6, 240)):
+                p.setPen(QPen(self._c('pri' if i else 'white', alpha * k), width))
+                p.drawPath(path)
+            p.setPen(self._c('dim', 255 * k))
+            p.setFont(QFont('Courier New', 8))
+            p.drawText(QRectF(box.left() + 10, box.top() + 6, box.width() - 20, 12), Qt.AlignmentFlag.AlignLeft, name.upper())
+            shown_v, shown_t = vals[-1], pts[-1][0]
+            if day is not None and t0 <= day <= t1:
+                near = min(pts, key=lambda q: abs(q[0] - day))
+                shown_t, shown_v = near
+                x = inner.left() + inner.width() * (near[0] - t0) / (t1 - t0)
+                p.setPen(QPen(self._c('acc2', 200 * k), 1, Qt.PenStyle.DotLine))
+                p.drawLine(QPointF(x, inner.top()), QPointF(x, inner.bottom()))
+            p.setPen(self._c('white', 255 * k))
+            p.setFont(QFont('Courier New', 12, QFont.Weight.Bold))
+            unit_x = self.shown.get('x_unit', '')
+            p.drawText(QRectF(box.left() + 10, box.top() + 16, box.width() - 20, 18), Qt.AlignmentFlag.AlignLeft,
+                       f"{_num(shown_v, 'R' if unit == 'R' else '')} {'' if unit == 'R' else unit}".strip()
+                       + f"   @ {shown_t:,.0f}" + (f" {unit_x}" if unit_x else ''))
+
+    def _under_the_hood(self, p, w, h):
+        """Swipe up: the model's formulas and settings slide up over the board."""
+        k = min(1.0, (time.monotonic() - getattr(self, '_hood_at', 0)) / .35)
+        k = 1 - (1 - k) ** 3
+        if not getattr(self, '_hood', False):
+            k = 1 - k
+        sh = self.shown
+        lines = []
+        if sh.get('formulas'):
+            lines.append(('MODEL', 'pri'))
+            for name, (kind, text) in sh['formulas'].items():
+                lines.append((f"{'d/dt ' if kind == 'rate' else ''}{name} = {text}", 'text'))
+        a = sh.get('assumptions') or {}
+        settings = a.get('settings') if isinstance(a.get('settings'), dict) else {k2: v for k2, v in a.items() if not isinstance(v, (dict, list))}
+        if settings:
+            lines.append(('SETTINGS', 'pri'))
+            lines += [(f"{k2.replace('_', ' ')} = {v}", 'text') for k2, v in settings.items() if v is not None]
+        st = sh.get('stats') or {}
+        if st:
+            lines.append(('RESULT', 'pri'))
+            lines += [(f"{k2.replace('_', ' ')} = {v}", 'text') for k2, v in st.items() if v is not None]
+        for key in ('method', 'limits'):
+            if sh.get(key):
+                lines.append((key.upper(), 'pri'))
+                lines.append((str(sh[key]), 'dim'))
+        hh = min(h * .78, 22 + 15 * len(lines) + 40)
+        box = QRectF(24, h - hh * k, w - 48, hh)
+        p.setPen(QPen(self._c('pri', 220 * k), 1.2))
+        p.setBrush(self._c('bg', 240 * k))
+        p.drawRoundedRect(box, 8, 8)
+        p.setFont(QFont('Courier New', 9))
+        y = box.top() + 18
+        p.setPen(self._c('acc2', 255 * k))
+        p.drawText(QPointF(box.left() + 14, y), 'UNDER THE HOOD   ·   swipe down to close')
+        y += 20
+        for text, tone in lines:
+            if y > box.bottom() - 8:
+                break
+            p.setPen(self._c(tone, 255 * k))
+            p.setFont(QFont('Courier New', 9, QFont.Weight.Bold if tone == 'pri' else QFont.Weight.Normal))
+            p.drawText(QRectF(box.left() + 14, y - 11, box.width() - 28, 14), Qt.AlignmentFlag.AlignLeft,
+                       p.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, int(box.width() - 28)))
+            y += 15
 
     def apply_hand_gesture(self, event: dict) -> None:
         """Camera hand gestures on the board: point, scrub, zoom, swipe through attempts, replay, reset."""
@@ -617,15 +780,46 @@ class SimulationHologram(QWidget):
             if hover is not None and hasattr(self, '_w0') and chart.width():
                 self._zoom_center = self._w0 + (hover.x() - chart.left()) / chart.width() * self._span
             self._toast(f"ZOOM ×{self._zoom:.1f}")
-        elif kind == 'swipe':
+        elif kind == 'swipe' and event.get('direction') in ('left', 'right'):
             self._step_attempt(-1 if event.get('direction') == 'left' else 1)
+        elif kind == 'swipe' and event.get('direction') == 'up':
+            self._hood, self._hood_at = True, now
+            self._toast('UNDER THE HOOD')
+        elif kind == 'swipe' and event.get('direction') == 'down':
+            if getattr(self, '_hood', False):
+                self._hood, self._hood_at = False, now
+            elif getattr(self, '_exploded', False):
+                self._exploded, self._explode_at = False, now
+            else:
+                self._fly = (now, 0, 1)                      # swipe down on the plain board puts it away
         elif kind == 'palm_hold':
             self._toast('▶ REPLAY')
             self.set_result(self.result)
         elif kind == 'reset':
             self._zoom, self._zoom_center, self._spin, self._hover = 1.0, None, 0.0, None
+            self._exploded = self._hood = False
             self._toast('VIEW RESET')
             self.set_result(self.result)
+        elif kind == 'throw':
+            vec = {'left': (-1, 0), 'right': (1, 0), 'up': (0, -1), 'down': (0, 1)}.get(event.get('direction'), (1, 0))
+            self._fly = (now, vec[0], vec[1])
+            self._toast('')
+        elif kind == 'explode':
+            self._exploded, self._explode_at = True, now
+            self._toast('◇ EXPLODED VIEW')
+        elif kind == 'implode':
+            if getattr(self, '_exploded', False):
+                self._exploded, self._explode_at = False, now
+                self._toast('◆ ASSEMBLED')
+        elif kind == 'twist':
+            self._spin = getattr(self, '_spin', 0.0) + (1.2 if event.get('direction') == 'cw' else -1.2)
+            self._cycle_focus(1 if event.get('direction') == 'cw' else -1)
+        elif kind == 'push':
+            self._toast('▶ RE-RUNNING')
+            self.set_result(self.result)
+        elif kind == 'pull':
+            self._zoom, self._zoom_center = 1.0, None
+            self._toast('◁ ZOOMED OUT')
         if not self._timer.isActive():
             self._timer.start(50)
         self.update()
@@ -673,7 +867,8 @@ class SimulationHologram(QWidget):
         if k < 1.4:
             a = 1 if k < 1 else (1.4 - k) / .4
             p.setFont(QFont('Courier New', 13, QFont.Weight.Bold))
-            box = QRectF(chart.center().x() - 150, chart.bottom() - 74, 300, 30)
+            top = getattr(self, '_hood', False) or getattr(self, '_exploded', False)
+            box = QRectF(chart.center().x() - 150, chart.top() - 30 if top else chart.bottom() - 74, 300, 30)
             p.setPen(QPen(self._c('acc2', 220 * a), 1))
             p.setBrush(self._c('bg', 210 * a))
             p.drawRoundedRect(box, 4, 4)

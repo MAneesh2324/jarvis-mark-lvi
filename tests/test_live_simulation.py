@@ -254,5 +254,76 @@ class HandGestures(unittest.TestCase):
         self.assertIn('board.apply_hand_gesture(event)', src)
 
 
+class WorkshopGestures(unittest.TestCase):
+    hand = staticmethod(lambda n, wrist=(.5, .8), scale=1.0: WorkshopGestures._hand(n, wrist, scale))
+
+    @staticmethod
+    def _hand(n, wrist, k):
+        wx, wy = wrist
+        pts = [(wx, wy), (wx - .08 * k, wy - .05 * k), (wx - .12 * k, wy - .1 * k), (wx - .14 * k, wy - .15 * k), (wx - .15 * k, wy - .2 * k)]
+        for i, fx in enumerate((-.04, 0, .04, .08)):
+            fx *= k
+            pts += ([(wx + fx, wy - .15 * k), (wx + fx, wy - .22 * k), (wx + fx, wy - .27 * k), (wx + fx, wy - .32 * k)] if i < n else
+                    [(wx + fx, wy - .15 * k), (wx + fx, wy - .2 * k), (wx + fx + .02 * k, wy - .16 * k), (wx + fx + .01 * k, wy - .13 * k)])
+        return pts
+
+    def kinds(self, frames):
+        from core.hand_gestures import Interpreter
+        i = Interpreter()
+        out = [i.update(f, t) for t, f in frames]
+        return [e['kind'] + (':' + e['direction'] if 'direction' in e else '') for e in out if e['kind'] not in ('idle', 'zoom')]
+
+    def test_each_gesture_fires_once_and_near_misses_do_not(self):
+        import math
+        h = self.hand
+        self.assertEqual(self.kinds([(k * .04, [h(0, (.3 + k * .06, .6))]) for k in range(5)] + [(.21, [h(4, (.62, .6))])]), ['throw:right'])
+        self.assertEqual(self.kinds([(k * .1, [h(0, (.3 + k * .005, .6))]) for k in range(5)] + [(.55, [h(4, (.33, .6))])]), [])
+        self.assertEqual(self.kinds([(k * .1, [h(0)]) for k in range(10)]), ['reset'])
+        self.assertEqual(self.kinds([(k * .05, [h(4, (.45 - k * .08, .7)), h(4, (.55 + k * .08, .7))]) for k in range(5)]), ['explode'])
+        self.assertEqual(self.kinds([(k * .05, [h(4, (.1 + k * .08, .7)), h(4, (.9 - k * .08, .7))]) for k in range(6)]), ['implode'])
+        pair = lambda a: [h(4, (.5 - .2 * math.cos(math.radians(a)), .6 - .2 * math.sin(math.radians(a)))),
+                          h(4, (.5 + .2 * math.cos(math.radians(a)), .6 + .2 * math.sin(math.radians(a))))]
+        self.assertEqual(self.kinds([(k * .06, pair(k * 10)) for k in range(6)]), ['twist:cw'])
+        self.assertEqual(self.kinds([(k * .06, pair(0)) for k in range(6)]), [])
+        self.assertEqual(self.kinds([(k * .04, [h(4, (.5, .8 - k * .06))]) for k in range(6)]), ['swipe:up'])
+        self.assertEqual(self.kinds([(k * .06, [h(4, (.5, .8), 1 + k * .12)]) for k in range(6)]), ['push'])
+        self.assertEqual(self.kinds([(k * .06, [h(4, (.5, .8), 1 - k * .08)]) for k in range(6)]), ['pull'])
+
+    def test_board_responds(self):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        import core.sim_session as S
+        from core.simulation_view import SimulationHologram
+        S.start('process', APPLE)
+        w = SimulationHologram()
+        w.resize(1100, 640)
+        w.set_result(S.board(), animate=False)
+        w.grab()
+        w.apply_hand_gesture({'kind': 'explode'})
+        self.assertTrue(w._exploded)
+        self.assertEqual(len(w._panels()), 3)                           # one panel per quantity
+        self.assertFalse(w.grab().isNull())
+        w.apply_hand_gesture({'kind': 'implode'})
+        self.assertFalse(w._exploded)
+        w.apply_hand_gesture({'kind': 'twist', 'direction': 'cw'})
+        self.assertEqual(w.shown['focus'], 'sugar_percent')
+        w.apply_hand_gesture({'kind': 'twist', 'direction': 'ccw'})
+        self.assertEqual(w.shown['focus'], 'diameter_mm')
+        w.apply_hand_gesture({'kind': 'swipe', 'direction': 'up'})
+        self.assertTrue(w._hood)
+        self.assertFalse(w.grab().isNull())
+        w.apply_hand_gesture({'kind': 'swipe', 'direction': 'down'})
+        self.assertFalse(w._hood)
+        closed = []
+        w.closed.connect(lambda: closed.append(1))
+        w.apply_hand_gesture({'kind': 'throw', 'direction': 'left'})
+        w._fly = (w._fly[0] - 2, -1, 0)                                   # past the end of the fly-off
+        w.grab()
+        app.processEvents()
+        self.assertEqual(closed, [1])
+        S.reset()
+
+
 if __name__ == '__main__':
     unittest.main()
