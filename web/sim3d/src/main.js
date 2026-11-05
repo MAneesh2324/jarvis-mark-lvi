@@ -4,6 +4,7 @@
 //   Sim3D.load(model)    model = {scene, series, series_t, units, title, x_unit, status}
 //   Sim3D.setTime(t)     show the state at time t; null = play the whole run as a time-lapse loop
 //   Sim3D.setStatus(s)   'success' | 'failed' | null — tints the stage
+//   Sim3D.hands(frame)   one hand-tracker frame (see interact.js for the controls)
 // and reads Sim3D.currentTime() to mark the chart.
 //
 // Scenes: tree (fruit tree), grow (one object on a pedestal), fill (glass tank),
@@ -16,6 +17,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+import { setupInteraction } from './interact.js';
 
 const CYAN = new THREE.Color('#18d3ed');
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
@@ -368,23 +370,71 @@ window.addEventListener('resize', resize);
 
 function duration() { const ts = (model && model.series_t) || [0, 1]; return [ts[0], ts[ts.length - 1]]; }
 
+// ── playback and camera, both driven by hands / mouse ──────────────────────
+// time: a playhead that loops through the run; scrubbing pauses it where you leave it.
+// Python's chart hover (forcedTime) shows a moment without moving the playhead.
+const play = { t: 0, on: true, hold: 0, scrubAt: -1e9 };
+const LOOP_SECONDS = 10, END_HOLD = 1.6;
+// camera: goal values the controls set, and the shown values that ease toward them
+const cam = { yaw: 0, pitch: 0, zoom: 1, gYaw: 0, gPitch: 0, gZoom: 1, vYaw: 0, vPitch: 0, touched: -1e9, autoSpin: 0 };
+const PITCH_MIN = -0.32, PITCH_MAX = 0.85;
+const nowS = () => performance.now() / 1000;
+
+const controls = setupInteraction({
+  canvas,
+  duration,
+  time: () => shownTime,
+  playing: () => play.on && forcedTime === null,
+  unit: () => (model && model.x_unit) || '',
+  seek(t) { play.t = t; play.on = false; play.hold = 0; play.scrubAt = nowS(); },
+  togglePlay() {
+    const [t0, t1] = duration();
+    if (!play.on && play.t >= t1 - 1e-6) play.t = t0;      // at the end: play again from the start
+    play.on = !play.on; play.hold = 0;
+  },
+  resetView() { cam.gYaw = cam.gYaw - (((cam.gYaw % (Math.PI * 2)) + Math.PI * 3) % (Math.PI * 2) - Math.PI); cam.gPitch = 0; cam.gZoom = 1; cam.vYaw = cam.vPitch = 0; },
+  orbit(dy, dp) { cam.gYaw += dy; cam.gPitch = clamp(cam.gPitch + dp, PITCH_MIN, PITCH_MAX); cam.vYaw = cam.vPitch = 0; },
+  yawPitch: () => [cam.gYaw, cam.gPitch],
+  setYawPitch(y, p) { cam.gYaw = y; cam.gPitch = clamp(p, PITCH_MIN, PITCH_MAX); },
+  zoom: () => cam.gZoom,
+  setZoom(z) { cam.gZoom = z; },
+  fling(vy, vp) { cam.vYaw = vy; cam.vPitch = vp; },
+  touch() { cam.touched = nowS(); },
+  request(msg) { console.info('[[sim3d]] ' + msg); },        // read by the Python side (sim3d_view.py)
+});
+
+let lastTick = nowS();
 function tick() {
   requestAnimationFrame(tick);
-  const time = clock.getElapsedTime();
+  const time = clock.getElapsedTime(), now = nowS(), dt = Math.min(0.05, now - lastTick); lastTick = now;
   if (model && built) {
     const [t0, t1] = duration();
-    if (forcedTime !== null) shownTime = forcedTime;
-    else { const loop = 10, hold = 1.6, k = (time % (loop + hold)) / loop; shownTime = lerp(t0, t1, Math.min(1, k)); }
+    if (play.on) {
+      if (play.t >= t1) { play.hold += dt; if (play.hold > END_HOLD) { play.t = t0; play.hold = 0; } }
+      else play.t = Math.min(t1, play.t + dt * (t1 - t0) / LOOP_SECONDS);
+    }
+    shownTime = forcedTime !== null && now - play.scrubAt > 0.3 ? forcedTime : play.t;   // a scrub beats the chart hover
     built.update(shownTime, time);
-    const h = built.height || 4;
-    const ang = time * 0.12, aspect = Math.max(.6, camera.aspect);
-    const dist = (h * 2.35 + 2.2) / Math.min(1, aspect);
-    camera.position.set(Math.sin(ang) * dist, h * 0.55 + 0.9, Math.cos(ang) * dist);
-    camera.lookAt(0, h * 0.5, 0);
+    // camera: a slow turntable when nobody is touching it, fling inertia after a spin
+    const idle = now - cam.touched;
+    cam.autoSpin = lerp(cam.autoSpin, idle > 4 ? 0.12 : 0, 1 - Math.exp(-dt * (idle > 4 ? 0.8 : 6)));
+    cam.gYaw += (cam.autoSpin + cam.vYaw) * dt;
+    cam.gPitch = clamp(cam.gPitch + cam.vPitch * dt, PITCH_MIN, PITCH_MAX);
+    const decay = Math.exp(-dt * 2.4); cam.vYaw *= decay; cam.vPitch *= decay;
+    const e = 1 - Math.exp(-dt * 12);
+    cam.yaw += (cam.gYaw - cam.yaw) * e; cam.pitch += (cam.gPitch - cam.pitch) * e;
+    cam.zoom += (cam.gZoom - cam.zoom) * (1 - Math.exp(-dt * 9));
+    const h = built.height || 4, aspect = Math.max(.6, camera.aspect);
+    const base = (h * 2.35 + 2.2) / Math.min(1, aspect), lift = h * 0.05 + 0.9;
+    const dist = Math.hypot(base, lift) * cam.zoom, pitch = Math.atan2(lift, base) + cam.pitch;
+    const target = new THREE.Vector3(0, h * 0.5, 0);
+    camera.position.set(Math.sin(cam.yaw) * Math.cos(pitch) * dist, target.y + Math.sin(pitch) * dist, Math.cos(cam.yaw) * Math.cos(pitch) * dist);
+    camera.lookAt(target);
     scan.position.y = (Math.sin(time * 0.9) * 0.5 + 0.5) * h;
     scan.scale.setScalar(0.75 + 0.35 * Math.sin(time * 0.9 + 1));
     hudText(shownTime);
   }
+  controls.update();
   const tint = status === 'success' ? new THREE.Color('#00ff88') : status === 'failed' ? new THREE.Color('#ff3355') : CYAN;
   rings.forEach((m, i) => { m.material.color.copy(tint); m.material.opacity = 0.55 + 0.35 * Math.sin(clock.elapsedTime * 2 + i); });
   scan.material.color.copy(tint); rim.color.copy(tint);
@@ -402,7 +452,7 @@ function hudText(t) {
 
 window.Sim3D = {
   load(m) {
-    model = m; clear();
+    model = m; clear(); play.t = duration()[0]; play.on = true; play.hold = 0;
     const sc = Object.assign({ type: 'columns' }, m.scene || {});
     const make = BUILDERS[sc.type] || buildColumns;
     built = make(sc); stage.add(built.group); frame(built.height);
@@ -411,6 +461,8 @@ window.Sim3D = {
     return true;
   },
   setTime(t) { forcedTime = (t === null || t === undefined) ? null : Number(t); return true; },
+  hands(data) { controls.frame(data || {}); return true; },          // one tracker frame: {t, hands: [{id, x, y, s, p, pts}]}
+  gestureState(st) { controls.gestureState(st); return true; },
   setStatus(s) { status = s || null; return true; },
   currentTime() { return shownTime; },
   ready: true,

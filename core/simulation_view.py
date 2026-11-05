@@ -55,6 +55,7 @@ def _at(rows, day):
 
 class SimulationHologram(QWidget):
     closed = pyqtSignal()
+    gesture_request = pyqtSignal(str)                       # the 3D view's ✋ button
 
     def __init__(self, palette: dict | None = None, parent=None):
         super().__init__(parent)
@@ -113,6 +114,8 @@ class SimulationHologram(QWidget):
         if wants and view is None and not getattr(self, '_3d_failed', False):
             view = self._view3d = self.make_3d(self)
             self._3d_failed = view is None
+            if view is not None and hasattr(view, 'gesture_request'):
+                view.gesture_request.connect(self.gesture_request.emit)
         self._3d_on = bool(wants and view is not None)
         if view is not None:
             if self._3d_on:
@@ -252,6 +255,8 @@ class SimulationHologram(QWidget):
             p.drawRect(hero.adjusted(-1, -1, 1, 1))
         if self._deferred:                                   # hover readouts sit on top of everything
             self._readout(p, *self._deferred)
+        if getattr(self, '_hand', None):
+            self._hand_cursor(p)
         self._scanlines(p, w, h, t)
 
     def _header(self, p, w, t):
@@ -660,6 +665,57 @@ class SimulationHologram(QWidget):
 
     def _defer(self, at, lines, r):
         self._deferred = (at, lines, r)
+
+    # ── hands ──────────────────────────────────────────────────────────────
+    REACH = (0.16, 0.84, 0.14, 0.80)                        # the comfortable middle of the camera picture
+
+    def hand(self, event: dict) -> None:
+        """A hand-tracker frame. The 3D view does its own smooth controls; a flat board gets a
+        hand cursor that reads the chart like the mouse does."""
+        frame = {'t': event.get('t'), 'hands': list(event.get('hands') or [])[:2]}
+        view = getattr(self, '_view3d', None)
+        if getattr(self, '_3d_on', False) and view is not None:
+            view.hand(frame)
+            if getattr(self, '_hand', None):
+                self._hand = None
+                self.update()
+            return
+        if not frame['hands'] or not getattr(self, '_chart', None):
+            if getattr(self, '_hand', None):
+                self._hand = self._hover = None
+                self.update()
+            return
+        h = frame['hands'][0]
+        x0, x1, y0, y1 = self.REACH
+        u = min(1.0, max(0.0, (h['x'] - x0) / (x1 - x0)))
+        v = min(1.0, max(0.0, (h['y'] - y0) / (y1 - y0)))
+        c = self._chart
+        target = QPointF(c.left() + u * c.width(), c.top() + v * c.height())
+        old = getattr(self, '_hand', None)
+        if old is not None:                                  # ease toward the hand: smooth, never jumpy
+            k = 0.55
+            target = QPointF(old[0].x() + (target.x() - old[0].x()) * k, old[0].y() + (target.y() - old[0].y()) * k)
+        self._hand = (target, float(h.get('s') or 0), bool(h.get('p')))
+        self._hover = target
+        self.update()
+
+    def gesture_state(self, state: dict) -> None:
+        view = getattr(self, '_view3d', None)
+        if view is not None and hasattr(view, 'gesture_state'):
+            view.gesture_state(state)
+        if not state.get('enabled') and getattr(self, '_hand', None):
+            self._hand = self._hover = None
+            self.update()
+
+    def _hand_cursor(self, p):
+        at, s, held = self._hand
+        r = 18 * (1 - 0.4 * (1 if held else s))
+        p.setPen(QPen(self._c('white' if held else 'text', 230), 2))
+        p.setBrush(self._c('pri', 80) if held else Qt.BrushStyle.NoBrush)
+        p.drawEllipse(at, r, r)
+        p.setBrush(self._c('white'))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(at, 2.5, 2.5)
 
     def mouseMoveEvent(self, e):
         self._hover = e.position()

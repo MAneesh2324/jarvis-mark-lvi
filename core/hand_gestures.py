@@ -9,6 +9,65 @@ def distance(a,b):return math.sqrt(sum((float(a[i])-float(b[i]))**2 for i in ran
 def angle(a,b,c):
  u=[a[i]-b[i] for i in range(2)];v=[c[i]-b[i] for i in range(2)];norm=math.hypot(*u)*math.hypot(*v)
  return math.degrees(math.acos(max(-1,min(1,sum(x*y for x,y in zip(u,v))/norm)))) if norm>1e-8 else 0
+class LatestFrame:
+ """Reads the camera on its own thread and keeps only the newest frame.
+
+ OpenCV queues frames inside the camera driver; a loop that runs even slightly slower than the
+ camera then works on frames a quarter of a second old, which is what lag feels like."""
+ def __init__(self,cap,stop):
+  self.cap,self.stop=cap,stop;self.frame=None;self.ok=False;self.seq=0;self.taken=0;self.stamp=0.
+  self.cond=threading.Condition();self.closed=False
+  self.thread=threading.Thread(target=self._run,daemon=True,name='gesture-camera-reader');self.thread.start()
+ def _run(self):
+  while not self.stop.is_set() and not self.closed:
+   ok,frame=self.cap.read();stamp=time.monotonic()
+   with self.cond:
+    self.ok,self.frame,self.stamp=ok,frame,stamp;self.seq+=1;self.cond.notify_all()
+   if not ok:time.sleep(.02)
+ def next(self,timeout=.5):
+  with self.cond:
+   if self.seq==self.taken:self.cond.wait(timeout)
+   self.taken=self.seq
+   return self.ok,(None if self.frame is None else self.frame.copy()),self.stamp
+ def close(self):
+  self.closed=True
+  with self.cond:self.cond.notify_all()
+  self.thread.join(timeout=1)
+
+
+class HandPose:
+ """Landmarks -> what the simulation board needs from each hand.
+
+ x, y   a steady pointer between the thumb tip, index tip and index knuckle, so closing a pinch
+        barely moves it (no jump when you grab)
+ s      how far the pinch has closed, 0 (open) .. 1 (touching): the cursor ring shrinks with it
+ p      the pinch is held. Press needs the tips nearly touching; release needs them clearly apart
+        for two frames in a row, so a drag never drops halfway through a move.
+ A fist counts as a pinch too (thumb on the index finger), so 'grab' works either way."""
+ PRESS=.30;RELEASE=.45;RELEASE_FRAMES=2
+ def __init__(self):self.state={}
+ @staticmethod
+ def ratio(h):return distance(h[4],h[8])/max(.04,distance(h[0],h[9]))
+ def update(self,hands,labels=None):
+  out=[];seen=[]
+  for i,h in enumerate(hands or []):
+   if len(h)!=21:continue
+   key=str(labels[i]) if labels and i<len(labels) and labels[i] else 'hand'
+   while key in seen:key+='+'
+   seen.append(key)
+   r=self.ratio(h);st=self.state.setdefault(key,{'held':False,'apart':0})
+   if st['held']:
+    st['apart']=st['apart']+1 if r>self.RELEASE else 0
+    if st['apart']>=self.RELEASE_FRAMES:st['held']=False;st['apart']=0
+   elif r<self.PRESS:st['held']=True;st['apart']=0
+   x=(h[4][0]+h[8][0])*.3+h[5][0]*.4;y=(h[4][1]+h[8][1])*.3+h[5][1]*.4
+   out.append({'id':key,'x':round(float(x),4),'y':round(float(y),4),'s':round(max(0.,min(1.,(.65-r)/(.65-.25))),3),
+               'p':st['held'],'pts':[[round(float(a[0]),3),round(float(a[1]),3)] for a in h]})
+  for gone in [k for k in self.state if k not in seen]:del self.state[gone]
+  out.sort(key=lambda d:d['x'])
+  return out
+
+
 class Interpreter:
  def __init__(self):self.clear()
  def clear(self):self.anchor=None;self.span=None;self.fist_at=None;self.fist_latched=False;self.pinched=False
@@ -137,11 +196,15 @@ class GestureController:
      from actions.screen_processor import _load_config,_cv2_backend
      index=int(_load_config().get('camera_index',0));cap=cv2.VideoCapture(index,_cv2_backend());resources.callback(cap.release)
      if not cap.isOpened():raise RuntimeError('Camera could not open for gestures. Close other camera apps and try again.')
-     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);interpreter=Interpreter();last_stamp=0;misses=0;last_preview=0
+     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);cap.set(cv2.CAP_PROP_FPS,30)
+     try:cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+     except Exception:pass
+     interpreter=Interpreter();poses=HandPose();last_stamp=0;misses=0;last_preview=0
+     latest=LatestFrame(cap,stop);resources.callback(latest.close)
      with self._lock:
       if generation==self.generation:self.state='tracking'
      while not stop.is_set():
-      before=time.monotonic();ok,frame=cap.read()
+      ok,frame,taken=latest.next(timeout=.5)
       if not ok or frame is None:
        misses+=1
        if misses>=10:raise RuntimeError('Camera stopped returning frames.')
@@ -149,6 +212,8 @@ class GestureController:
       misses=0;frame=cv2.flip(cv2.resize(frame,(640,480)),1);rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB);stamp=max(last_stamp+1,int(time.monotonic()*1000));last_stamp=stamp
       result=detector.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB,data=rgb),stamp)
       hands=[[(p.x,p.y) for p in hand] for hand in result.hand_landmarks];event=interpreter.update(hands);event['generation']=generation
+      labels=[(c[0].category_name if c else '') for c in (result.handedness or [])]
+      event['hands']=poses.update(hands,labels);event['t']=round(taken,4)
       with self._lock:
        if generation!=self.generation:return
        self.frames+=1;self.label=event['label']
@@ -162,7 +227,6 @@ class GestureController:
         for point in points:cv2.circle(preview,point,3,(0,255,120),-1)
        ok,encoded=cv2.imencode('.jpg',preview,[cv2.IMWRITE_JPEG_QUALITY,45])
        if ok and len(encoded)<=36000:callback({'kind':'preview','generation':generation,'jpeg':base64.b64encode(encoded).decode('ascii'),'label':event['label'],'hands':len(hands)})
-      stop.wait(max(0,.05-(time.monotonic()-before)))
   except Exception as exc:
    with self._lock:
     if generation==self.generation:self.state='failed';self.error=str(exc);self.label='Tracking stopped'

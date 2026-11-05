@@ -5888,6 +5888,7 @@ class MainWindow(QMainWindow):
                 board = SimulationHologram({k: getattr(C, k) for k in ('BG', 'PRI', 'TEXT', 'TEXT_DIM', 'WHITE',
                                                                          'ACC', 'ACC2', 'GREEN', 'RED')})
                 board.closed.connect(lambda: self._hud_cam_stack.setCurrentIndex(0))
+                board.gesture_request.connect(lambda a: self._gesture_control('start' if a.endswith('start') else 'stop'))
                 self._hud_cam_stack.addWidget(board)
                 self._sim_board = board
             except Exception as exc:
@@ -5940,10 +5941,13 @@ class MainWindow(QMainWindow):
             if action=='stop' or action=='toggle' and controller.status()['enabled']:controller.stop()
             elif action in ('start','toggle'):
                 controller.start(self._hand_gesture_sig.emit)
-                self._log.append_log('SYS: Local hand gestures enabled. Camera frames stay on this Mac. Pinch + drag to rotate; two open hands to zoom; hold a fist to reset. Stop with Hand Gestures in Controls.')
+                self._log.append_log('SYS: Local hand gestures enabled. Camera frames stay on this Mac. Simulation board: pinch and drag to spin the model or scrub the timeline, pinch both hands to zoom. Face/Earth: pinch + drag to rotate; two open hands to zoom; hold a fist to reset. Stop with Hand Gestures in Controls.')
         except PermissionError as exc:
             self._log.append_log('SYS: '+str(exc));self._show_camera_permissions()
         except Exception as exc:self._log.append_log('SYS: Hand gestures: '+str(exc))
+        board=getattr(self,'_sim_board',None)
+        if board is not None:
+            board.gesture_state(controller.status())
         self._refresh_screen_controls()
 
     def _apply_hand_gesture(self,event):
@@ -5964,6 +5968,9 @@ class MainWindow(QMainWindow):
                 self._hand_preview_status.show()
             except (ValueError,TypeError):pass
             return
+        board=getattr(self,'_sim_board',None)
+        if board is not None and self._hud_cam_stack.currentWidget() is board:
+            board.hand(event);return                         # the simulation board has its own smooth controls
         if event.get('kind')=='idle':return
         earth=getattr(self,'_earth_panel',None)
         if earth is not None and self._hud_cam_stack.currentWidget() is earth and earth.ready:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import QTimer, QUrl
+from PyQt6.QtCore import QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -17,16 +17,26 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 PAGE = Path(__file__).resolve().parent.parent / 'web' / 'sim3d' / 'index.html'
 
 
+REQUESTS = ('gestures:start', 'gestures:stop')               # the only things the page can ask for
+
+
 class _Page(QWebEnginePage):
+    request = pyqtSignal(str)
+
     def acceptNavigationRequest(self, url, kind, main):
         return url.isLocalFile()                             # nothing but the local scene page
 
     def javaScriptConsoleMessage(self, level, message, line, source):
-        if level == QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel:
+        if message.startswith('[[sim3d]] '):
+            if message[10:] in REQUESTS:
+                self.request.emit(message[10:])
+        elif level == QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel:
             print('[Sim3D JS]', message[:300])
 
 
 class Sim3DView(QWebEngineView):
+    gesture_request = pyqtSignal(str)                        # 'gestures:start' | 'gestures:stop' from the ✋ button
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ready = False
@@ -40,6 +50,7 @@ class Sim3DView(QWebEngineView):
         s.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
         s.setAttribute(QWebEngineSettings.WebAttribute.Accelerated2dCanvasEnabled, True)
         self.setPage(page)
+        page.request.connect(self.gesture_request.emit)
         page.setBackgroundColor(QColor('#00060a'))
         self.loadFinished.connect(self._loaded)
         self.setUrl(QUrl.fromLocalFile(str(PAGE)))
@@ -93,3 +104,10 @@ class Sim3DView(QWebEngineView):
 
     def _got_time(self, value):
         self.current_time = value if isinstance(value, (int, float)) else None
+
+    def hand(self, frame: dict) -> None:
+        """One hand-tracker frame: {t, hands: [{id, x, y, s, p, pts}]}. The page does the smoothing and controls."""
+        self._js('window.Sim3D && Sim3D.hands(' + json.dumps(frame, allow_nan=False) + ');')
+
+    def gesture_state(self, state: dict) -> None:
+        self._js('window.Sim3D && Sim3D.gestureState(' + json.dumps(state, default=str) + ');')

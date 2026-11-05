@@ -266,5 +266,77 @@ class Board3D(unittest.TestCase):
         self.assertTrue(Sim3DView.available())
 
 
+class HandControls(unittest.TestCase):
+    """Pinch tracking for the board, and where hand frames go."""
+
+    @staticmethod
+    def hand(gap, x=0.5, y=0.5):
+        pts = [[x, y + 0.2]] + [[x, y]] * 20                    # wrist below, palm length 0.2
+        pts[9] = [x, y]
+        pts[4] = [x - gap / 2, y - 0.05]                         # thumb tip
+        pts[8] = [x + gap / 2, y - 0.05]                         # index tip
+        return pts
+
+    def test_pinch_press_release_has_hysteresis_and_a_steady_pointer(self):
+        from core.hand_gestures import HandPose
+        pose = HandPose()
+        held = lambda gap: pose.update([self.hand(gap)], ['Right'])[0]['p']
+        self.assertFalse(held(0.15))                             # open: ratio .75
+        self.assertTrue(held(0.05))                              # tips together: pressed
+        self.assertTrue(held(0.07))                              # a little apart: still held
+        self.assertTrue(held(0.12))                              # clearly apart once: still held (one noisy frame)
+        self.assertFalse(held(0.12))                             # twice: released
+        a = pose.update([self.hand(0.15)], ['Right'])[0]
+        b = pose.update([self.hand(0.04)], ['Right'])[0]
+        self.assertLess(abs(a['x'] - b['x']) + abs(a['y'] - b['y']), 0.001)   # closing the pinch does not move the pointer
+        self.assertGreater(b['s'], a['s'])
+        self.assertEqual(len(b['pts']), 21)
+        two = pose.update([self.hand(0.05, x=0.7), self.hand(0.05, x=0.3)], ['Left', 'Right'])
+        self.assertEqual([h['id'] for h in two], ['Right', 'Left'])          # sorted left to right on screen
+        self.assertEqual(pose.update([], []), [])
+
+    def test_frames_reach_the_3d_view_or_a_flat_board_cursor(self):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        import core.sim_session as S
+        from core.simulation_view import SimulationHologram
+        made = []
+
+        class View(Board3D.FakeView):
+            def __init__(self, parent):
+                super().__init__(parent); self.frames = []; self.states = []
+            def hand(self, frame): self.frames.append(frame)
+            def gesture_state(self, st): self.states.append(st)
+
+        with patch.object(SimulationHologram, 'make_3d', staticmethod(lambda parent: made.append(View(parent)) or made[-1])):
+            w = SimulationHologram(); w.resize(1100, 700)
+            S.start('process', APPLE, {'metric': 'ripe', 'op': '<=', 'value': 145})
+            w.set_result(S.board()); w.grab()
+            frame = {'kind': 'idle', 't': 1.0, 'hands': [{'id': 'Right', 'x': .5, 'y': .5, 's': 1, 'p': True, 'pts': []}]}
+            w.hand(frame)
+            self.assertEqual(made[0].frames[-1]['hands'][0]['id'], 'Right')
+            w.gesture_state({'enabled': True, 'state': 'tracking'})
+            self.assertEqual(made[0].states[-1]['state'], 'tracking')
+            w.set_result(__import__('core.scenario_simulator', fromlist=['run']).run('goal', {'total_hours': 30, 'hours_per_day': 2}))
+            w.started -= 60; w.grab()
+            n = len(made[0].frames)
+            w.hand(frame); w.grab()
+            self.assertEqual(len(made[0].frames), n)             # flat board: drawn here, not sent to the hidden 3D view
+            self.assertIsNotNone(w._hand)
+            self.assertTrue(w._chart.contains(w._hover))         # the hand reads the chart like the mouse
+            w.hand({'kind': 'idle', 'hands': []})
+            self.assertIsNone(w._hand)
+            S.reset()
+        app.processEvents()
+
+    def test_page_only_asks_for_gesture_start_and_stop(self):
+        from core.sim3d_view import REQUESTS
+        self.assertEqual(set(REQUESTS), {'gestures:start', 'gestures:stop'})
+        js = (Path(__file__).parent.parent / 'web' / 'sim3d' / 'src' / 'interact.js').read_text()
+        for word in ('OneEuro', 'rewind', "'zoom'", "'scrub'", 'gestures:start'):
+            self.assertIn(word, js)
+
+
 if __name__ == '__main__':
     unittest.main()
