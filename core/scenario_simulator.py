@@ -1,5 +1,5 @@
 """Reproducible hypothetical scenarios. No orders, scans or real system changes."""
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 from pathlib import Path
 import json,math,uuid
 import numpy as np
@@ -45,16 +45,103 @@ def outage(requests_per_minute,outage_minutes,affected_percent,capacity_per_minu
  clearance=0.0 if backlog==0 and spare>=0 else backlog/spare if spare>0 else None
  return {'kind':'outage','assumptions':{'normal_requests_per_minute':arrival,'outage_minutes':minutes,'affected_percent':affected*100,'post_recovery_capacity_per_minute':capacity,'failed_request_retry_percent':retry*100,'initial_backlog':prior},'failed_or_interrupted_requests':lost,'new_retries':lost*retry,'total_recovery_backlog':backlog,'spare_recovery_capacity_per_minute':spare,'estimated_backlog_clearance_minutes':clearance,'stable_recovery':spare>0 or backlog==0 and spare>=0,'method':'Deterministic fluid queue: retries join a single backlog after recovery; new normal traffic consumes capacity first.','limits':'Planning arithmetic, not an operational forecast. Constant rates, perfect retry eligibility, no queue limits, dependencies, timeouts or service-time variance. No systems were contacted or changed.'}
 
+def _fan(step,matrix):
+ a,b,c=np.percentile(matrix,[5,50,95]);return {'day':int(step),'p05':float(a),'median':float(b),'p95':float(c)}
+
+def goal(total_hours,hours_per_day,consistency_percent=80,hours_done=0,deadline_days=None,daily_variation_percent=25,max_days=1095,paths=2000,seed=42):
+ """How long a goal measured in hours takes when real days are uneven: some are skipped, some run short or long."""
+ total=number(total_hours,'Total hours needed',.1,1e6);rate=number(hours_per_day,'Planned hours per day',.01,24)
+ consistency=number(consistency_percent,'Consistency % (days you actually work)',1,100)/100;done=number(hours_done,'Hours already done',0,1e6)
+ variation=number(daily_variation_percent,'Daily variation %',0,200)/100;horizon=integer(max_days,'Longest horizon in days',1,3650)
+ paths=integer(paths,'Paths',100,10000);seed=integer(seed,'Random seed',0,2**32-1)
+ deadline=None if deadline_days in (None,'',0) else integer(deadline_days,'Deadline in days',1,3650)
+ if horizon*paths>4_000_000:raise ValueError('Keep horizon days × paths at or below 4,000,000.')
+ remaining=max(0.0,total-done);rng=np.random.default_rng(seed);progress=np.full(paths,min(done,total));finish=np.full(paths,np.nan)
+ if remaining==0:finish[:]=0
+ history=[progress.copy()];day=0
+ while day<horizon and np.isnan(finish).any():
+  day+=1;worked=rng.random(paths)<consistency;hours=np.clip(rng.normal(rate,rate*variation,paths),0,24)
+  progress=np.minimum(total,progress+worked*hours);newly=np.isnan(finish)&(progress>=total);finish[newly]=day;history.append(progress.copy())
+ span=len(history)-1;steps=sorted(set(np.linspace(0,span,min(31,span+1),dtype=int)))
+ fan=[_fan(s,history[s]) for s in steps];finished=finish[~np.isnan(finish)]
+ pct=(lambda q:float(np.percentile(finished,q)) if len(finished) else None)
+ today=datetime.now().date()
+ when=(lambda d:(today+timedelta(days=math.ceil(d))).isoformat() if d is not None else None)
+ p05,p50,p95=pct(5),pct(50),pct(95)
+ result={'kind':'goal','assumptions':{'total_hours':total,'hours_per_day':rate,'consistency_percent':consistency*100,'hours_done':done,'daily_variation_percent':variation*100,'deadline_days':deadline,'max_days':horizon,'paths':paths,'seed':seed},
+  'x_unit':'days','y_unit':'hours','target':total,'deadline':deadline,
+  'finish_day_p05':p05,'finish_day_median':p50,'finish_day_p95':p95,'finish_date_p05':when(p05),'finish_date_median':when(p50),'finish_date_p95':when(p95),
+  'naive_finish_day':math.ceil(remaining/rate) if rate else None,'simulated_fraction_unfinished_at_horizon_percent':float(np.mean(np.isnan(finish))*100),
+  'fan_chart':fan,'method':'Monte Carlo over days: each day is worked with the consistency probability, worked hours are normal around the plan (clipped to 0–24 h).',
+  'limits':'Hypothetical arithmetic on your own assumptions. Real study plans also depend on difficulty, fatigue, exams and breaks that this model does not see.'}
+ if deadline:result['simulated_fraction_done_by_deadline_percent']=float(np.mean(finish<=deadline)*100)
+ return result
+
+def savings(monthly_contribution,months,start_balance=0,annual_return_percent=0,annual_volatility_percent=0,target=None,paths=2000,seed=42):
+ """A savings plan month by month. Returns and volatility are the user's own assumptions, never JARVIS's."""
+ add=number(monthly_contribution,'Monthly contribution',-1e9,1e9);months=integer(months,'Months',1,1200);start=number(start_balance,'Starting balance',0,1e15)
+ mu=number(annual_return_percent,'Assumed annual return %',-100,100)/100;sigma=number(annual_volatility_percent,'Assumed annual volatility %',0,300)/100
+ paths=integer(paths,'Paths',100,10000);seed=integer(seed,'Random seed',0,2**32-1);goal_value=None if target in (None,'',0) else number(target,'Target balance',0,1e15)
+ if months*paths>2_000_000:raise ValueError('Keep months × paths at or below 2,000,000.')
+ rng=np.random.default_rng(seed);balance=np.full(paths,start);dt=1/12;hit=np.full(paths,np.nan);steps=set(np.linspace(0,months,min(31,months+1),dtype=int));fan=[_fan(0,balance)]
+ if goal_value is not None:hit[balance>=goal_value]=0
+ for m in range(1,months+1):
+  balance=np.maximum(0,balance*np.exp((mu-.5*sigma*sigma)*dt+sigma*math.sqrt(dt)*rng.standard_normal(paths))+add)
+  if goal_value is not None:hit[np.isnan(hit)&(balance>=goal_value)]=m
+  if m in steps:fan.append(_fan(m,balance))
+ a,b,c=np.percentile(balance,[5,50,95]);paid=start+add*months
+ result={'kind':'savings','assumptions':{'start_balance':start,'monthly_contribution':add,'months':months,'annual_return_percent':mu*100,'annual_volatility_percent':sigma*100,'target':goal_value,'paths':paths,'seed':seed},
+  'x_unit':'months','y_unit':'balance','target':goal_value,'final_balance_p05':float(a),'final_balance_median':float(b),'final_balance_p95':float(c),'total_paid_in':paid,'fan_chart':fan,
+  'method':'Monthly geometric Brownian motion on the balance with your assumed return and volatility, contribution added at each month end.',
+  'limits':'Hypothetical model outcomes from your assumptions, not investment advice or a forecast. No taxes, fees, inflation or changing contributions.'}
+ if goal_value is not None:
+  reached=hit[~np.isnan(hit)];result['simulated_fraction_reaching_target_percent']=float(np.mean(~np.isnan(hit))*100);result['target_month_median']=float(np.median(reached)) if len(reached) else None
+ return result
+
+_FMT=lambda v,d=1:'—' if v is None else (f'{v:,.{d}f}' if abs(v)<1e6 else f'{v:,.3g}')
+
+def headline(result):
+ """Title, metric cards and a one-line verdict for the holographic display and for JARVIS to say."""
+ kind=result.get('kind');a=result.get('assumptions',{});m=[]
+ if kind=='comparison':
+  inner=headline(result.get('alternative',{}));base=headline(result.get('baseline',{}))
+  changed=', '.join(f"{k} {v['baseline']}→{v['alternative']}" for k,v in result.get('changed_assumptions',{}).items()) or 'no assumption changed'
+  return {'title':'COMPARISON · '+inner['title'],'metrics':inner['metrics'],'verdict':'Changed: '+changed+'. Baseline: '+base['verdict']+' Alternative: '+inner['verdict']}
+ if kind=='goal':
+  p50=result.get('finish_day_median');p05=result.get('finish_day_p05');p95=result.get('finish_day_p95')
+  m=[('MEDIAN FINISH',f"day {_FMT(p50,0)}",'pri'),('LIKELY RANGE',f"{_FMT(p05,0)}–{_FMT(p95,0)} days",'acc2'),('IF EVERY DAY WENT TO PLAN',f"day {_FMT(result.get('naive_finish_day'),0)}",'dim'),('PLAN',f"{_FMT(a.get('hours_per_day'))} h/day · {_FMT(a.get('consistency_percent'),0)}% of days",'dim')]
+  if a.get('deadline_days'):
+   chance=result.get('simulated_fraction_done_by_deadline_percent',0);m.insert(1,(f"DONE BY DAY {a['deadline_days']}",f"{chance:.0f}% of runs",'green' if chance>=70 else 'acc2' if chance>=40 else 'red'))
+  verdict=(f"At {_FMT(a.get('hours_per_day'))} hours a day, working {a.get('consistency_percent',0):.0f}% of days, the median run reaches {_FMT(a.get('total_hours'),0)} hours on day {_FMT(p50,0)} ({result.get('finish_date_median') or 'beyond the horizon'})." if p50 is not None else 'Most runs did not finish inside the horizon; raise the hours or the consistency.')
+  return {'title':'GOAL TIMELINE','metrics':m,'verdict':verdict}
+ if kind=='savings':
+  m=[('MEDIAN BALANCE',_FMT(result.get('final_balance_median'),0),'pri'),('5TH–95TH PERCENTILE',f"{_FMT(result.get('final_balance_p05'),0)} – {_FMT(result.get('final_balance_p95'),0)}",'acc2'),('PAID IN',_FMT(result.get('total_paid_in'),0),'dim')]
+  if result.get('target') is not None:
+   chance=result.get('simulated_fraction_reaching_target_percent',0);m.insert(1,('RUNS REACHING TARGET',f'{chance:.0f}%','green' if chance>=70 else 'acc2' if chance>=40 else 'red'))
+  return {'title':'SAVINGS PLAN','metrics':m,'verdict':f"After {a.get('months')} months the median run ends near {_FMT(result.get('final_balance_median'),0)} from {_FMT(result.get('total_paid_in'),0)} paid in, under your assumed {a.get('annual_return_percent',0):.1f}% return."}
+ if kind=='forex':
+  m=[('MEDIAN END RATE',_FMT(result.get('terminal_rate_median'),5),'pri'),('5TH–95TH PERCENTILE',f"{_FMT(result.get('terminal_rate_p05'),5)} – {_FMT(result.get('terminal_rate_p95'),5)}",'acc2'),('RUNS BELOW START',f"{result.get('simulated_fraction_below_unshocked_start_percent',0):.0f}%",'dim'),('P95 MAX DRAWDOWN',f"{result.get('p95_path_max_drawdown_percent',0):.1f}%",'red')]
+  return {'title':'FOREX PATHS','metrics':m,'verdict':f"Over {a.get('trading_days')} trading days the median path ends at {_FMT(result.get('terminal_rate_median'),5)}; one run in twenty ends below {_FMT(result.get('terminal_rate_p05'),5)}."}
+ if kind=='trade_stress':
+  net=result.get('net_pnl_account_currency',0)
+  m=[('NET P&L',_FMT(net,2),'green' if net>=0 else 'red'),('EQUITY AFTER',_FMT(result.get('equity_after_scenario'),2),'pri'),('EQUITY CHANGE',f"{result.get('equity_change_percent',0):+.2f}%",'acc2')]
+  return {'title':'TRADE STRESS TEST','metrics':m,'verdict':f"A {a.get('move_percent',0):+.2f}% move on this {a.get('direction')} position changes equity by {result.get('equity_change_percent',0):+.2f}%."}
+ if kind=='outage':
+  clear=result.get('estimated_backlog_clearance_minutes')
+  m=[('FAILED REQUESTS',_FMT(result.get('failed_or_interrupted_requests'),0),'red'),('RECOVERY BACKLOG',_FMT(result.get('total_recovery_backlog'),0),'acc2'),('CLEARS IN',('never — no spare capacity' if clear is None else f'{clear:.0f} min'),'green' if result.get('stable_recovery') else 'red')]
+  return {'title':'OUTAGE RECOVERY','metrics':m,'verdict':('Recovery is stable.' if result.get('stable_recovery') else 'Recovery never catches up: capacity is below normal traffic.')}
+ return {'title':'SIMULATION','metrics':[],'verdict':''}
+
 def run(kind,parameters):
  if not isinstance(parameters,dict):raise ValueError('Provide a parameter object.')
- functions={'forex':forex,'trade_stress':trade_stress,'outage':outage}
- if kind not in functions:raise ValueError('Choose forex, trade_stress or outage.')
+ functions={'forex':forex,'trade_stress':trade_stress,'outage':outage,'goal':goal,'savings':savings}
+ if kind not in functions:raise ValueError('Choose forex, trade_stress, outage, goal or savings.')
  try:result=functions[kind](**parameters)
  except TypeError:raise ValueError('Missing or unsupported scenario parameters.') from None
  result['created']=datetime.now(timezone.utc).isoformat();return result
 
 def save(result):
- if not isinstance(result,dict) or result.get('kind') not in ('forex','trade_stress','outage','comparison'):raise ValueError('Run a scenario first.')
+ if not isinstance(result,dict) or result.get('kind') not in ('forex','trade_stress','outage','goal','savings','comparison'):raise ValueError('Run a scenario first.')
  REPORTS.mkdir(parents=True,exist_ok=True,mode=0o700);path=REPORTS/('scenario-'+uuid.uuid4().hex[:12]+'.json')
  write_file(path,json.dumps(result,ensure_ascii=False,allow_nan=False,indent=2));return str(path)
 

@@ -4383,6 +4383,7 @@ class MainWindow(QMainWindow):
     _screen_permission_sig = pyqtSignal()
     _missions_sig = pyqtSignal()
     _earth_sig = pyqtSignal(object)
+    _sim_sig = pyqtSignal(object)        # simulation result → holographic board (None closes)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
@@ -4668,6 +4669,7 @@ class MainWindow(QMainWindow):
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._earth_sig.connect(self._show_earth)
+        self._sim_sig.connect(self._show_simulation)
         self._missions_sig.connect(self._open_missions)
         self._portable_sig.connect(self._open_portable_memory)
         self._hand_gesture_sig.connect(self._apply_hand_gesture)
@@ -5865,6 +5867,27 @@ class MainWindow(QMainWindow):
         self._hud_cam_stack.setCurrentWidget(self._earth_panel)
         self._earth_panel.apply({k:v for k,v in options.items() if k not in ('toggle','close')})
         self._earth_btn.setText('RETURN TO ASSISTANT')
+
+    def _show_simulation(self, result):
+        """Slot — Qt main thread. The holographic simulation board takes the face's place until RETURN."""
+        board = getattr(self, '_sim_board', None)
+        if result is None:
+            if board is not None and self._hud_cam_stack.currentWidget() is board:
+                self._hud_cam_stack.setCurrentIndex(0)
+            return
+        if board is None:
+            try:
+                from core.simulation_view import SimulationHologram
+                board = SimulationHologram({k: getattr(C, k) for k in ('BG', 'PRI', 'TEXT', 'TEXT_DIM', 'WHITE',
+                                                                         'ACC', 'ACC2', 'GREEN', 'RED')})
+                board.closed.connect(lambda: self._hud_cam_stack.setCurrentIndex(0))
+                self._hud_cam_stack.addWidget(board)
+                self._sim_board = board
+            except Exception as exc:
+                self._log.append_log('SYS: Simulation board could not open: ' + str(exc))
+                return
+        self._hud_cam_stack.setCurrentWidget(board)
+        board.set_result(dict(result))
 
     def _open_portable_memory(self):
         self._open_missions()
@@ -7511,6 +7534,10 @@ class JarvisUI:
 
     def show_earth(self,options):
         self._win._earth_sig.emit(dict(options))
+
+    def show_simulation(self, result: dict | None):
+        """Thread-safe: play a scenario result on the holographic board; None returns to the face."""
+        self._win._sim_sig.emit(None if result is None else dict(result))
 
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
