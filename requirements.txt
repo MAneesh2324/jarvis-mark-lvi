@@ -139,3 +139,4 @@ pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 # tools (pactl / brightnessctl / osascript / systemd), so no extra Python
 # packages are needed there — nothing Windows-specific is ever pulled in.
 pyflakes>=3.2,<4
+pyobjc-framework-CoreLocation==13.0; sys_platform == 'darwin'

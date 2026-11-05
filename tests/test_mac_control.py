@@ -169,3 +169,21 @@ class Browser(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BrowserAnswers(unittest.TestCase):
+    def test_site_routing(self):
+        from actions.browser_control import _site_route
+        self.assertEqual(_site_route('MacBook on Flipkart')[2], 'https://www.flipkart.com/search?q=macbook')
+        self.assertEqual(_site_route('search for wireless earbuds on amazon')[1], 'wireless earbuds')
+        self.assertIsNone(_site_route('MacBooks near me')[2])
+        self.assertIsNone(_site_route('facebook')[2])          # just the site name: open it, not a search
+
+    def test_native_search_returns_results_for_answering(self):
+        from actions import browser_control as bc
+        peek = {'top_results_for_answering': [{'title': 'MacBook Air M5', 'url': 'https://x', 'snippet': 'Rs 1,34,240'}]}
+        with patch.object(bc, '_open_native', return_value='status=unverified action=browser_control url=x'), \
+                patch.object(bc, '_peek_search', return_value=peek), patch.object(bc._registry, 'has', return_value=False):
+            out = bc.browser_control({'action': 'search', 'query': 'MacBook on Flipkart'})
+        self.assertIn('MacBook Air M5', out)
+        self.assertIn('Rs 1,34,240', out)

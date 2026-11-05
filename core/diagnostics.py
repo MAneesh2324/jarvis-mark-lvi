@@ -148,6 +148,25 @@ def _du(path: Path, timeout=20):
     return int(m.group(1)) * 1024 if m else None
 
 
+def _largest_files(folder: Path, n: int = 6) -> list[dict]:
+    """Biggest files directly inside a folder (and its first level of subfolders), largest first."""
+    found = []
+    try:
+        for entry in os.scandir(folder):
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    found.append((entry.stat().st_size, entry.name))
+                elif entry.is_dir(follow_symlinks=False) and not entry.name.startswith('.'):
+                    total = sum(e.stat().st_size for e in os.scandir(entry.path) if e.is_file(follow_symlinks=False))
+                    found.append((total, entry.name + '/'))
+            except OSError:
+                continue
+    except OSError:
+        return []
+    found.sort(reverse=True)
+    return [{'name': name, 'size': _human(size)} for size, name in found[:n] if size > 50e6]
+
+
 def storage():
     checks, volumes = [], []
     seen = set()
@@ -189,10 +208,14 @@ def storage():
     if sizes.get('Trash', 0) > 1e9:
         checks.append(_check('Trash', 'warn', f'The Trash holds {_human(sizes["Trash"])}.',
                              'Empty the Trash yourself in Finder to free that space (JARVIS never empties it).'))
+    biggest = _largest_files(HOME / 'Downloads', 6)
     if sizes.get('Downloads', 0) > 10e9:
-        checks.append(_check('Downloads folder', 'warn', f'Downloads holds {_human(sizes["Downloads"])}.',
+        names = ', '.join(f"{f['name']} ({f['size']})" for f in biggest[:4])
+        checks.append(_check('Downloads folder', 'warn', f'Downloads holds {_human(sizes["Downloads"])}' +
+                             (f'; largest: {names}.' if names else '.'),
                              'Old installers (.dmg) and archives there are usually safe to remove once installed.'))
-    return {'section': 'Storage', 'info': {'volumes': volumes, 'space_used_by': [{'place': k, 'size': _human(v)} for v, k in reclaim]},
+    return {'section': 'Storage', 'info': {'volumes': volumes, 'space_used_by': [{'place': k, 'size': _human(v)} for v, k in reclaim],
+                                           'largest_in_downloads': biggest},
             'checks': checks}
 
 

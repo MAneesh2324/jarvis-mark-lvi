@@ -174,13 +174,16 @@ class PhoneLink:
             try:
                 # Long poll: Telegram holds the request up to 25 s until a message arrives.
                 updates = _call(self.cfg['token'], 'getUpdates', timeout=35, offset=self.offset, timeout_s=25,
-                                allowed_updates=['message'])
+                                allowed_updates=['message', 'edited_message'])
                 backoff = 2
                 self.last_error = ''
                 for u in updates:
                     self.offset = max(self.offset, u['update_id'] + 1)
                     try:
-                        self._handle(u.get('message') or {})
+                        if u.get('edited_message', {}).get('location'):
+                            self._location(u['edited_message'], live_update=True)   # live location moving
+                        else:
+                            self._handle(u.get('message') or {})
                     except Exception as exc:
                         print(f'[PhoneLink] message failed: {exc}')
             except Exception as exc:
@@ -225,6 +228,9 @@ class PhoneLink:
         if text == '/status':
             self._reply(chat, json.dumps(self.status(), indent=1))
             return
+        if msg.get('location'):
+            self._location(msg)
+            return
         if msg.get('voice') or msg.get('audio'):
             text = self._transcribe(msg.get('voice') or msg.get('audio'))
             if not text:
@@ -237,6 +243,18 @@ class PhoneLink:
             self.on_text(text, lambda answer: self._reply(chat, answer))
         else:
             self._reply(chat, 'JARVIS is not listening right now.')
+
+    def _location(self, msg: dict, live_update: bool = False):
+        """A location (or live-location update) shared from the paired phone: GPS-accurate position for JARVIS."""
+        if (msg.get('chat') or {}).get('id') != self.cfg.get('chat_id'):
+            return
+        loc = msg['location']
+        from core import location
+        location.set_phone_fix(loc['latitude'], loc['longitude'], loc.get('horizontal_accuracy'),
+                               live=bool(loc.get('live_period')) or live_update)
+        if not live_update:
+            self._reply(msg['chat']['id'], '📍 Got your location. JARVIS will use it for "where am I", weather and nearby '
+                                           'places for the next 15 minutes' + (' (live updates keep it fresh).' if loc.get('live_period') else '.'))
 
     def _transcribe(self, media: dict) -> str:
         try:

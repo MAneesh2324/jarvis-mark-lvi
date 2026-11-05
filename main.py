@@ -620,6 +620,9 @@ class JarvisLive:
         # Set while JARVIS holds its sentence because the user seems to be
         # starting to talk; the playback loop waits on it instead of writing.
         self._barge_pause = threading.Event()
+        # Why microphone audio did not reach the model, for the once-a-minute listening report.
+        self._listen_stats = {'sent': 0, 'replayed': 0}
+        self._listen_voice_drops: dict[str, int] = {}
         # Tone-aware replies, owner voice recognition, phone link and self-raised notifications.
         self._pending_notes: list[str] = []
         self._pending_spoken: list[str] = []
@@ -1141,6 +1144,15 @@ class JarvisLive:
 
     async def _record_conversation_turn(self, role: str, text: str):
         """Persist completed text independently of model-generated summaries."""
+        try:
+            from core import self_learning
+            if role == 'user':
+                self._sl_user = text
+            else:
+                user, self._sl_user = getattr(self, '_sl_user', ''), ''
+                self._journal_writer.submit(self_learning.record_turn, user, text)
+        except Exception as exc:
+            print(f"[SelfLearning] {exc}")
         label = "User" if role == "user" else self._asst_name
         self._session_log.append(f"{label}: {text}")
         if not self._journal_session:
@@ -1152,6 +1164,23 @@ class JarvisLive:
         if not self._journal_warning_shown:
             self._journal_warning_shown = True
             self.ui.write_log(f"SYS: Local conversation saving failed: {exc}. Recovery may be incomplete.")
+
+    def _count_drop(self, reason: str, indata) -> None:
+        """Cheap bookkeeping in the audio callback: only voice-loud blocks are counted as lost speech."""
+        try:
+            if _pcm_level(indata) > 0.08:
+                self._listen_voice_drops[reason] = self._listen_voice_drops.get(reason, 0) + 1
+        except Exception:
+            pass
+
+    def _listen_report(self) -> None:
+        drops, self._listen_voice_drops = self._listen_voice_drops, {}
+        stats, self._listen_stats = self._listen_stats, {'sent': 0, 'replayed': 0}
+        lost = {k: v for k, v in drops.items() if k != 'jarvis_speaking' or v > 30}
+        if lost or stats['replayed']:
+            secs = lambda n: round(n * CHUNK_SIZE / SEND_SAMPLE_RATE, 1)
+            print('[Listen] last minute: ' + ', '.join(f'{secs(v)}s of speech-level audio not sent ({k})' for k, v in lost.items())
+                  + (f"; {secs(stats['replayed'])}s of early speech recovered" if stats['replayed'] else ''), flush=True)
 
     def _tail_active(self) -> bool:
         """True while the speakers may still be finishing our last sentence."""
@@ -1249,6 +1278,11 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        try:
+            from core import self_learning
+            self_learning.mark_interrupted()
+        except Exception:
+            pass
         self._barge_pause.clear()
         self._voice_interrupt.reset()
         performance.cancel_response()
@@ -1284,7 +1318,7 @@ class JarvisLive:
         notes = []
         if self._wellbeing is not None:
             try:
-                note = self._wellbeing.end_turn(text)
+                note = await asyncio.to_thread(self._wellbeing.end_turn, text)   # may wait briefly for analysis
                 if note:
                     notes.append(note)
             except Exception as exc:
@@ -1404,6 +1438,7 @@ class JarvisLive:
         while True:
             await asyncio.sleep(60)
             try:
+                self._listen_report()
                 if self._wellbeing is not None:
                     msg = self._wellbeing.care_check()
                     if msg:
@@ -1563,6 +1598,12 @@ class JarvisLive:
         from core.learning_journal import context as learning_context
         lessons=learning_context()
         if lessons:parts.append(lessons)
+        try:
+            from core.self_learning import context as learned_rules
+            rules_text=learned_rules()
+            if rules_text:parts.append(rules_text)
+        except Exception as exc:
+            print(f"[SelfLearning] rules not loaded: {exc}")
         from core.voice_style import instruction as voice_style_instruction
         delivery = voice_style_instruction()
         if delivery:
@@ -1701,10 +1742,19 @@ class JarvisLive:
                 fc.name, 'This voice is not recognised as the owner, so this action needs the owner. Ask them to '
                          'confirm by voice or type the request.')})
         started = time.monotonic()
+        fr = None
         try:
-            return await self._execute_tool_impl(fc)
+            fr = await self._execute_tool_impl(fc)
+            return fr
         finally:
-            performance.record('tool', fc.name, time.monotonic() - started)
+            elapsed = time.monotonic() - started
+            performance.record('tool', fc.name, elapsed)
+            try:
+                from core import self_learning
+                res = (getattr(fr, 'response', None) or {}).get('result', '') if fr is not None else 'status=failed reason=exception'
+                self_learning.note_tool(fc.name, elapsed, str(res)[:400])
+            except Exception:
+                pass
 
     async def _execute_tool_impl(self, fc) -> types.FunctionResponse:
         name = fc.name
@@ -1934,6 +1984,7 @@ class JarvisLive:
             # only a queue push, so the audio path is never slowed. When wake word
             # is off (default) or we're awake, this is a single boolean check.
             if self._wake_enabled and not self._awake:
+                self._count_drop('asleep_waiting_for_wake_word', indata)
                 det = self._wake_detector
                 if det is not None:
                     det.feed(indata)
@@ -1951,6 +2002,7 @@ class JarvisLive:
             # the echo of what we are playing right now", sustained long enough
             # that a cough or a keystroke cannot trigger it.
             if jarvis_speaking:
+                self._count_drop('jarvis_speaking', indata)
                 allowed=not self.ui.muted and not self._phone_active and not self._local_voice.enabled and (not self._ptt_enabled or self._ptt_held)
                 action,blocks=self._voice_interrupt.feed(indata,SEND_SAMPLE_RATE,_pcm_level(indata),self._echo,allowed)
                 if action=='pause':
@@ -1969,7 +2021,17 @@ class JarvisLive:
                 return
             if self._voice_interrupt.paused:
                 self._barge_pause.clear()
+            # The user started talking while JARVIS was finishing: those blocks were judged to be their
+            # voice, not echo, so send them now instead of clipping the start of the sentence.
+            early = list(self._voice_interrupt.blocks) if self._voice_interrupt.hits else []
             self._voice_interrupt.reset()
+            if early and not self.ui.muted and not self._phone_active and not self._local_voice.enabled \
+                    and (not self._ptt_enabled or self._ptt_held):
+                def replay_early(blocks=early):
+                    for data in blocks:
+                        enqueue_latest(self.out_queue, {'data': data, 'mime_type': 'audio/pcm'})
+                loop.call_soon_threadsafe(replay_early)
+                self._listen_stats['replayed'] += len(early)
 
             # ── Echo tail ────────────────────────────────────────────────────
             # The speaking flag has dropped but the speakers have not finished.
@@ -1981,6 +2043,7 @@ class JarvisLive:
                 try:
                     if not self._echo.is_user_speech(
                             indata, SEND_SAMPLE_RATE, _pcm_level(indata)):
+                        self._count_drop('echo_tail', indata)
                         return
                     self._tail_until = 0.0      # a real voice ends the tail early
                 except Exception:
@@ -1993,11 +2056,15 @@ class JarvisLive:
             # opens it, which is the whole point: nothing leaves the machine
             # unless you are holding the key.
             if self._ptt_enabled and not self._ptt_held:
+                self._count_drop('push_to_talk_not_held', indata)
                 return
             
             if self._local_voice.enabled:
                 return  # Its dedicated local microphone stream handles commands.
+            if self.ui.muted or self._phone_active:
+                self._count_drop('muted' if self.ui.muted else 'phone_relay_active', indata)
             if not self.ui.muted and not self._phone_active:
+                self._listen_stats['sent'] += 1
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     enqueue_latest, self.out_queue,
@@ -3316,6 +3383,14 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    import os
+    if os.environ.get('JARVIS_NATIVE_APP'):
+        # The app writes stdout to a log file, which Python would otherwise buffer until exit.
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+            sys.stderr.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     try:
         from core.portable_memory import apply_pending
         restored=apply_pending()
