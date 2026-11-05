@@ -646,6 +646,8 @@ class JarvisLive:
             self._voice_guard = _og.voice() if (_og.MODELS / 'speaker.onnx').exists() else None
         except Exception as exc:
             print(f"[OwnerGuard] voice recognition disabled: {exc}"); self._voice_guard = None
+        from core.room_sense import RoomSense
+        self._room = RoomSense()                 # notices when the user is talking with someone else
         from core import notify as _notify
         _notify.register(self._notify_sink)
         # `stream.write()` returns when the buffer accepts the audio, not when the
@@ -1341,7 +1343,7 @@ class JarvisLive:
             pass
 
     # ── wellbeing, owner recognition, phone link, notifications ─────────────
-    async def _after_user_turn(self, text: str):
+    async def _after_user_turn(self, text: str, answered: bool = True):
         notes = []
         if self._wellbeing is not None:
             try:
@@ -1375,7 +1377,10 @@ class JarvisLive:
                     self.ui.write_log('SYS: Voice learned. I will recognise you from now on.')
                 elif verdict.get('enrolling'):
                     self.ui.write_log(f"SYS: Learning your voice ({verdict['collected']}/{verdict['of']})...")
-                elif verdict.get('result') == 'stranger' and verdict.get('alarm', True) and not self._guest_mode:
+                elif verdict.get('result') == 'stranger' and verdict.get('alarm', True) and answered \
+                        and not self._guest_mode:
+                    # only when JARVIS actually answered that voice: a friend chatting with the user is not
+                    # someone giving JARVIS commands
                     self._guest_mode = True
                     notes.append(og.GUEST_NOTE)
                     from core import notify
@@ -1384,6 +1389,11 @@ class JarvisLive:
                 elif verdict.get('result') == 'owner' and self._guest_mode:
                     self._guest_mode = False
                     notes.append(og.OWNER_BACK_NOTE)
+            room = self._room.heard(verdict)     # a second voice: the user is talking with someone else
+            if room:
+                notes.append(room)
+                self.ui.write_log('SYS: ' + ('Someone else is talking with you; I will stay quiet unless you turn to me.'
+                                             if self._room.active else 'Back to just us.'))
         self._pending_notes.extend(notes)
         if self._pending_notes and not self._conversation_busy and not self._is_speaking:
             await self._flush_notes()
@@ -1493,6 +1503,12 @@ class JarvisLive:
                     if msg:
                         notify.send('wellbeing', msg, speak=True)
                 from core import companion as _co
+                quiet = self._room.tick()                    # the other voice has gone quiet
+                if quiet:
+                    self._pending_notes.append(quiet)
+                    self.ui.write_log('SYS: Back to just us.')
+                    if not self._conversation_busy and not self._is_speaking:
+                        await self._flush_notes()
                 done = _co.instance().tick()                 # ends a focus session that ran out; refreshes the face
                 if done:
                     held = getattr(self, '_held_for_focus', [])
@@ -2342,7 +2358,7 @@ class JarvisLive:
                                 self.ui.write_log(f"You: {full_in}")
                                 await self._record_conversation_turn("user", full_in)
                                 if getattr(self, '_last_input_voice', False):
-                                    asyncio.create_task(self._after_user_turn(full_in))
+                                    asyncio.create_task(self._after_user_turn(full_in, answered=bool(out_buf)))
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
