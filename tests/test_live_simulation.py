@@ -396,5 +396,24 @@ class GestureResponsiveness(unittest.TestCase):
         S.reset()
 
 
+class MoreFormulaFunctions(unittest.TestCase):
+    def test_the_logged_floor_call_runs_and_runaway_growth_is_flagged(self):
+        from core.process_sim import simulate, Formula
+        spec = {"title": "Apple Growing", "time_unit": "days", "duration": "1000", "steps": 1000,
+                "params": {"sunlight_hours": 8, "water_litres": 0.5, "nutrient_level": 75},
+                "variables": [{"name": "height_cm", "unit": "cm", "start": 1,
+                               "rate": "height_cm * 0.01 * (sunlight_hours/8) * (water_litres/0.5) * (nutrient_level/75)"},
+                              {"name": "fruit_count", "unit": "apples", "value": "floor(height_cm / 50)"}]}
+        r = simulate(spec)                                            # "duration" as text and floor() both work
+        self.assertEqual(r['finals']['fruit_count'], int(r['finals']['fruit_count']))
+        self.assertTrue(any('unbounded' in w for w in r['model_warnings']))
+        bounded = dict(spec, variables=[{"name": "height_cm", "unit": "cm", "start": 1, "rate": "0.01 * (400 - height_cm)"}])
+        self.assertEqual(simulate(bounded)['model_warnings'], [])
+        for f in ('ceil(x)', 'round(x, 1)', 'pow(x, 2)', 'sign(-x)', 'sigmoid(x)', 'clip(x, 0, 1)', 'int(x)', 'ln(x)'):
+            Formula(f, {'x'})({'x': 2.5, 't': 0})
+        with self.assertRaisesRegex(ValueError, 'Unknown function "gamma'):
+            Formula('gamma(x)', {'x'})
+
+
 if __name__ == '__main__':
     unittest.main()

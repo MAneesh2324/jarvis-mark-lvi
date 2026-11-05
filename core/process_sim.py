@@ -47,7 +47,19 @@ _FUNCS = {
     'ramp': lambda t, a, b: 0.0 if t <= a else 1.0 if t >= b else (t - a) / (b - a),
     'logistic': lambda x, mid, k: 1 / (1 + math.exp(-k * (x - mid))),
     'pulse': lambda t, at, width: math.exp(-((t - at) / max(width, 1e-9)) ** 2),
+    # common maths a model reaches for
+    'floor': math.floor, 'ceil': math.ceil, 'round': lambda x, n=0: round(x, int(n)),
+    'pow': lambda a, b: a ** b if abs(b) <= 10 else 0.0, 'sign': lambda x: (x > 0) - (x < 0),
+    'tan': math.tan, 'atan': math.atan, 'asin': lambda x: math.asin(max(-1, min(1, x))),
+    'acos': lambda x: math.acos(max(-1, min(1, x))), 'sinh': math.sinh, 'cosh': math.cosh,
+    'log10': lambda x: math.log10(max(x, 1e-12)), 'log2': lambda x: math.log2(max(x, 1e-12)),
+    'hypot': math.hypot, 'sigmoid': lambda x: 1 / (1 + math.exp(-x)),
+    'step': lambda x, at=0: 1.0 if x >= at else 0.0, 'lerp': lambda a, b, k: a + (b - a) * k,
 }
+# other spellings of the same thing
+_FUNCS.update({'int': _FUNCS['floor'], 'trunc': lambda x: float(int(x)), 'clip': _FUNCS['clamp'], 'power': _FUNCS['pow'],
+               'ln': _FUNCS['log'], 'heaviside': _FUNCS['step'], 'smoothstep': lambda a, b, x: (lambda k: k * k * (3 - 2 * k))(
+                   max(0.0, min(1.0, (x - a) / (b - a) if b != a else 0.0))), 'minimum': min, 'maximum': max, 'fabs': abs})
 _CONST = {'pi': math.pi, 'e': math.e, 'true': 1.0, 'false': 0.0}
 _BIN = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b,
         ast.Div: lambda a, b: a / b if b else 0.0, ast.Pow: lambda a, b: a ** b if abs(b) <= 10 else 0.0,
@@ -106,7 +118,10 @@ class Formula:
         elif isinstance(node, ast.IfExp):
             for v in (node.test, node.body, node.orelse):
                 self._check(v, names)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _FUNCS and not node.keywords:
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+            if node.func.id not in _FUNCS:
+                raise ValueError(f'Unknown function "{node.func.id}()" in formula: {self.text}. '
+                                 f'Available: {", ".join(sorted(_FUNCS))}.')
             for a in node.args:
                 self._check(a, names)
         else:
@@ -147,7 +162,7 @@ class Formula:
 
 def _num(v, name):
     try:
-        x = float(v)
+        x = float(str(v).strip()) if isinstance(v, str) else float(v)
     except (TypeError, ValueError):
         raise ValueError(f'{name} must be a number.') from None
     if not math.isfinite(x):
@@ -258,6 +273,14 @@ def simulate(spec: dict) -> dict:
         fan.append({'day': round(times[k], 6), 'p05': min(lo, med), 'median': med, 'p95': max(hi, med)})
     units = {v['name']: v['unit'] for v in c['variables']}
     finals = {v['name']: base[v['name']][-1] for v in c['variables']}
+    warnings = []
+    for v in c['variables']:                                 # a sanity check on what the model produced
+        series = base[v['name']]
+        start, end, late = series[0], finals[v['name']], series[int(len(series) * .9)]
+        # runaway = big AND still surging at the end (a curve that levels off barely moves in its last 10%)
+        if v['kind'] == 'rate' and v['max'] is None and abs(end) > 50 * max(abs(start), 1) and abs(end - late) > .25 * abs(end):
+            warnings.append(f"{v['name']} grew from {start:g} to {end:,.0f} {v['unit']} — likely unbounded growth; "
+                            f"use a limit, e.g. rate = k * (max_size - {v['name']}), or set its max.")
     return {'kind': 'process', 'title': c['title'], 'x_unit': c['unit'], 'y_unit': units[focus], 'focus': focus,
             'target': None, 'fan_chart': fan,
             'band_label': 'line = ' + focus.replace('_', ' ') + ('  ·  band = 5th–95th with settings varied ±%g%%' % c['uncertainty']
@@ -269,6 +292,7 @@ def simulate(spec: dict) -> dict:
             'assumptions': {'settings': c['params'], 'duration': c['duration'], 'time_unit': c['unit'],
                             'uncertainty_percent': c['uncertainty'], 'paths': len(paths) or None, 'seed': c['seed']},
             'formulas': {v['name']: (v['kind'], v['f'].text) for v in c['variables']},
+            'model_warnings': warnings,
             'method': 'Step-by-step model JARVIS wrote from your description: rate formulas are integrated, value formulas computed each step.',
             'limits': 'An illustrative model built from general knowledge, not measured data or a scientific prediction.'}
 

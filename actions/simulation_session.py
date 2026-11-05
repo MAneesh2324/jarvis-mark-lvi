@@ -48,6 +48,10 @@ def _summary(board, extra=None):
             'verdict': {'success': 'MODEL SUCCESSFUL', 'failed': 'MODEL FAILED'}.get(sess.get('status'), 'no goal set'),
             'this_attempt': {k: last.get(k) for k in ('change', 'value', 'passed')},
             'headline': headline(board)['verdict'], 'current_settings': S.status().get('current_settings')}
+    if board.get('model_warnings'):
+        data['model_warnings'] = board['model_warnings']
+        data['say'] = ('The result looks unrealistic. Tell the user in one line, then start again with a corrected spec '
+                       '(bounded growth, realistic magnitudes) without waiting to be asked.')
     cur = data['current_settings'] or {}
     if isinstance(cur.get('variables'), list):               # a process: the settings, not the whole spec
         data['current_settings'] = cur.get('params', {})
@@ -134,9 +138,12 @@ TOOL = {
         '"stages": [{"name","start","end"}], "events": [{"label","when": "condition"}], "focus": variable to plot, '
         '"uncertainty_percent" (0-80, varies params for a band), "scene": {"type": "grow"|"fill"|"dots", "size": '
         'variable, "max": number, "color": variable, "color_max": number, "from": "#hex", "to": "#hex", "label"}}. '
-        'Formulas use t, params, variables, + - * / ** %, comparisons, and/or, x if c else y, and min max abs exp log '
-        'sqrt sin cos tanh clamp(x,lo,hi) between(t,a,b) ramp(t,a,b) logistic(x,mid,k) pulse(t,at,width). Use '
-        'realistic, well-known magnitudes and say the model is illustrative. Pick a scene: grow for fruit/plants/'
+        'Formulas use bare names (t, setting names, variable names — not params.x), + - * / ** %, comparisons, '
+        'and/or, x if c else y, and min max abs exp log sqrt sin cos tan tanh floor ceil round pow sign sigmoid '
+        'clamp(x,lo,hi) between(t,a,b) ramp(t,a,b) logistic(x,mid,k) pulse(t,at,width) step(x,at) lerp(a,b,k). '
+        'Growth must level off: write rate = k * (max_value - x) or logistic forms, never plain k * x over a long '
+        'duration; give each variable a realistic max. Use realistic, well-known magnitudes (an apple is ~7-8 cm, '
+        'a tree ~3-5 m) and say the model is illustrative. Pick a scene: grow for fruit/plants/'
         'tumours/balloons, fill for tanks/batteries/reservoirs, dots for populations/crowds/infections.\n'
         ' • goal, savings, forex, outage, trade_stress — the same parameters as scenario_simulator.\n'
         ' • backtest — trading_lab backtest parameters (symbol, interval, strategy e.g. sweep_mss_breaker, '
