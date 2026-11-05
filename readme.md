@@ -2,7 +2,7 @@
 
 A real-time voice assistant that hears, sees, speaks and controls your computer. It runs on the Gemini Live API, or on your own speech, language-model and voice engines.
 
-This is a customised edition of [Mark LVI by Maneesh. It adds live 3D simulations, a trading backtest lab, phone remote control, owner face and voice recognition, and an emotional robot face. See [INSTALL-MAC.md](INSTALL-MAC.md) to install it on another Mac and [ADVANCED-FEATURES.md](ADVANCED-FEATURES.md) for Mission Control and the other added tools. Each user sets up their own keys and permissions.
+This is a customised edition of Mark LVI by Maneesh. It adds live 3D simulations, a trading backtest lab, phone remote control, owner face and voice recognition, and an emotional robot face. See [INSTALL-MAC.md](INSTALL-MAC.md) to install it on another Mac and [ADVANCED-FEATURES.md](ADVANCED-FEATURES.md) for Mission Control and the other added tools. Each user sets up their own keys and permissions.
 
 ---
 
