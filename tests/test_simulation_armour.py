@@ -57,6 +57,16 @@ class GoalAndSavings(unittest.TestCase):
 
 
 class SimulatorTool(unittest.TestCase):
+    def setUp(self):
+        import core.scenario_simulator as sim
+        self._tmp = tempfile.TemporaryDirectory()
+        self._p = patch.object(sim, 'LAST', Path(self._tmp.name) / 'last.json')
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        self._tmp.cleanup()
+
     def test_tool_shows_the_board_and_returns_the_headline(self):
         from actions.scenario_simulator import simulate
         ui = MagicMock()
