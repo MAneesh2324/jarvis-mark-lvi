@@ -211,7 +211,7 @@ def _add_neck(verts: np.ndarray, faces: np.ndarray):
     # brightnesses and the neck grows a sawtooth edge.
     fade = np.ones(base)
     nd = np.repeat(d, _NECK_SEGS)
-    fade = np.concatenate([fade, 1.0 - 0.72 * np.clip(nd, 0.0, 1.0) ** 1.5])
+    fade = np.concatenate([fade, 1.0 - 0.30 * np.clip(nd, 0.0, 1.0) ** 1.5])
     return np.vstack([verts, nv]), np.vstack([faces, np.array(nf)]), fade
 
 
@@ -260,6 +260,175 @@ def _check_landmarks(verts: np.ndarray) -> None:
     assert abs(lips[0]) < 0.5, "lips are not centred"
 
 
+# ── robot parts, built in the normalised head space (y: crown +1, chin -1) ─────
+
+def _lathe(rings, axis, centre, segs):
+    """Rings of (offset along axis, radius_a, radius_b) around an axis ('x' or 'y') → verts, faces (quads split)."""
+    c = np.array(centre, dtype=float)
+    ph = np.linspace(0.0, 2.0 * np.pi, segs, endpoint=False)
+    vs = []
+    for off, ra, rb in rings:
+        if axis == 'x':                                   # ring in the y-z plane
+            vs.append(np.stack([np.full(segs, off), ra * np.cos(ph), rb * np.sin(ph)], 1) + c)
+        else:                                             # ring in the x-z plane
+            vs.append(np.stack([ra * np.cos(ph), np.full(segs, off), rb * np.sin(ph)], 1) + c)
+    verts = np.vstack(vs)
+    faces = []
+    for i in range(len(rings) - 1):
+        for j in range(segs):
+            a, b = i * segs + j, i * segs + (j + 1) % segs
+            cc, d = (i + 1) * segs + (j + 1) % segs, (i + 1) * segs + j
+            faces += [[a, b, cc], [a, cc, d]]
+    return verts, np.array(faces, dtype=np.int64)
+
+
+def _ear(side):
+    """A robotic audio pod: a chamfered disc on the side of the head, at ear height."""
+    x0 = 0.60 * side
+    rings = [(0.00, 0.175, 0.145), (0.090 * side, 0.178, 0.148), (0.128 * side, 0.160, 0.132),
+             (0.160 * side, 0.118, 0.098), (0.170 * side, 0.050, 0.042), (0.172 * side, 0.002, 0.002)]
+    v, f = _lathe(rings, 'x', (x0, -0.16, -0.19), 24)
+    out = np.zeros_like(v)
+    out[:, 1:] = v[:, 1:] - np.array([-0.16, -0.19])
+    out[:, 0] = side * 0.6                               # the cap faces sideways
+    return v, f, out
+
+
+def _hair(head_verts):
+    """Sculpted robot hair: plates swept back over the cranium, ending at a natural hairline."""
+    c = np.array([0.0, 0.05, -0.12])
+    rel = head_verts - c
+    norm = np.linalg.norm(rel, axis=1)
+    dirs = rel / norm[:, None]
+    AZ, EL = 48, 16
+    az = np.linspace(-np.pi, np.pi, AZ, endpoint=False)
+    front = (1 + np.cos(az)) / 2                         # 1 at the forehead, 0 at the nape
+    bound = np.radians(-38 + 82 * front ** 0.8)          # hairline elevation: forehead 44°, temples 9°, nape -38°
+    D, R = [], []
+    for i in range(EL + 1):
+        k = i / EL
+        el = np.radians(88) * (1 - k) + bound * k        # crown → hairline
+        d = np.stack([np.sin(az) * np.cos(el), np.sin(el), np.cos(az) * np.cos(el)], 1)
+        near = d @ dirs.T
+        top = np.argsort(-near, axis=1)[:, :10]
+        D.append((d, el, k)); R.append(norm[top].max(1))
+    R = np.array(R)
+    for _ in range(4):                                   # smooth the skull radius: no stripes from mesh noise
+        R = (np.roll(R, 1, 1) + 2 * R + np.roll(R, -1, 1)) / 4
+        R[1:-1] = (R[:-2] + 2 * R[1:-1] + R[2:]) / 4
+    verts, outward, fade = [], [], []
+    for i, (d, el, k) in enumerate(D):
+        r = R[i]
+        quiff = 0.05 * front ** 3 * np.clip(np.sin(el) * 1.6, 0, 1) * (1 - k)          # a little lift over the forehead
+        lift = 1.0 + 0.028 + 0.022 * np.clip(np.sin(el), 0, 1) + quiff - 0.022 * k ** 3  # close to the head, a little volume on top
+        plate = 0.008 * np.cos(14 * az + 2.2 * k) ** 2                                  # machined plates, swept back
+        rr = r * lift + plate * (1 - k ** 4)
+        if i == EL:
+            rr = r * 1.004                               # the last ring meets the scalp: no gap under the edge
+        verts.append(c + d * rr[:, None])
+        outward.append(d)
+        fade.append(np.full(AZ, 0.62))
+    verts, outward, fade = np.vstack(verts), np.vstack(outward), np.concatenate(fade)
+    faces, strands = [], []
+    for i in range(EL):
+        for j in range(AZ):
+            a, b = i * AZ + j, i * AZ + (j + 1) % AZ
+            cc, d = (i + 1) * AZ + (j + 1) % AZ, (i + 1) * AZ + j
+            faces += [[a, b, cc], [a, cc, d]]
+            if j % 3 == 0:
+                strands.append([a, d])                   # strand lines run crown → hairline
+    return verts, np.array(faces, dtype=np.int64), outward, fade, np.array(strands, dtype=np.int64)
+
+
+def _smooth_profile(points, n):
+    """Points along a hand-drawn profile → n evenly spaced, smoothed points (a soft spline)."""
+    pts = np.array(points, dtype=float)
+    seg = np.r_[0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
+    t = np.linspace(0, seg[-1], n * 4)
+    dense = np.stack([np.interp(t, seg, pts[:, 0]), np.interp(t, seg, pts[:, 1])], 1)
+    for _ in range(6):
+        dense[1:-1] = (dense[:-2] + 2 * dense[1:-1] + dense[2:]) / 4
+    seg = np.r_[0, np.cumsum(np.linalg.norm(np.diff(dense, axis=0), axis=1))]
+    t = np.linspace(0, seg[-1], n)
+    return np.stack([np.interp(t, seg, dense[:, 0]), np.interp(t, seg, dense[:, 1])], 1)
+
+
+# The silhouette seen from the front (x, y): neck → trapezius (a gentle concave slope) → the round
+# cap of the deltoid → the upper arm hanging down. And the profile from the side (z, y): collarbone,
+# then the flat plane of the chest.
+SHOULDER_LINE = [(0.40, -0.96), (0.56, -1.04), (0.74, -1.13), (0.90, -1.22), (1.03, -1.31),
+                 (1.13, -1.42), (1.18, -1.55), (1.18, -1.68), (1.15, -1.80), (1.12, -1.88)]
+CHEST_LINE = [(0.32, -0.98), (0.40, -1.06), (0.46, -1.16), (0.49, -1.30), (0.50, -1.50), (0.49, -1.88)]
+
+
+def _torso():
+    """Shoulders and chest under the neck, so the head sits on a body with an upright posture."""
+    U, V = 40, 16
+    side = _smooth_profile(SHOULDER_LINE, V)               # (x, y) at the shoulder, per ring
+    front = _smooth_profile(CHEST_LINE, V)                 # (z, y) at the chest, per ring
+    u = np.linspace(0, 2 * np.pi, U, endpoint=False)
+    cu, su = np.cos(u), np.sin(u)
+    w_side = np.abs(cu) ** 2                               # how much a point belongs to the shoulder vs the chest
+    verts, fades = [], []
+    for i in range(V):
+        k = i / (V - 1)
+        e = 2.4 + 1.2 * k                                  # round over the shoulders, squarer down the chest
+        rad = (np.abs(cu) ** e + np.abs(su) ** e) ** (-1 / e)
+        delt = 0.06 * np.exp(-((k - 0.45) / 0.16) ** 2) * np.abs(cu) ** 3        # the deltoid's round cap
+        x = (side[i, 0] + delt) * cu * rad
+        z = -0.14 + front[i, 0] * su * rad * (1.0 if True else 1)
+        z = np.where(su < 0, -0.14 + front[i, 0] * 0.92 * su * rad, z)   # the back is a little flatter
+        y = front[i, 1] * (1 - w_side) + side[i, 1] * w_side
+        verts.append(np.stack([x, y, z], 1))
+        fades.append(np.full(U, float(np.interp(k, [0, 0.6, 1], [1.0, 0.9, 0.05]))))
+    v = np.vstack(verts)
+    f = []
+    for i in range(V - 1):
+        for j in range(U):
+            a, b = i * U + j, i * U + (j + 1) % U
+            c, d = (i + 1) * U + (j + 1) % U, (i + 1) * U + j
+            f += [[a, b, c], [a, c, d]]
+    out = v - np.array([0.0, -1.35, -0.14])
+    out[:, 1] *= 0.5
+    return v, np.array(f, dtype=np.int64), out, np.concatenate(fades)
+
+
+def _ring_curve(centre, ra, rb, axis='y', n=48):
+    ph = np.linspace(0, 2 * np.pi, n + 1)
+    c = np.array(centre, dtype=float)
+    if axis == 'y':
+        return c + np.stack([ra * np.cos(ph), np.zeros_like(ph), rb * np.sin(ph)], 1)
+    return c + np.stack([np.zeros_like(ph), ra * np.cos(ph), rb * np.sin(ph)], 1)
+
+
+def _on_surface(verts, normals, path_xy, side_z=True, steps=18):
+    """Follow a path over the front of the mesh: for each (x, y), the front-most surface point near it.
+    The path is resampled smoothly first, so the line hugs the curve of the face instead of cutting across."""
+    k = np.array(path_xy, dtype=float)
+    t = np.linspace(0, 1, len(k))
+    tt = np.linspace(0, 1, steps)
+    path_xy = np.stack([np.interp(tt, t, k[:, 0]), np.interp(tt, t, k[:, 1])], 1)
+    pts, nrm = [], []
+    for x, y in path_xy:
+        d = (verts[:, 0] - x) ** 2 + (verts[:, 1] - y) ** 2
+        near = np.argsort(d)[:6]
+        w = 1.0 / (d[near] + 1e-4)
+        front = near[verts[near, 2] >= verts[near, 2].max() - 0.08] if side_z else near
+        wf = 1.0 / (d[front] + 1e-4)
+        point = (verts[front] * wf[:, None]).sum(0) / wf.sum()
+        i = front[np.argmax(wf)]
+        pts.append(point)
+        nrm.append(normals[i])
+    pts = np.array(pts)
+    for _ in range(3):                                   # smooth the line, keeping its ends
+        pts[1:-1] = (pts[:-2] + 2 * pts[1:-1] + pts[2:]) / 4
+    nrm = np.array(nrm)
+    for _ in range(3):
+        nrm[1:-1] = (nrm[:-2] + 2 * nrm[1:-1] + nrm[2:]) / 4
+    nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-9)
+    return pts + nrm * 0.018, nrm                       # float just above the skin
+
+
 def build_head() -> dict:
     """Assemble the full head. Called once; `get_head_mesh()` caches the result."""
     verts, faces = _load_obj(_OBJ)
@@ -283,6 +452,78 @@ def build_head() -> dict:
     outward[n_head:] = verts[n_head:] - np.array([0.0, 0.0, _NECK_Z * scale])
     outward[n_head:, 1] = 0.0
     normals = _vertex_normals(verts, faces, outward)
+    n_neck = len(verts)
+
+    # ── robot parts: ears, hair, shoulders ──────────────────────────────────
+    body = np.zeros(len(verts))                         # 0 = turns with the head, 1 = stays with the torso
+    body[n_head:] = np.clip((-verts[n_head:, 1] - 0.55) / 0.8, 0.0, 1.0)      # the neck blends from head to body
+    group = np.where(np.arange(len(faces)) >= 0, 1, 1)
+    group = 1 - (faces >= n_head).all(axis=1).astype(np.int32)                # 1 head, 0 neck
+    extra_edges = []
+
+    def add(pv, pf, pout, pfade, pbody, pgroup, pedges=None):
+        nonlocal verts, faces, normals, fade, body, group
+        base = len(verts)
+        pn = _vertex_normals(pv, pf, pout)
+        verts = np.vstack([verts, pv]); normals = np.vstack([normals, pn])
+        faces = np.vstack([faces, pf + base]); fade = np.concatenate([fade, pfade])
+        body = np.concatenate([body, np.full(len(pv), pbody) if np.isscalar(pbody) else pbody])
+        group = np.concatenate([group, np.full(len(pf), pgroup)])
+        if pedges is not None:
+            extra_edges.append(pedges + base)
+        return base
+
+    for side in (-1, 1):
+        ev, ef, eo = _ear(side)
+        add(ev, ef, eo, np.full(len(ev), 1.0), 0.0, 1, _unique_edges(ef)[::2])
+    hv, hf, ho, hfade, strands = _hair(verts[:n_head])
+    add(hv, hf, ho, hfade, 0.0, 1)
+    hair_lines = {}
+    AZ = 48
+    rows = len(hv) // AZ
+    for j in range(0, AZ, 2):                              # swept-back strand highlights, crown to hairline
+        col = hv[np.arange(1, rows - 1) * AZ + j]
+        hair_lines['hair_%02d' % j] = (col + ho[np.arange(1, rows - 1) * AZ + j] * 0.006, 0.0, 0)
+    tv, tf, to, tfade = _torso()
+    ring_edges = np.array([[i * 40 + j, i * 40 + (j + 1) % 40] for i in (3, 7, 11) for j in range(40)])
+    add(tv, tf, to, tfade, 1.0, -1, ring_edges)
+
+    # glowing robot details, drawn as lines over the surface
+    curves = dict(hair_lines)
+    for side, name in ((-1, 'ear_l'), (1, 'ear_r')):
+        x = (0.60 + 0.171) * side
+        curves[name + '_ring'] = (_ring_curve((x, -0.16, -0.19), 0.100, 0.083, 'x', 36), 0.0, side)
+        curves[name + '_core'] = (_ring_curve((x + 0.001 * side, -0.16, -0.19), 0.035, 0.029, 'x', 18), 0.0, side)
+    curves['collar'] = (_ring_curve((0.0, -1.09, -0.14), 0.46, 0.36), 1.0, 0)
+    curves['neck_ring_1'] = (_ring_curve((0.0, -0.78, -0.13), 0.40, 0.34), 0.35, 0)
+    curves['neck_ring_2'] = (_ring_curve((0.0, -0.93, -0.13), 0.43, 0.36), 0.6, 0)
+    head_v, head_n = verts[:n_head], normals[:n_head]
+    for side, tag in ((-1, 'l'), (1, 'r')):
+        jaw_xy = [(0.60 * side, -0.30), (0.58 * side, -0.48), (0.50 * side, -0.66), (0.36 * side, -0.82), (0.20 * side, -0.92)]
+        curves['jaw_seam_' + tag] = (*_on_surface(head_v, head_n, jaw_xy)[:1], 0.0, 0)
+        temple_xy = [(0.50 * side, 0.42), (0.60 * side, 0.22), (0.63 * side, 0.02)]
+        curves['temple_seam_' + tag] = (*_on_surface(head_v, head_n, temple_xy)[:1], 0.0, 0)
+    # chest plate: a V from the collar, a seam across, and a small core light
+    front = lambda y: -0.14 + np.interp(y, [-1.8, -1.2, -1.05, -1.0], [0.47, 0.47, 0.40, 0.32]) + 0.012
+    for side, tag in ((-1, 'l'), (1, 'r')):
+        ys = np.linspace(-1.12, -1.48, 8)
+        xs = side * np.linspace(0.30, 0.10, 8)
+        curves['chest_v_' + tag] = (np.stack([xs, ys, [front(y) - 0.02 * abs(x) * 3 for x, y in zip(xs, ys)]], 1), 1.0, 0)
+        # a panel seam over the top of each shoulder, following the trapezius line
+        line = _smooth_profile(SHOULDER_LINE, 26)[3:12]
+        xs, ys = side * line[:, 0] * 0.96, line[:, 1] + 0.035
+        zs = -0.14 + 0.30 * np.ones_like(xs)
+        curves['shoulder_' + tag] = (np.stack([xs, ys, zs], 1), 1.0, 0)
+    ph = np.linspace(0, 2 * np.pi, 25)
+    curves['chest_core'] = (np.stack([0.07 * np.cos(ph), -1.58 + 0.07 * np.sin(ph), np.full(25, front(-1.58) + 0.005)], 1), 1.0, 0)
+    t_n = _vertex_normals(tv, tf, to)
+    for side, tag in ((-1, 'l'), (1, 'r')):
+        clav = [(0.16 * side, -1.06), (0.40 * side, -1.10), (0.62 * side, -1.15), (0.80 * side, -1.21)]
+        cv = _on_surface(tv, t_n, clav, steps=14)[0]
+        curves['clavicle_' + tag] = (cv - np.array([0, 0, 0.004]), 1.0, 0)
+        crease = [(0.86 * side, -1.30), (0.84 * side, -1.48), (0.86 * side, -1.66), (0.90 * side, -1.84)]
+        curves['deltoid_' + tag] = (_on_surface(tv, t_n, crease, steps=14)[0], 1.0, 0)
+    verts = verts.astype(np.float64)
 
     # ── jaw rig ─────────────────────────────────────────────────────────────
     # Everything below the mouth swings on the mandible, tapering to nothing at
@@ -315,15 +556,24 @@ def build_head() -> dict:
     lips *= np.clip(verts[:, 2] / 0.40, 0.0, 1.0)
     lips[n_head:] = 0.0
 
-    edges = _unique_edges(faces)[::_WIRE_STRIDE]
+    base_edges = _unique_edges(faces[:len(faces) - sum(len(x) for x in ())])
+    head_like = base_edges[(base_edges < n_neck).all(1)]
+    rel = verts[:n_neck] - np.array([0.0, 0.05, -0.12])
+    az = np.arctan2(rel[:, 0], rel[:, 2])
+    el = np.arcsin(np.clip(rel[:, 1] / np.maximum(np.linalg.norm(rel, axis=1), 1e-9), -1, 1))
+    hairline = np.radians(-38 + 82 * ((1 + np.cos(az)) / 2) ** 0.8)
+    under = (el > hairline - 0.03) & (np.arange(n_neck) < n_head)       # the scalp is under the hair: no wire there
+    head_like = head_like[~(under[head_like[:, 0]] | under[head_like[:, 1]])][::_WIRE_STRIDE]
+    edges = np.vstack([head_like] + extra_edges)          # the parts bring their own clean lines
 
-    # Neck and head interpenetrate, and a painter's-algorithm sort by triangle
-    # depth interleaves them into a torn edge. Grouping fixes it: the neck is
-    # always behind the head where they overlap, so draw every neck facet first.
-    face_group = (faces >= n_head).all(axis=1).astype(np.int32)   # 1 = neck
+    # Body, neck and head interpenetrate, and a painter's-algorithm sort by triangle depth interleaves
+    # them into a torn edge. Grouping fixes it: torso first, then the neck, then the head with its ears
+    # and hair.
 
     return {
-        "face_group": np.ascontiguousarray(1 - face_group, dtype=np.float32),
+        "face_group": np.ascontiguousarray(group, dtype=np.float32),
+        "body": np.ascontiguousarray(body, dtype=np.float32),
+        "curves": curves,
         "brow": np.ascontiguousarray(brow, dtype=np.float32),
         "lips": np.ascontiguousarray(lips, dtype=np.float32),
         "lip_centre": np.ascontiguousarray(lip_c, dtype=np.float32),
@@ -336,7 +586,7 @@ def build_head() -> dict:
         "landmarks": {k: np.array(v, dtype=np.int32) for k, v in LANDMARKS.items()},
         "n_face": n_face,
         "n_head": n_head,
-        "span": (1.0, float(verts[:, 1].min())),        # crown, bottom of the neck
+        "span": (1.0, float(verts[:, 1].min())),        # crown, bottom of the bust
     }
 
 

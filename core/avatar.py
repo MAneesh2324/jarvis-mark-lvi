@@ -195,6 +195,8 @@ class HoloAvatar:
         self._e0 = mesh["edges"][:, 0]
         self._e1 = mesh["edges"][:, 1]
         self._lm = mesh["landmarks"]
+        self._body = mesh["body"][:, None]           # 1 = stays with the shoulders when the head turns
+        self._curves = mesh["curves"]
         # The inner-lip ring runs lower-lip left→right, then upper-lip back.
         # Splitting it lets the upper arc anchor a strip of teeth, which is what
         # keeps an open mouth from reading as a hole punched in the face.
@@ -447,8 +449,12 @@ class HoloAvatar:
                 self._mouth_step(v_hop, amp, live, op, lv)
         else:
             self._mouth_step(dt, amp, live, v_open, v_level)
-        if not live and self._g.get('jaw', 0.0) > self._mouth:
-            self._mouth = self._g['jaw']          # a laugh or a gasp opens the mouth
+        if not live:
+            smile_now = self._smile + self._g.get('smile', 0.0)
+            # a laugh or a gasp opens the mouth; a big smile parts the lips to show the teeth
+            want = max(self._g.get('jaw', 0.0), max(0.0, smile_now - 0.55) * 0.32)
+            if want > self._mouth:
+                self._mouth += (want - self._mouth) * 0.25
 
         # Syllable emphasis. Applied unconditionally: `_emph` decays to zero on
         # its own once the mouth closes, whereas gating it on `live` deleted the
@@ -638,7 +644,15 @@ class HoloAvatar:
         if abs(self._roll) > 1e-4:                # a sideways tilt of the head (sympathy, curiosity, a laugh)
             cr, sr = math.cos(self._roll), math.sin(self._roll)
             m = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32) @ m
-        return v @ m.T, self._n0 @ m.T
+        self._m_head, self._m_body = m, self._body_matrix()
+        b = self._body
+        # Posture: the shoulders stay square while the head turns, nods and tilts; the neck blends between.
+        return (v @ m.T) * (1 - b) + (v @ self._m_body.T) * b, (self._n0 @ m.T) * (1 - b) + (self._n0 @ self._m_body.T) * b
+
+    def _body_matrix(self):
+        y = 0.2 * (self._yaw + getattr(self, "gesture_yaw", 0))     # the body follows a turn only a little
+        cy, sy = math.cos(y), math.sin(y)
+        return np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
 
     # ── rendering ───────────────────────────────────────────────────────────
 
@@ -684,6 +698,60 @@ class HoloAvatar:
             self._paint_surface(p, xs, ys, norms, verts, primary, bg, amp)
         self._paint_wire(p, xs, ys, norms, verts, primary, bg, amp)
         self._paint_features(p, xs, ys, norms, r, primary, accent, bg, amp)
+        self._paint_details(p, cx, cy, r, primary, accent, bg, amp)
+
+    def _project(self, pts, cx, cy, r):
+        w = np.maximum(_CAM_D - pts[:, 2], 0.35)
+        k = (_CAM_D / w) * r
+        return cx + pts[:, 0] * k, cy - pts[:, 1] * k
+
+    def _paint_details(self, p, cx, cy, r, primary, accent, bg, amp):
+        """The robot's glowing details: ear rings, seams, neck rings, collar, chest plate and core light."""
+        if not hasattr(self, '_m_head'):
+            return
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        head_c = np.array([0.0, 0.05, -0.12], dtype=np.float32)
+        pulse = 0.75 + 0.25 * math.sin(self._t * 2.2) + 0.35 * amp
+        for name, (pts, bw, side) in self._curves.items():
+            m = self._m_body if bw >= 0.99 else self._m_head
+            q = (pts @ m.T) if bw in (0.0, 1.0) else (pts @ self._m_head.T) * (1 - bw) + (pts @ self._m_body.T) * bw
+            if side:                                            # ear: faces sideways
+                facing = float((np.array([side, 0.0, 0.0]) @ self._m_head.T)[2])
+                if facing < -0.05:
+                    continue
+                vis = np.full(len(q), 0.35 + 0.65 * max(0.0, facing))
+            else:
+                centre = (np.array([0.0, float(pts[:, 1].mean()), -0.14]) if bw > 0.2 else head_c)
+                c2 = centre @ (self._m_body if bw > 0.2 else self._m_head).T
+                d = q - c2
+                vis = d[:, 2] / np.maximum(np.linalg.norm(d, axis=1), 1e-6)
+            X, Y = self._project(q, cx, cy, r)
+            core = name.endswith('_core')
+            if core or name == 'chest_core':
+                if vis.mean() < 0.1:
+                    continue
+                poly = QPolygonF([QPointF(float(a), float(b)) for a, b in zip(X, Y)])
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(_c(accent, 60 * pulse)))
+                br = poly.boundingRect()
+                p.drawEllipse(br.center(), br.width() * 0.9, br.height() * 0.9)       # glow
+                p.setBrush(QBrush(_c(accent, 230 * min(1.0, pulse))))
+                p.drawPolygon(poly)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                continue
+            bright = name.startswith('ear') or name in ('collar',)
+            hair = name.startswith('hair')
+            col = accent if bright else primary
+            top = 200 if bright else (85 if hair else 150)
+            width = 2.0 if bright else (1.0 if hair else 1.4)
+            seg_vis = np.minimum(vis[:-1], vis[1:])
+            buckets: dict = {}
+            for i in np.flatnonzero(seg_vis > 0.05):
+                level = min(3, int(seg_vis[i] * 1.6 * 4))
+                buckets.setdefault(level, []).append(QLineF(float(X[i]), float(Y[i]), float(X[i + 1]), float(Y[i + 1])))
+            for level, lines in buckets.items():       # one draw call per brightness level
+                p.setPen(QPen(_c(col, top * (level + 1) / 4), width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLines(lines)
 
     def _paint_surface(self, p: QPainter, xs, ys, norms, verts,
                        primary: QColor, bg: QColor, amp: float) -> None:
@@ -800,8 +868,6 @@ class HoloAvatar:
                 p.setPen(QPen(_blend(bg, primary, a), 1.0))
             p.drawLines(seg)
 
-    # ── face ────────────────────────────────────────────────────────────────
-
     def _ring(self, xs, ys, idx) -> QPolygonF:
         return QPolygonF([QPointF(float(x), float(y))
                           for x, y in zip(xs[idx], ys[idx])])
@@ -866,6 +932,21 @@ class HoloAvatar:
                 p.drawEllipse(QPointF(gx - rad * 0.28, gy - rad * 0.30), rad * 0.16, rad * 0.16 * vis)   # catch-light
                 p.restore()
 
+        # ── nose: the bridge and the nostril line, so the profile reads ──────
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(_c(primary, 120 * face), 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolyline(self._ring(xs, ys, np.array([168, 6, 197, 195, 5, 4])))
+        p.setPen(QPen(_c(primary, 200 * face), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolyline(self._ring(xs, ys, np.array([129, 98, 97, 2, 326, 327, 358])))
+        # ── forehead sensor ───────────────────────────────────────────────
+        sx, sy = float(xs[151]), float(ys[151])
+        sp = 0.6 + 0.4 * math.sin(self._t * 1.7)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(_c(accent, 70 * sp * face)))
+        p.drawEllipse(QPointF(sx, sy), r * 0.035, r * 0.035)
+        p.setBrush(QBrush(_c(accent, 240 * face)))
+        p.drawEllipse(QPointF(sx, sy), r * 0.013, r * 0.013)
+
         # ── brows ───────────────────────────────────────────────────────────
         p.setBrush(Qt.BrushStyle.NoBrush)
         glow = QColor(primary)
@@ -900,6 +981,15 @@ class HoloAvatar:
             p.setBrush(QBrush(_c(accent, 40 * self._mouth * face)))
             p.drawPolygon(inner)
 
+        # the lips as a solid plate, a shade brighter than the skin
+        outer = self._ring(xs, ys, lm["lips_out"])
+        path = QPainterPath(); path.addPolygon(outer); path.closeSubpath()
+        if self._mouth > 0.02:
+            hole = QPainterPath(); hole.addPolygon(inner); hole.closeSubpath()
+            path = path.subtracted(hole)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(_c(primary, 70 * face)))
+        p.drawPath(path)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(_c(primary, 50 * face), 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPolygon(inner)                       # glow along the lip seam: the line that smiles or frowns

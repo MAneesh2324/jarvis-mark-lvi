@@ -575,7 +575,7 @@ class HudCanvas(QWidget):
         f.setBold(True)
         f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
         p.setFont(f)
-        y = status_y - 30
+        y = 12.0                                          # top of the face screen, clear of the face and chest
         if focus:
             task, ends, total = focus
             left = max(0.0, ends - time.monotonic())
@@ -587,7 +587,7 @@ class HudCanvas(QWidget):
             p.drawArc(ring, 90 * 16, int(-360 * 16 * (left / total)))
             text = f'FOCUS · {task.upper()} · {int(left // 60):02d}:{int(left % 60):02d}'
             p.setPen(QColor('#00ff9c'))
-            p.drawText(QRectF(cx - 200, y - 18, 400, 16), Qt.AlignmentFlag.AlignCenter, text)
+            p.drawText(QRectF(cx - 200, y + 22, 400, 16), Qt.AlignmentFlag.AlignCenter, text)
         if feel:
             name, level, label = feel
             pulse = 0.5 + 0.5 * math.sin(time.monotonic() * (1.2 + level))
