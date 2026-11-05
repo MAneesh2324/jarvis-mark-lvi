@@ -7268,7 +7268,8 @@ class MainWindow(QMainWindow):
         txt = self._input.text().strip()
         if not txt: return
         self._input.clear()
-        self._log.append_log(f"You: {txt}")
+        shown = '/phonelink token ••••••' if txt.lower().startswith('/phonelink token') else txt   # never echo a secret
+        self._log.append_log(f"You: {shown}")
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 

@@ -119,6 +119,10 @@ def refresh_all():
         brief['cybersecurity'] = {'catalog_date': cyber.get('catalog_date'),
                                   'items': [f"{i.get('cveID')} {i.get('vendorProject', '')} {i.get('product', '')}".strip()
                                             for i in cyber.get('items', [])[:3]]}
+    from core import recall
+    tl = run('memory_timeline', lambda: recall.extract_new(120))   # small batches keep each cycle short
+    if tl:
+        result['sources']['memory_timeline'].update(processed=tl.get('processed', 0), added=tl.get('added', 0))
     if cfg['trading_learning']:
         from core import setup_tracker
         tr = run('trading_learning', setup_tracker.cycle)
