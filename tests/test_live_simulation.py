@@ -188,5 +188,71 @@ class VideoStreamUrl(unittest.TestCase):
         self.assertIn("if source.startswith(('http://', 'https://')):", src)
 
 
+class HandGestures(unittest.TestCase):
+    @staticmethod
+    def hand(n, wrist=(.5, .8)):
+        wx, wy = wrist
+        pts = [(wx, wy), (wx - .08, wy - .05), (wx - .12, wy - .1), (wx - .14, wy - .15), (wx - .15, wy - .2)]
+        for k, fx in enumerate((-.04, 0, .04, .08)):
+            pts += ([(wx + fx, wy - .15), (wx + fx, wy - .22), (wx + fx, wy - .27), (wx + fx, wy - .32)] if k < n else
+                    [(wx + fx, wy - .15), (wx + fx, wy - .2), (wx + fx + .02, wy - .16), (wx + fx + .01, wy - .13)])
+        return pts
+
+    def test_point_swipe_palm_and_old_gestures(self):
+        from core.hand_gestures import Interpreter
+        i = Interpreter()
+        e = i.update([self.hand(1)], 0)
+        self.assertEqual(e['kind'], 'point')
+        self.assertAlmostEqual(e['x'], .46)
+        i, kinds = Interpreter(), []
+        for k in range(10):
+            kinds.append(i.update([self.hand(4, (.5 + k * .05, .8))], k * .04))
+        swipes = [e for e in kinds if e['kind'] == 'swipe']
+        self.assertEqual([e['direction'] for e in swipes], ['right'])     # exactly one, with a cooldown
+        i = Interpreter()
+        held = [i.update([self.hand(4)], k / 10)['kind'] for k in range(14)]
+        self.assertEqual(held.count('palm_hold'), 1)
+        i = Interpreter()
+        self.assertIn('reset', [i.update([self.hand(0)], k / 10)['kind'] for k in range(10)])   # fist still resets
+        i = Interpreter()
+        self.assertEqual(i.update([self.hand(4), self.hand(4, (.2, .8))], 0)['kind'], 'zoom')  # two hands still zoom
+
+    def test_board_scrubs_zooms_and_swipes_attempts(self):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        import core.sim_session as S
+        from core.simulation_view import SimulationHologram
+        S.start('process', APPLE, {'metric': 'ripe', 'op': '<=', 'value': 145})
+        S.change({'sunlight_hours': 5})
+        b = S.change({'sunlight_hours': 10})
+        w = SimulationHologram()
+        w.resize(1100, 640)
+        w.set_result(b, animate=False)
+        w.grab()
+        w.apply_hand_gesture({'kind': 'point', 'x': .3, 'y': .5})
+        x0 = w._hover.x()
+        w.apply_hand_gesture({'kind': 'rotate', 'dx': .03, 'dy': 0})
+        self.assertGreater(w._hover.x(), x0)                             # pinch-drag scrubs forward in time
+        for _ in range(5):
+            w.apply_hand_gesture({'kind': 'zoom', 'factor': 1.1})
+        w.grab()
+        self.assertLess(w._span, 160)                                     # zoomed into part of the timeline
+        w.apply_hand_gesture({'kind': 'swipe', 'direction': 'left'})
+        self.assertEqual(w.result['session']['attempt'], 2)
+        self.assertEqual(w.result['assumptions']['settings']['sunlight_hours'], 5)
+        w.apply_hand_gesture({'kind': 'swipe', 'direction': 'right'})
+        self.assertEqual(w.result['session']['attempt'], 3)
+        w.apply_hand_gesture({'kind': 'reset'})
+        self.assertEqual(w._zoom, 1.0)
+        self.assertFalse(w.grab().isNull())
+        S.reset()
+        app.processEvents()
+
+    def test_ui_routes_gestures_to_the_board(self):
+        src = (Path(__file__).parent.parent / 'ui.py').read_text(encoding='utf-8')
+        self.assertIn('board.apply_hand_gesture(event)', src)
+
+
 if __name__ == '__main__':
     unittest.main()

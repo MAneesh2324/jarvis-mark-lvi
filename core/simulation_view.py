@@ -173,6 +173,7 @@ class SimulationHologram(QWidget):
             self._scene(p, eq, t, scene)
         if self._deferred:                                   # hover readouts sit on top of everything
             self._readout(p, *self._deferred)
+        self._gesture_layer(p, w, h, chart)
         self._scanlines(p, w, h, t)
 
     def _header(self, p, w, t):
@@ -232,7 +233,13 @@ class SimulationHologram(QWidget):
         dl = self.shown.get('deadline')
         if isinstance(dl, (int, float)) and last < dl <= last * 1.6:
             last = int(dl)                                   # keep a nearby deadline on the chart
-        return (lambda day: r.left() + r.width() * day / last), (lambda v: r.top() + r.height() * (hi - v) / (hi - lo)), lo, hi, last
+        zoom = max(1.0, min(12.0, getattr(self, '_zoom', 1.0)))
+        span = last / zoom
+        center = getattr(self, '_zoom_center', None)
+        center = last / 2 if center is None else center
+        w0 = max(0.0, min(last - span, center - span / 2))
+        self._w0, self._span = w0, span                      # the visible time window (hand-gesture zoom)
+        return (lambda day: r.left() + r.width() * (day - w0) / span), (lambda v: r.top() + r.height() * (hi - v) / (hi - lo)), lo, hi, last
 
     def _band(self, p, r, t):
         X, Y, lo, hi, last = self._scale(r)
@@ -284,7 +291,7 @@ class SimulationHologram(QWidget):
             p.setFont(QFont('Courier New', 8))
             p.drawText(QPointF(r.left() + 6, y - 5), f'TARGET {tgt:,.0f}')
         dl = self.shown.get('deadline')
-        if isinstance(dl, (int, float)) and dl <= last:
+        if isinstance(dl, (int, float)) and dl <= last and r.left() <= X(dl) <= r.right():
             x = X(dl)
             p.setPen(QPen(self._c('red', 200), 1.2, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
@@ -310,7 +317,7 @@ class SimulationHologram(QWidget):
             p.drawText(QRectF(r.left() - 72, r.top() + r.height() * i / 6 - 8, 66, 16),
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, _num(v, yu))
         for i in range(0, 11, 2):                            # time scale under every other vertical line
-            d = last * i / 10
+            d = self._w0 + self._span * i / 10
             x = r.left() + r.width() * i / 10
             align = Qt.AlignmentFlag.AlignLeft if i == 0 else Qt.AlignmentFlag.AlignRight if i == 10 else Qt.AlignmentFlag.AlignHCenter
             box = QRectF(x - (0 if i == 0 else 80 if i == 10 else 40), r.bottom() + 4, 80, 14)
@@ -324,33 +331,38 @@ class SimulationHologram(QWidget):
         if stages:
             p.setFont(QFont('Courier New', 7))
             for k, st in enumerate(stages):
-                x1, x2 = X(st['start']), X(st['end'])
+                x1, x2 = max(r.left(), X(st['start'])), min(r.right(), X(st['end']))
+                if x2 <= x1:
+                    continue
                 active = x1 <= edge
                 p.setPen(self._c('text' if active else 'dim', 230 if active else 120))
                 p.drawText(QRectF(x1 + 2, r.top() + 2 + (k % 2) * 10, max(10.0, x2 - x1 - 4), 10), Qt.AlignmentFlag.AlignLeft,
                            p.fontMetrics().elidedText(st['name'].upper(), Qt.TextElideMode.ElideRight, int(max(10.0, x2 - x1 - 4))))
         for ev in self.shown.get('events') or []:
-            if ev.get('at') is None or X(ev['at']) > edge:
+            if ev.get('at') is None or X(ev['at']) > edge or X(ev['at']) < r.left():
                 continue
             x = X(ev['at'])
             p.setPen(QPen(self._c('green', 200), 1.2, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(x, r.top() + 22), QPointF(x, r.bottom()))
             p.setFont(QFont('Courier New', 8, QFont.Weight.Bold))
             p.setPen(self._c('green'))
-            p.drawText(QRectF(x - 124, r.bottom() - 32, 120, 14), Qt.AlignmentFlag.AlignRight, '◆ ' + ev['label'].upper())
+            left_side = x - 124 >= r.left()
+            p.drawText(QRectF(x - 124, r.bottom() - 32, 120, 14) if left_side else QRectF(x + 4, r.bottom() - 32, 120, 14),
+                       Qt.AlignmentFlag.AlignRight if left_side else Qt.AlignmentFlag.AlignLeft, '◆ ' + ev['label'].upper())
 
         if reveal < 1:                                       # live numbers riding the beam
-            day = last * reveal
+            day = self._w0 + self._span * reveal
             row = _at(self.rows, day)
             if row:
                 self._tag(p, QPointF(edge, Y(row['median'])), f"{unit[:-1] if unit.endswith('s') else unit} {day:,.0f}",
                           _num(row['median'], yu), r, live=True)
         else:
             end = self.rows[-1]                              # final value pinned to the end of the line
-            self._tag(p, QPointF(X(end['day']), Y(end['median'])), 'END', _num(end['median'], yu), r)
+            if r.left() <= X(end['day']) <= r.right() + 1:
+                self._tag(p, QPointF(X(end['day']), Y(end['median'])), 'END', _num(end['median'], yu), r)
             hover = getattr(self, '_hover', None)
             if hover is not None and r.contains(hover):
-                day = (hover.x() - r.left()) / r.width() * last
+                day = self._w0 + (hover.x() - r.left()) / r.width() * self._span
                 row = _at(self.rows, day)
                 if row:
                     p.setPen(QPen(self._c('white', 120), 1, Qt.PenStyle.DotLine))
@@ -379,7 +391,8 @@ class SimulationHologram(QWidget):
         cx, cy = r.right() - size * .62, r.top() + size * .62 + 6
         knots = ((2, 3), (3, 4), (2, 5), (3, 5), (4, 5), (3, 7), (5, 6), (4, 7))
         pk, qk = knots[(session.get('attempt', 1) - 1) % len(knots)]
-        ang, tilt = t * (.9 if status != 'success' else .4), .55 + .25 * math.sin(t * .5)
+        ang = t * (.9 if status != 'success' else .4) + getattr(self, '_spin', 0.0)
+        tilt = .55 + .25 * math.sin(t * .5)
         pts = []
         for i in range(181):
             u = 2 * math.pi * i / 180
@@ -445,9 +458,9 @@ class SimulationHologram(QWidget):
         X, _Y, _lo, _hi, last = self._scale(r)
         reveal = 1 - (1 - min(1.0, t / BUILD_SECONDS)) ** 3
         hover = getattr(self, '_hover', None)
-        day = last * reveal
+        day = self._w0 + self._span * reveal
         if reveal >= 1 and hover is not None and r.contains(hover):
-            day = (hover.x() - r.left()) / r.width() * last
+            day = self._w0 + (hover.x() - r.left()) / r.width() * self._span
         k = min(range(len(ts)), key=lambda i: abs(ts[i] - day))
         val = lambda name, default=0.0: (series.get(name) or [default] * len(ts))[k]
         frac = lambda name, top: max(0.0, min(1.0, val(name) / top)) if name in series and top else 0.0
@@ -522,8 +535,10 @@ class SimulationHologram(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         for tr in trades:
             x = X(tr['n'])
-            if x > edge + 1:
+            if x > edge + 1 or x > eq.right() + 1:
                 break
+            if x < eq.left() - 1:
+                continue
             k = (tr.get('r') or 0) / top
             hgt = abs(k) * (r.height() / 2 - 2)
             win = tr.get('result') == 'win'
@@ -531,7 +546,7 @@ class SimulationHologram(QWidget):
             p.drawRect(QRectF(x - bw / 2, mid - hgt if win else mid, bw, max(1.0, hgt)))
         hover = getattr(self, '_hover', None)
         if hover is not None and r.contains(hover) and self.finished():
-            n = round((hover.x() - eq.left()) / eq.width() * last)
+            n = round(self._w0 + (hover.x() - eq.left()) / eq.width() * self._span)
             tr = next((x for x in trades if x['n'] == n), None)
             if tr:
                 lines = [f"#{tr['n']}  {'WIN' if tr.get('result') == 'win' else 'LOSS'}  {tr.get('direction', '')}",
@@ -575,6 +590,95 @@ class SimulationHologram(QWidget):
         p.setBrush(self._c('white'))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(at, 4, 4)
+
+    # ── hand gestures ───────────────────────────────────────────────────────
+    GESTURE_HINT = '☝ point  ·  🤏 drag = scrub time  ·  👐 spread = zoom  ·  ✋ swipe = attempts  ·  ✋ hold = replay  ·  ✊ hold = reset'
+
+    def apply_hand_gesture(self, event: dict) -> None:
+        """Camera hand gestures on the board: point, scrub, zoom, swipe through attempts, replay, reset."""
+        kind = event.get('kind')
+        now = time.monotonic()
+        self._gesture_seen = now
+        self._gesture_label = str(event.get('label', ''))[:80]
+        chart = getattr(self, '_chart', QRectF(0, 0, self.width(), self.height()))
+        if kind == 'point':
+            # the camera frame spans the whole board, like reaching into the projection
+            self._hover = QPointF(float(event.get('x', .5)) * self.width(), float(event.get('y', .5)) * self.height())
+            self._cursor_kind = 'point'
+        elif kind == 'rotate':                               # pinch + drag
+            hover = getattr(self, '_hover', None) or QPointF(chart.center().x(), chart.center().y())
+            x = min(chart.right() - 1, max(chart.left() + 1, hover.x() + float(event.get('dx', 0)) * chart.width() * 2.4))
+            self._hover = QPointF(x, hover.y())
+            self._spin = getattr(self, '_spin', 0.0) + float(event.get('dy', 0)) * 6
+            self._cursor_kind = 'grab'
+        elif kind == 'zoom':
+            self._zoom = max(1.0, min(12.0, getattr(self, '_zoom', 1.0) * float(event.get('factor', 1))))
+            hover = getattr(self, '_hover', None)
+            if hover is not None and hasattr(self, '_w0') and chart.width():
+                self._zoom_center = self._w0 + (hover.x() - chart.left()) / chart.width() * self._span
+            self._toast(f"ZOOM ×{self._zoom:.1f}")
+        elif kind == 'swipe':
+            self._step_attempt(-1 if event.get('direction') == 'left' else 1)
+        elif kind == 'palm_hold':
+            self._toast('▶ REPLAY')
+            self.set_result(self.result)
+        elif kind == 'reset':
+            self._zoom, self._zoom_center, self._spin, self._hover = 1.0, None, 0.0, None
+            self._toast('VIEW RESET')
+            self.set_result(self.result)
+        if not self._timer.isActive():
+            self._timer.start(50)
+        self.update()
+
+    def _step_attempt(self, step: int) -> None:
+        session = self.result.get('session')
+        if not session:
+            self._toast('NO OTHER ATTEMPTS')
+            return
+        from core import sim_session
+        total = session.get('of') or session.get('attempt', 1)
+        n = session.get('attempt', 1) + step
+        board = sim_session.attempt_board(n) if 1 <= n <= total else None
+        if board is None:
+            self._toast('FIRST ATTEMPT' if step < 0 else 'LATEST ATTEMPT')
+            return
+        self.set_result(board, animate=False)
+        self._toast(('◀ ' if step < 0 else '') + f'ATTEMPT {n:02d} OF {total:02d}' + (' ▶' if step > 0 else ''))
+
+    def _toast(self, text: str) -> None:
+        self._toast_text, self._toast_at = text, time.monotonic()
+
+    def _gesture_layer(self, p, w, h, chart):
+        now = time.monotonic()
+        seen = now - getattr(self, '_gesture_seen', -99) < 6
+        if seen:                                             # which gestures are live, along the bottom
+            p.setFont(QFont('Courier New', 8))
+            p.setPen(self._c('acc2', 220))
+            p.drawText(QRectF(28, h - 22, w - 56, 14), Qt.AlignmentFlag.AlignLeft,
+                       p.fontMetrics().elidedText('✋ GESTURES  ' + (getattr(self, '_gesture_label', '') or self.GESTURE_HINT),
+                                                  Qt.TextElideMode.ElideRight, int(w * .6)))
+            hover = getattr(self, '_hover', None)
+            if hover is not None and now - getattr(self, '_gesture_seen', -99) < 1.5:
+                grab = getattr(self, '_cursor_kind', 'point') == 'grab'
+                ring = 9 if grab else 13
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(self._c('acc2', 240), 2))
+                p.drawEllipse(hover, ring, ring)
+                p.setPen(QPen(self._c('acc2', 120), 1))
+                p.drawEllipse(hover, ring + 6 + 3 * math.sin(now * 8), ring + 6 + 3 * math.sin(now * 8))
+                if grab:
+                    p.setBrush(self._c('acc2', 200))
+                    p.drawEllipse(hover, 3, 3)
+        k = now - getattr(self, '_toast_at', -99)
+        if k < 1.4:
+            a = 1 if k < 1 else (1.4 - k) / .4
+            p.setFont(QFont('Courier New', 13, QFont.Weight.Bold))
+            box = QRectF(chart.center().x() - 150, chart.bottom() - 74, 300, 30)
+            p.setPen(QPen(self._c('acc2', 220 * a), 1))
+            p.setBrush(self._c('bg', 210 * a))
+            p.drawRoundedRect(box, 4, 4)
+            p.setPen(self._c('acc2', 255 * a))
+            p.drawText(box, Qt.AlignmentFlag.AlignCenter, getattr(self, '_toast_text', ''))
 
     def _defer(self, at, lines, r):
         self._deferred = (at, lines, r)

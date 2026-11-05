@@ -11,7 +11,7 @@ def angle(a,b,c):
  return math.degrees(math.acos(max(-1,min(1,sum(x*y for x,y in zip(u,v))/norm)))) if norm>1e-8 else 0
 class Interpreter:
  def __init__(self):self.clear()
- def clear(self):self.anchor=None;self.span=None;self.fist_at=None;self.fist_latched=False;self.pinched=False
+ def clear(self):self.anchor=None;self.span=None;self.fist_at=None;self.fist_latched=False;self.pinched=False;self.trail=[];self.swiped_at=-9.;self.still_at=None;self.palm_latched=False
  def update(self,hands,now=None):
   now=time.monotonic() if now is None else now
   if not isinstance(hands,list) or not 1<=len(hands)<=2:self.clear();return {'kind':'idle','label':'Show your hand'}
@@ -38,7 +38,23 @@ class Interpreter:
    dx=max(-.06,min(.06,current[0]-old[0])) if old else 0;dy=max(-.06,min(.06,current[1]-old[1])) if old else 0
    return {'kind':'rotate','dx':dx,'dy':dy,'label':'Grab / rotate'}
   self.anchor=None
-  return {'kind':'idle','label':'Pinch + drag to rotate · two open hands to zoom'}
+  if fingers==1 and angle(h[5],h[6],h[8])>155 and distance(h[8],h[0])>distance(h[6],h[0])*1.1:
+   self.trail=[];self.still_at=None;self.palm_latched=False
+   return {'kind':'point','x':float(h[8][0]),'y':float(h[8][1]),'label':'Pointing'}
+  if fingers>=4:                                   # open palm: swipe sideways, or hold still to replay
+   wrist=(float(h[0][0]),float(h[0][1]));self.trail=[(t,x,y) for t,x,y in self.trail if now-t<=.35]+[(now,wrist[0],wrist[1])]
+   t0,x0,y0=self.trail[0];dx,dy=wrist[0]-x0,wrist[1]-y0
+   if abs(dx)>.22 and abs(dy)<.12 and now-self.swiped_at>.9:
+    self.swiped_at=now;self.trail=[];self.still_at=None
+    return {'kind':'swipe','direction':'right' if dx>0 else 'left','label':'Swipe '+('right' if dx>0 else 'left')}
+   moving=max((abs(x-wrist[0])+abs(y-wrist[1]) for _,x,y in self.trail),default=0)>.03
+   if moving:self.still_at=None;self.palm_latched=False
+   elif self.still_at is None:self.still_at=now
+   elif now-self.still_at>=1.0 and not self.palm_latched:
+    self.palm_latched=True;return {'kind':'palm_hold','label':'Open palm held: replay'}
+   return {'kind':'idle','label':'Open hand: swipe for attempts, hold still to replay'}
+  self.trail=[];self.still_at=None;self.palm_latched=False
+  return {'kind':'idle','label':'Point · pinch + drag · two open hands to zoom · swipe · fist resets'}
 
 def _finish_process(process):
  if process.poll() is None:
@@ -106,7 +122,7 @@ class GestureController:
         if event.get('kind')=='preview':
          payload=event.get('jpeg','')
          if not isinstance(payload,str) or len(payload)>48000:continue
-        elif event.get('kind') not in ('idle','rotate','zoom','reset'):continue
+        elif event.get('kind') not in ('idle','rotate','zoom','reset','point','swipe','palm_hold'):continue
         self.state='tracking';self.frames+=1;self.label=str(event.get('label','Tracking'))[:100]
        if not stop.is_set():callback(event)
      if process.poll() is not None:break
