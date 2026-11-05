@@ -137,9 +137,6 @@ def _record(result, info, params):
     with _lock:
         info['n'] = len(_state['attempts']) + 1
         _state['attempts'].append(info)
-        _state.setdefault('history', {})[info['n']] = result
-        for old in [k for k in _state['history'] if k <= info['n'] - 12]:
-            del _state['history'][old]                       # keep the last 12 attempts' boards
         _state['params'] = params
         _state['last'] = result
         if info['passed'] and _state.get('best') is None:
@@ -223,22 +220,6 @@ def status() -> dict:
 
 def board() -> dict | None:
     return _board(_state['last']) if active() and _state.get('last') else None
-
-
-def attempt_board(n: int) -> dict | None:
-    """The board as it was at attempt n (for swiping back through attempts), or None."""
-    with _lock:
-        result = (_state.get('history') or {}).get(int(n))
-        if result is None:
-            return None
-        attempts = _state['attempts'][:int(n)]
-        last = attempts[-1]
-        board = dict(result)
-        board['session'] = {'label': _state.get('label') or '', 'attempt': int(n), 'of': len(_state['attempts']),
-                            'criterion': _criterion_text(_state.get('criterion')),
-                            'status': 'success' if last.get('passed') else 'failed' if last.get('passed') is False else None,
-                            'attempts': attempts[-MAX_ATTEMPTS_SHOWN:]}
-        return board
 
 
 def reset() -> dict:

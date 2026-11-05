@@ -9,75 +9,9 @@ def distance(a,b):return math.sqrt(sum((float(a[i])-float(b[i]))**2 for i in ran
 def angle(a,b,c):
  u=[a[i]-b[i] for i in range(2)];v=[c[i]-b[i] for i in range(2)];norm=math.hypot(*u)*math.hypot(*v)
  return math.degrees(math.acos(max(-1,min(1,sum(x*y for x,y in zip(u,v))/norm)))) if norm>1e-8 else 0
-class LatestFrame:
- """Reads the camera on its own thread and keeps only the newest frame.
-
- OpenCV queues frames inside the camera driver; a loop that runs even slightly slower than
- the camera then works on frames that are a quarter of a second old, which is what lag feels
- like. Draining continuously and handing out only the latest frame removes that delay."""
- def __init__(self,cap,stop):
-  self.cap,self.stop=cap,stop;self.frame=None;self.ok=False;self.seq=0;self.taken=0
-  self.cond=threading.Condition();self.closed=False
-  self.thread=threading.Thread(target=self._run,daemon=True,name='gesture-camera-reader');self.thread.start()
- def _run(self):
-  while not self.stop.is_set() and not self.closed:
-   ok,frame=self.cap.read()
-   with self.cond:
-    self.ok,self.frame=ok,frame;self.seq+=1;self.cond.notify_all()
-   if not ok:time.sleep(.02)
- def next(self,timeout=.5):
-  with self.cond:
-   if self.seq==self.taken:self.cond.wait(timeout)
-   self.taken=self.seq
-   return self.ok,(None if self.frame is None else self.frame.copy())
- def close(self):
-  self.closed=True
-  with self.cond:self.cond.notify_all()
-  self.thread.join(timeout=1)
-
-
-class OneEuro:
- """One-euro filter: steady when the hand is still, responsive when it moves (Casiez et al. 2012)."""
- def __init__(self,min_cutoff=1.6,beta=8.0,d_cutoff=1.0):
-  self.min_cutoff,self.beta,self.d_cutoff=min_cutoff,beta,d_cutoff;self.x=None;self.dx=0.;self.t=None
- @staticmethod
- def _alpha(cutoff,dt):
-  tau=1/(2*math.pi*cutoff);return 1/(1+tau/dt)
- def __call__(self,x,t):
-  if self.x is None or self.t is None or t-self.t>.5:
-   self.x,self.dx,self.t=x,0.,t;return x
-  dt=max(1e-3,t-self.t);self.t=t
-  dx=(x-self.x)/dt;a_d=self._alpha(self.d_cutoff,dt);self.dx=a_d*dx+(1-a_d)*self.dx
-  a=self._alpha(self.min_cutoff+self.beta*abs(self.dx),dt);self.x=a*x+(1-a)*self.x
-  return self.x
- def reset(self):self.x=None;self.t=None;self.dx=0.
-
-
 class Interpreter:
- """Hand landmarks → gestures. Each frame returns one event dict with a 'kind' and a 'label'.
-
- Kept from before (the face, Earth and board all use them):
-   rotate     pinch thumb+index and drag            dx, dy
-   zoom       two open hands moving apart/together  factor
-   reset      fist held still ~0.8 s
-   point      index finger only                     x, y of the fingertip
-   swipe      open palm flicked left/right/up/down  direction
-   palm_hold  open palm held still ~1 s
- Workshop gestures:
-   throw      a fist flung and opened mid-move      direction, speed
-   explode    two hands close together, then burst apart
-   implode    two hands brought back together quickly
-   twist      two open hands turned like a wheel    direction (cw/ccw), degrees
-   push/pull  open palm moved towards / away from the camera
- """
  def __init__(self):self.clear()
- def clear(self):
-  self.anchor=None;self.span=None;self.fist_at=None;self.fist_latched=False;self.pinched=False
-  self.trail=[];self.swiped_at=-9.;self.still_at=None;self.palm_latched=False
-  self.fist_trail=[];self.was_fist=False;self.thrown_at=-9.
-  self.pair=[];self.pair_event_at=-9.;self.depth=[];self.depth_at=-9.
-  self.fx=OneEuro();self.fy=OneEuro();self.mode=None
-
+ def clear(self):self.anchor=None;self.span=None;self.fist_at=None;self.fist_latched=False;self.pinched=False
  def update(self,hands,now=None):
   now=time.monotonic() if now is None else now
   if not isinstance(hands,list) or not 1<=len(hands)<=2:self.clear();return {'kind':'idle','label':'Show your hand'}
@@ -85,104 +19,26 @@ class Interpreter:
    if len(hand)!=21 or any(len(p)<2 or not all(math.isfinite(float(v)) and -.5<=float(v)<=1.5 for v in p[:2]) for p in hand):self.clear();return {'kind':'idle','label':'Hand tracking lost'}
   def opened(h):return sum(angle(h[mcp],h[pip],h[tip])>155 and distance(h[tip],h[0])>distance(h[pip],h[0])*1.05 for mcp,pip,tip in ((5,6,8),(9,10,12),(13,14,16),(17,18,20)))
   h=hands[0];fingers=opened(h)
-
-  # ── two open hands: zoom, plus twist / explode / implode from how the pair moves ──
   if len(hands)==2 and fingers>=3 and opened(hands[1])>=3:
-   self.pinched=False;self.anchor=None;self.fist_at=None;self.trail=[]
-   a,b=h[9],hands[1][9]
-   span=distance(a,b);turn=math.degrees(math.atan2(b[1]-a[1],b[0]-a[0]))
-   self.pair=[q for q in self.pair if now-q[0]<=.6]+[(now,span,turn)]
-   if now-self.pair_event_at>1.0 and len(self.pair)>=3:
-    t0,s0,a0=self.pair[0]
-    da=(turn-a0+180)%360-180
-    if s0<.22 and span>s0*2.0 and span>.35:
-     self.pair_event_at=now;self.pair=[];self.span=span
-     return {'kind':'explode','label':'Explode view'}
-    if s0>.35 and span<s0*.5:
-     self.pair_event_at=now;self.pair=[];self.span=span
-     return {'kind':'implode','label':'Bring it together'}
-    if abs(da)>28 and .6<span/max(s0,1e-6)<1.6:
-     self.pair_event_at=now;self.pair=[];self.span=span
-     return {'kind':'twist','direction':'cw' if da>0 else 'ccw','degrees':round(da,1),'label':'Twist '+('clockwise' if da>0 else 'anticlockwise')}
-   previous=self.span;self.span=span
+   self.pinched=False
+   span=distance(h[9],hands[1][9]);previous=self.span;self.span=span;self.anchor=None;self.fist_at=None
    factor=max(.90,min(1.10,span/previous)) if previous and previous>.08 and span>.08 else 1.
-   return {'kind':'zoom','factor':factor,'label':'Two-hand zoom · burst apart to explode · turn to twist'}
-  self.span=None;self.pair=[]
-
-  wrist=(float(h[0][0]),float(h[0][1]))
-  # ── fist: held still resets; flung and opened is a throw ──
+   return {'kind':'zoom','factor':factor,'label':'Two-hand zoom'}
+  self.span=None
   if fingers==0:
-   self.pinched=False;self.anchor=None;self.trail=[]
-   self.fist_trail=[q for q in self.fist_trail if now-q[0]<=.3]+[(now,wrist[0],wrist[1])]
-   self.was_fist=True
-   moved=max((abs(x-wrist[0])+abs(y-wrist[1]) for _,x,y in self.fist_trail),default=0)
-   if moved>.04:self.fist_at=now;self.fist_latched=False         # a moving fist is a grab, not a reset
+   self.pinched=False;self.anchor=None
    if self.fist_at is None:self.fist_at=now
    if now-self.fist_at>=.8 and not self.fist_latched:self.fist_latched=True;return {'kind':'reset','label':'View reset'}
-   return {'kind':'idle','pose':'fist','progress':0 if self.fist_latched else round(min(1,(now-self.fist_at)/.8),2),
-           'label':'Fist: hold still to reset · fling and open to throw'}
-  if self.was_fist and fingers>=3 and self.fist_trail and now-self.thrown_at>1.0:
-   t0,x0,y0=self.fist_trail[0];t1,x1,y1=self.fist_trail[-1];dt=max(t1-t0,1e-3)
-   vx,vy=(x1-x0)/dt,(y1-y0)/dt;speed=math.hypot(vx,vy)
-   self.was_fist=False;self.fist_trail=[]
-   if speed>.9 and now-t1<.25:
-    self.thrown_at=now;self.fist_at=None;self.fist_latched=False
-    direction=('right' if vx>0 else 'left') if abs(vx)>=abs(vy) else ('down' if vy>0 else 'up')
-    return {'kind':'throw','direction':direction,'speed':round(speed,2),'label':'Throw '+direction}
-  if fingers>0:self.was_fist=False;self.fist_trail=[]
+   return {'kind':'idle','label':'Hold fist to reset'}
   self.fist_at=None;self.fist_latched=False
-
-  # ── pinch + drag ──
   palm=max(.04,distance(h[0],h[9]));pinch=distance(h[4],h[8])/palm
   grabbing=pinch<(.45 if self.pinched else .30) and fingers>=2;self.pinched=grabbing
   if grabbing:
-   if self.mode!='pinch':self.fx.reset();self.fy.reset()
    current=((h[4][0]+h[8][0])/2,(h[4][1]+h[8][1])/2);old=self.anchor;self.anchor=current
-   # dx/dy stay raw (the face and Earth views rotate by them as before); x/y are smoothed for the board cursor
    dx=max(-.06,min(.06,current[0]-old[0])) if old else 0;dy=max(-.06,min(.06,current[1]-old[1])) if old else 0
-   self.mode='pinch'
-   return {'kind':'rotate','dx':dx,'dy':dy,'x':float(self.fx(current[0],now)),'y':float(self.fy(current[1],now)),'label':'Pinch: drag to scrub'}
+   return {'kind':'rotate','dx':dx,'dy':dy,'label':'Grab / rotate'}
   self.anchor=None
-
-  # ── pointing ──
-  index_out=distance(h[8],h[0])>distance(h[6],h[0])*1.05
-  pointing=(fingers==1 and angle(h[5],h[6],h[8])>155 and distance(h[8],h[0])>distance(h[6],h[0])*1.1) or \
-           (self.mode=='point' and fingers<=2 and angle(h[5],h[6],h[8])>135 and index_out)       # hysteresis
-  if pointing:
-   if self.mode!='point' and self.mode!='pinch':self.fx.reset();self.fy.reset()
-   self.trail=[];self.still_at=None;self.palm_latched=False;self.depth=[];self.mode='point'
-   return {'kind':'point','x':float(self.fx(h[8][0],now)),'y':float(self.fy(h[8][1],now)),'label':'Pointing'}
-  self.mode=None
-
-  # ── open palm: swipe in four directions, push / pull, hold still ──
-  if fingers>=4:
-   self.trail=[(t,x,y) for t,x,y in self.trail if now-t<=.35]+[(now,wrist[0],wrist[1])]
-   self.depth=[q for q in self.depth if now-q[0]<=.4]+[(now,palm)]
-   t0,x0,y0=self.trail[0];dx,dy=wrist[0]-x0,wrist[1]-y0
-   if now-self.swiped_at>.9:
-    if abs(dx)>.22 and abs(dy)<.12:
-     self.swiped_at=now;self.trail=[];self.still_at=None;self.depth=[]
-     return {'kind':'swipe','direction':'right' if dx>0 else 'left','label':'Swipe '+('right' if dx>0 else 'left')}
-    if abs(dy)>.20 and abs(dx)<.12:
-     self.swiped_at=now;self.trail=[];self.still_at=None;self.depth=[]
-     return {'kind':'swipe','direction':'down' if dy>0 else 'up','label':'Swipe '+('down' if dy>0 else 'up')}
-   d0=self.depth[0][1]
-   if now-self.depth_at>1.0 and len(self.depth)>=3 and abs(dx)<.08 and abs(dy)<.08:
-    if palm>d0*1.35:
-     self.depth_at=now;self.depth=[];self.still_at=None
-     return {'kind':'push','label':'Push: run it again'}
-    if palm<d0*.72:
-     self.depth_at=now;self.depth=[];self.still_at=None
-     return {'kind':'pull','label':'Pull back: zoom out'}
-   moving=max((abs(x-wrist[0])+abs(y-wrist[1]) for _,x,y in self.trail),default=0)>.03 or abs(palm-d0)>d0*.1
-   if moving:self.still_at=None;self.palm_latched=False
-   elif self.still_at is None:self.still_at=now
-   elif now-self.still_at>=1.0 and not self.palm_latched:
-    self.palm_latched=True;return {'kind':'palm_hold','label':'Open palm held: replay'}
-   return {'kind':'idle','pose':'open','progress':0 if (self.still_at is None or self.palm_latched) else round(min(1,(now-self.still_at)/1.0),2),
-           'x':float(h[9][0]),'y':float(h[9][1]),'label':'Open hand: swipe · push / pull · hold still to replay'}
-  self.trail=[];self.still_at=None;self.palm_latched=False;self.depth=[]
-  return {'kind':'idle','label':'Point · pinch + drag · open hand swipe/push · two hands zoom/twist/explode · fist throw/reset'}
+  return {'kind':'idle','label':'Pinch + drag to rotate · two open hands to zoom'}
 
 def _finish_process(process):
  if process.poll() is None:
@@ -250,7 +106,7 @@ class GestureController:
         if event.get('kind')=='preview':
          payload=event.get('jpeg','')
          if not isinstance(payload,str) or len(payload)>48000:continue
-        elif event.get('kind') not in ('idle','rotate','zoom','reset','point','swipe','palm_hold','throw','explode','implode','twist','push','pull'):continue
+        elif event.get('kind') not in ('idle','rotate','zoom','reset'):continue
         self.state='tracking';self.frames+=1;self.label=str(event.get('label','Tracking'))[:100]
        if not stop.is_set():callback(event)
      if process.poll() is not None:break
@@ -281,15 +137,11 @@ class GestureController:
      from actions.screen_processor import _load_config,_cv2_backend
      index=int(_load_config().get('camera_index',0));cap=cv2.VideoCapture(index,_cv2_backend());resources.callback(cap.release)
      if not cap.isOpened():raise RuntimeError('Camera could not open for gestures. Close other camera apps and try again.')
-     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);cap.set(cv2.CAP_PROP_FPS,30)
-     try:cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
-     except Exception:pass
-     interpreter=Interpreter();last_stamp=0;misses=0;last_preview=0
-     latest=LatestFrame(cap,stop);resources.callback(latest.close)
+     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);interpreter=Interpreter();last_stamp=0;misses=0;last_preview=0
      with self._lock:
       if generation==self.generation:self.state='tracking'
      while not stop.is_set():
-      before=time.monotonic();ok,frame=latest.next(timeout=.5)
+      before=time.monotonic();ok,frame=cap.read()
       if not ok or frame is None:
        misses+=1
        if misses>=10:raise RuntimeError('Camera stopped returning frames.')
@@ -301,7 +153,7 @@ class GestureController:
        if generation!=self.generation:return
        self.frames+=1;self.label=event['label']
       if not stop.is_set():callback(event)
-      if time.monotonic()-last_preview>=.2 and not stop.is_set():
+      if time.monotonic()-last_preview>=.15 and not stop.is_set():
        last_preview=time.monotonic();preview=cv2.resize(frame,(320,240))
        edges=((0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),(13,17),(0,17),(17,18),(18,19),(19,20))
        for hand in hands:
@@ -310,7 +162,7 @@ class GestureController:
         for point in points:cv2.circle(preview,point,3,(0,255,120),-1)
        ok,encoded=cv2.imencode('.jpg',preview,[cv2.IMWRITE_JPEG_QUALITY,45])
        if ok and len(encoded)<=36000:callback({'kind':'preview','generation':generation,'jpeg':base64.b64encode(encoded).decode('ascii'),'label':event['label'],'hands':len(hands)})
-      # no fixed sleep: the next call waits for the next fresh frame (about 30 a second)
+      stop.wait(max(0,.05-(time.monotonic()-before)))
   except Exception as exc:
    with self._lock:
     if generation==self.generation:self.state='failed';self.error=str(exc);self.label='Tracking stopped'

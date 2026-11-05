@@ -5940,7 +5940,7 @@ class MainWindow(QMainWindow):
             if action=='stop' or action=='toggle' and controller.status()['enabled']:controller.stop()
             elif action in ('start','toggle'):
                 controller.start(self._hand_gesture_sig.emit)
-                self._log.append_log('SYS: Local hand gestures enabled. Camera frames stay on this Mac. Pinch + drag to rotate; two open hands to zoom; hold a fist to reset. On the simulation board: point to inspect, pinch-drag to scrub time, swipe an open hand for attempts, hold a palm to replay. Stop with Hand Gestures in Controls.')
+                self._log.append_log('SYS: Local hand gestures enabled. Camera frames stay on this Mac. Pinch + drag to rotate; two open hands to zoom; hold a fist to reset. Stop with Hand Gestures in Controls.')
         except PermissionError as exc:
             self._log.append_log('SYS: '+str(exc));self._show_camera_permissions()
         except Exception as exc:self._log.append_log('SYS: Hand gestures: '+str(exc))
@@ -5962,14 +5962,7 @@ class MainWindow(QMainWindow):
                 self._hand_preview.show()
                 self._hand_preview_status.setText(str(event.get('hands',0))+' hand(s) · '+str(event.get('label','Tracking'))[:100])
                 self._hand_preview_status.show()
-                board=getattr(self,'_sim_board',None)
-                if board is not None and self._hud_cam_stack.currentWidget() is board:
-                    board.set_tracker_preview(pixmap)   # see your hand on the board while you control it
             except (ValueError,TypeError):pass
-            return
-        board=getattr(self,'_sim_board',None)
-        if board is not None and self._hud_cam_stack.currentWidget() is board:
-            board.apply_hand_gesture(event)   # the simulation board takes every gesture, idle included (it shows the hint)
             return
         if event.get('kind')=='idle':return
         earth=getattr(self,'_earth_panel',None)
