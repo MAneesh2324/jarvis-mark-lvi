@@ -968,6 +968,18 @@ def _signals(candles, strategy, p):
     return sorted(out, key=lambda e: e['i'])
 
 
+def _curve(rs, limit=300):
+    """[[trade number, cumulative R], …] starting at 0, thinned evenly so it stays small."""
+    pts, total = [[0, 0.0]], 0.0
+    for i, r in enumerate(rs, 1):
+        total += r
+        pts.append([i, round(total, 3)])
+    if len(pts) > limit:
+        step = (len(pts) - 1) / (limit - 1)
+        pts = [pts[round(k * step)] for k in range(limit)]
+    return pts
+
+
 def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **params) -> dict:
     candles = data['candles']
     rr = float(rr)
@@ -1025,6 +1037,7 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
              'total_r': round(sum(rs), 2), 'average_r_per_trade': round(sum(rs) / len(rs), 3) if rs else None,
              'profit_factor': round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) else None,
              'max_drawdown_r': round(dd, 2), 'longest_losing_streak': worst,
+             'equity_curve_r': _curve(rs),
              'longs': sum(1 for t in closed if t['direction'] == 'long'),
              'shorts': sum(1 for t in closed if t['direction'] == 'short'),
              'open_trade': next(({'direction': t['direction'], 'entry': round(t['entry'], dec), 'stop': round(t['stop'], dec),

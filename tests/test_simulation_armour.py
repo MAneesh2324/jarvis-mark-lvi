@@ -269,5 +269,46 @@ class ShowAndLab(unittest.TestCase):
         act._lab = None
 
 
+class BacktestBoard(unittest.TestCase):
+    def test_equity_curve_and_board(self):
+        from core.trading_lab import _curve
+        from core.scenario_simulator import from_backtest, headline
+        curve = _curve([2, -1, -1, 2])
+        self.assertEqual(curve, [[0, 0.0], [1, 2.0], [2, 1.0], [3, 0.0], [4, 2.0]])
+        self.assertEqual(len(_curve([1] * 1000)), 300)
+        board = from_backtest({'strategy': 'breaker_retest', 'instrument': 'XAUUSD', 'interval': '15m',
+                               'settings': {'reward_to_risk': 2}, 'closed_trades': 4, 'wins': 2, 'losses': 2,
+                               'win_rate_percent': 50, 'total_r': 2, 'max_drawdown_r': 2, 'equity_curve_r': curve})
+        self.assertEqual(board['y_unit'], 'R')
+        self.assertEqual(board['fan_chart'][3]['p95'], 2.0)          # running peak shades the drawdown
+        h = headline(board)
+        self.assertIn('XAUUSD', h['title'])
+        self.assertEqual(h['metrics'][0][1], '+2.0R')
+
+    def test_trading_tool_shows_backtest_on_board(self):
+        import actions.trading_lab as act
+        import core.scenario_simulator as sim
+        stats = {'strategy': 'breaker_retest', 'closed_trades': 1, 'total_r': 2, 'equity_curve_r': [[0, 0], [1, 2]]}
+        ui = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(sim, 'LAST', Path(tmp) / 'l.json'), \
+                patch.object(sim, 'REPORTS', Path(tmp)), patch('core.trading_lab.load', return_value={}), \
+                patch('core.trading_lab.backtest', return_value=dict(stats)):
+            out = act.trading_lab({'action': 'backtest', 'symbol': 'XAUUSD'}, player=ui)
+            self.assertEqual(sim.last()['kind'], 'backtest')          # "show me the simulation" replays it
+        self.assertEqual(ui.show_simulation.call_args[0][0]['kind'], 'backtest')
+        self.assertIn('"shown_on_hologram": true', out)
+        self.assertNotIn('equity_curve_r', out)
+
+    def test_numbers_are_formatted_for_the_board(self):
+        from core.simulation_view import _num, _at
+        self.assertEqual(_num(389444), '389.4k')
+        self.assertEqual(_num(2.5e6), '2.50M')
+        self.assertEqual(_num(300, 'hours'), '300 h')
+        self.assertEqual(_num(-3.4, 'R'), '-3.4R')
+        self.assertEqual(_num(1.10234), '1.1023')
+        row = _at([{'day': 0, 'p05': 0, 'median': 0, 'p95': 0}, {'day': 10, 'p05': 10, 'median': 20, 'p95': 30}], 5)
+        self.assertEqual(row['median'], 10)
+
+
 if __name__ == '__main__':
     unittest.main()

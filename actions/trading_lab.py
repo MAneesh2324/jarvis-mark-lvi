@@ -4,7 +4,21 @@ import json
 from core import outcome
 
 
-def trading_lab(parameters, **kwargs):
+def _show_backtest(data, player):
+    """Put a finished backtest on the holographic board and keep it for "show me the simulation"."""
+    try:
+        from core.scenario_simulator import from_backtest, remember
+        board = from_backtest(data)
+        remember(board)
+        if player is not None and hasattr(player, 'show_simulation'):
+            player.show_simulation(board)
+            return True
+    except Exception as exc:
+        print(f'[TradingLab] board failed: {exc}')
+    return False
+
+
+def trading_lab(parameters, player=None, **kwargs):
     p = dict(parameters or {})
     action = p.get('action', 'analyse')
     try:
@@ -42,6 +56,8 @@ def trading_lab(parameters, **kwargs):
                                 rr=p.get('rr', 2.0), max_hold=p.get('max_hold', 0),
                                 **{k: p[k] for k in ('fast', 'slow', 'length', 'atr_stop', 'oversold', 'overbought',
                                                      'swing_length') if p.get(k) is not None})
+            data['shown_on_hologram'] = _show_backtest(data, player)
+            data.pop('equity_curve_r', None)          # the board has it; keep the spoken payload small
         elif action == 'compare':
             data = {'instrument': p.get('symbol') or p.get('csv_path'), 'results': []}
             candles = lab.load(p)

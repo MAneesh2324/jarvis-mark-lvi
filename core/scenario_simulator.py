@@ -99,6 +99,16 @@ def savings(monthly_contribution,months,start_balance=0,annual_return_percent=0,
   reached=hit[~np.isnan(hit)];result['simulated_fraction_reaching_target_percent']=float(np.mean(~np.isnan(hit))*100);result['target_month_median']=float(np.median(reached)) if len(reached) else None
  return result
 
+def from_backtest(stats):
+ """A trading_lab backtest as a board result: the equity line in R, shaded down to its running peak (drawdown)."""
+ curve=stats.get('equity_curve_r') or [[0,0.0]];peak=float('-inf');rows=[]
+ for n,eq in curve:
+  peak=max(peak,eq);rows.append({'day':int(n),'p05':float(eq),'median':float(eq),'p95':float(peak)})
+ return {'kind':'backtest','x_unit':'trades','y_unit':'R','target':None,'fan_chart':rows,'band_label':'line = equity in R  ·  shaded = drawdown from peak',
+  'assumptions':{'strategy':stats.get('strategy'),'instrument':stats.get('instrument'),'interval':stats.get('interval'),'reward_to_risk':(stats.get('settings') or {}).get('reward_to_risk'),'period':stats.get('period')},
+  'stats':{k:stats.get(k) for k in ('closed_trades','wins','losses','win_rate_percent','total_r','average_r_per_trade','profit_factor','max_drawdown_r','longest_losing_streak')},
+  'limits':stats.get('assumptions','Past results do not predict future ones.'),'created':datetime.now(timezone.utc).isoformat()}
+
 _FMT=lambda v,d=1:'—' if v is None else (f'{v:,.{d}f}' if abs(v)<1e6 else f'{v:,.3g}')
 
 def headline(result):
@@ -107,7 +117,10 @@ def headline(result):
  if kind=='comparison':
   inner=headline(result.get('alternative',{}));base=headline(result.get('baseline',{}))
   changed=', '.join(f"{k} {v['baseline']}→{v['alternative']}" for k,v in result.get('changed_assumptions',{}).items()) or 'no assumption changed'
-  return {'title':'COMPARISON · '+inner['title'],'metrics':inner['metrics'],'verdict':'Changed: '+changed+'. Baseline: '+base['verdict']+' Alternative: '+inner['verdict']}
+  lead=''
+  if inner['metrics'] and base['metrics'] and inner['metrics'][0][0]==base['metrics'][0][0]:
+   lead=f" {inner['metrics'][0][0].capitalize()}: {base['metrics'][0][1]} → {inner['metrics'][0][1]}."
+  return {'title':'COMPARISON · '+inner['title'],'metrics':inner['metrics'],'verdict':'Changed '+changed+'.'+lead+' '+inner['verdict']}
  if kind=='goal':
   p50=result.get('finish_day_median');p05=result.get('finish_day_p05');p95=result.get('finish_day_p95')
   m=[('MEDIAN FINISH',f"day {_FMT(p50,0)}",'pri'),('LIKELY RANGE',f"{_FMT(p05,0)}–{_FMT(p95,0)} days",'acc2'),('IF EVERY DAY WENT TO PLAN',f"day {_FMT(result.get('naive_finish_day'),0)}",'dim'),('PLAN',f"{_FMT(a.get('hours_per_day'))} h/day · {_FMT(a.get('consistency_percent'),0)}% of days",'dim')]
@@ -120,6 +133,15 @@ def headline(result):
   if result.get('target') is not None:
    chance=result.get('simulated_fraction_reaching_target_percent',0);m.insert(1,('RUNS REACHING TARGET',f'{chance:.0f}%','green' if chance>=70 else 'acc2' if chance>=40 else 'red'))
   return {'title':'SAVINGS PLAN','metrics':m,'verdict':f"After {a.get('months')} months the median run ends near {_FMT(result.get('final_balance_median'),0)} from {_FMT(result.get('total_paid_in'),0)} paid in, under your assumed {a.get('annual_return_percent',0):.1f}% return."}
+ if kind=='backtest':
+  st=result.get('stats',{});tot=st.get('total_r') or 0;wr=st.get('win_rate_percent')
+  m=[('TOTAL',f"{tot:+.1f}R",'green' if tot>0 else 'red'),('WIN RATE','—' if wr is None else f'{wr:.1f}%','acc2'),
+     ('TRADES',f"{st.get('closed_trades',0)}  ({st.get('wins',0)}W / {st.get('losses',0)}L)",'dim'),
+     ('MAX DRAWDOWN',f"{st.get('max_drawdown_r') or 0:.1f}R",'red'),('PROFIT FACTOR',_FMT(st.get('profit_factor'),2),'pri'),
+     ('AVG PER TRADE','—' if st.get('average_r_per_trade') is None else f"{st['average_r_per_trade']:+.3f}R",'dim')]
+  name=str(a.get('strategy') or 'strategy').replace('_',' ');inst=a.get('instrument') or ''
+  return {'title':f"BACKTEST · {name.upper()} · {inst} {a.get('interval') or ''}".strip(),'metrics':m,
+   'verdict':f"{st.get('closed_trades',0)} trades at 1:{a.get('reward_to_risk') or '?'}: {tot:+.1f}R total, {wr if wr is not None else '—'}% wins, worst drawdown {st.get('max_drawdown_r') or 0:.1f}R. Past results, no costs included."}
  if kind=='forex':
   m=[('MEDIAN END RATE',_FMT(result.get('terminal_rate_median'),5),'pri'),('5TH–95TH PERCENTILE',f"{_FMT(result.get('terminal_rate_p05'),5)} – {_FMT(result.get('terminal_rate_p95'),5)}",'acc2'),('RUNS BELOW START',f"{result.get('simulated_fraction_below_unshocked_start_percent',0):.0f}%",'dim'),('P95 MAX DRAWDOWN',f"{result.get('p95_path_max_drawdown_percent',0):.1f}%",'red')]
   return {'title':'FOREX PATHS','metrics':m,'verdict':f"Over {a.get('trading_days')} trading days the median path ends at {_FMT(result.get('terminal_rate_median'),5)}; one run in twenty ends below {_FMT(result.get('terminal_rate_p05'),5)}."}
@@ -147,7 +169,7 @@ def run(kind,parameters):
  result['created']=datetime.now(timezone.utc).isoformat();return result
 
 def save(result):
- if not isinstance(result,dict) or result.get('kind') not in ('forex','trade_stress','outage','goal','savings','comparison'):raise ValueError('Run a scenario first.')
+ if not isinstance(result,dict) or result.get('kind') not in ('forex','trade_stress','outage','goal','savings','backtest','comparison'):raise ValueError('Run a scenario first.')
  REPORTS.mkdir(parents=True,exist_ok=True,mode=0o700);path=REPORTS/('scenario-'+uuid.uuid4().hex[:12]+'.json')
  write_file(path,json.dumps(result,ensure_ascii=False,allow_nan=False,indent=2));return str(path)
 

@@ -20,6 +20,39 @@ CARD_STAGGER = 0.35       # each metric card after the previous
 TYPE_CPS = 70             # verdict characters per second
 
 
+def _num(v, unit=''):
+    """Compact numbers for a small display: 1,234 · 12.3k · 4.5M; R values keep a sign."""
+    a = abs(v)
+    if unit == 'R':
+        return f'{v:+.1f}R'
+    if a >= 1e6:
+        s = f'{v / 1e6:.2f}M'
+    elif a >= 1e4:
+        s = f'{v / 1e3:.1f}k'
+    elif a >= 100:
+        s = f'{v:,.0f}'
+    elif a >= 10:
+        s = f'{v:.1f}'.rstrip('0').rstrip('.')
+    elif a >= 1:
+        s = f'{v:.4f}'.rstrip('0').rstrip('.')               # forex rates need the decimals
+    else:
+        s = f'{v:.4f}'.rstrip('0').rstrip('.') or '0'
+    return s + (' h' if unit == 'hours' else '')
+
+
+def _at(rows, day):
+    """Linear interpolation of a fan row at a fractional day."""
+    if not rows:
+        return None
+    if day <= rows[0]['day']:
+        return rows[0]
+    for a, b in zip(rows, rows[1:]):
+        if a['day'] <= day <= b['day']:
+            k = (day - a['day']) / max(1e-9, b['day'] - a['day'])
+            return {key: a[key] + (b[key] - a[key]) * k for key in ('p05', 'median', 'p95')}
+    return rows[-1]
+
+
 class SimulationHologram(QWidget):
     closed = pyqtSignal()
 
@@ -99,16 +132,24 @@ class SimulationHologram(QWidget):
         p.fillRect(self.rect(), QBrush(glow))
 
         side = w >= 720
-        chart = QRectF(28, 64, (w * .64 if side else w) - 56, (h - 176) if side else h * .52)
+        n = len(self.head['metrics'])
+        cards_h = math.ceil(n / 2) * 62 if not side else 0
+        left = 74                                            # room for the value scale
+        if side:
+            chart = QRectF(left, 64, w * .64 - left - 20, h - 64 - 150)
+        else:
+            chart = QRectF(left, 64, w - left - 24, max(110.0, h - 64 - 110 - cards_h - 40))
+        self._chart = chart
         self._grid(p, chart, t)
         self._header(p, w, t)
         if self.rows:
             self._band(p, chart, t)
         else:
             self._no_chart(p, chart, t)
-        cards = QRectF(w * .66, 64, w * .34 - 24, h - 150) if side else QRectF(28, chart.bottom() + 14, w - 56, h - chart.bottom() - 90)
+        cards = QRectF(w * .66, 64, w * .34 - 24, h - 64 - 110) if side else QRectF(28, chart.bottom() + 40, w - 56, cards_h - 6)
         self._cards(p, cards, t, side)
-        self._verdict(p, QRectF(28, h - 86, w - 56, 60), t)
+        top = h - 92 if side else min(h - 92, cards.bottom() + 16)
+        self._verdict(p, QRectF(28, top, w - 56, h - 26 - top), t, small=not side)
         self._scanlines(p, w, h, t)
 
     def _header(self, p, w, t):
@@ -116,12 +157,18 @@ class SimulationHologram(QWidget):
         p.setFont(QFont('Courier New', 11, QFont.Weight.Bold))
         dots = '.' * (int(t * 3) % 4) if t < BUILD_SECONDS else ''
         state = 'RUNNING' + dots if t < BUILD_SECONDS else 'COMPLETE'
-        p.drawText(QPointF(28, 30), f"SIMULATION // {self.head['title']}")
+        fm = p.fontMetrics()
+        p.drawText(QPointF(28, 30), fm.elidedText(f"SIMULATION // {self.head['title']}", Qt.TextElideMode.ElideRight, w - 28 - 150))
         p.setFont(QFont('Courier New', 9))
         p.setPen(self._c('acc2' if t < BUILD_SECONDS else 'green'))
         a = self.shown.get('assumptions', {}) if hasattr(self, 'shown') else {}
         paths = a.get('paths')
-        p.drawText(QPointF(28, 48), f"{state}   ·   {paths or 1} {'paths' if paths else 'case'}   ·   seed {a.get('seed', '—')}")
+        if self.shown.get('kind') == 'backtest':
+            st = self.shown.get('stats', {})
+            info = f"{st.get('closed_trades', 0)} trades   ·   RR 1:{a.get('reward_to_risk') or '?'}"
+        else:
+            info = f"{paths or 1} {'paths' if paths else 'case'}   ·   seed {a.get('seed', '—')}"
+        p.drawText(QPointF(28, 48), f"{state}   ·   {info}")
         self._close_rect = QRectF(w - 128, 14, 104, 26)
         p.setPen(QPen(self._c('pri', 160), 1))
         p.setBrush(self._c('pri', 18))
@@ -212,7 +259,9 @@ class SimulationHologram(QWidget):
             p.setPen(QPen(self._c('red', 200), 1.2, Qt.PenStyle.DashLine))
             p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
             p.setFont(QFont('Courier New', 8))
-            p.drawText(QPointF(x + 4, r.top() + 12), f'DEADLINE D{int(dl)}')
+            label = f'DEADLINE D{int(dl)}'
+            p.drawText(QRectF(x - 124, r.bottom() - 16, 120, 14) if x > r.right() - 110 else QRectF(x + 4, r.bottom() - 16, 120, 14),
+                       Qt.AlignmentFlag.AlignRight if x > r.right() - 110 else Qt.AlignmentFlag.AlignLeft, label)
 
         if reveal < 1:                                       # the scanning beam
             beam = QLinearGradient(QPointF(edge - 40, 0), QPointF(edge + 4, 0))
@@ -222,15 +271,91 @@ class SimulationHologram(QWidget):
             p.setPen(QPen(self._c('white', 230), 1.5))
             p.drawLine(QPointF(edge, r.top()), QPointF(edge, r.bottom()))
 
-        p.setPen(self._c('dim'))
-        p.setFont(QFont('Courier New', 8))
         unit = self.shown.get('x_unit') or ('trading days' if self.shown.get('kind') == 'forex' else 'steps')
-        p.drawText(QPointF(r.left(), r.bottom() + 16), '0')
-        p.drawText(QRectF(r.right() - 160, r.bottom() + 4, 160, 16), Qt.AlignmentFlag.AlignRight, f'{last} {unit}')
-        p.drawText(QPointF(r.left() + 4, r.top() + 12), f'{hi:,.4g}')
-        p.drawText(QPointF(r.left() + 4, r.bottom() - 4), f'{lo:,.4g}')
-        p.drawText(QRectF(r.left(), r.bottom() + 4, r.width(), 16), Qt.AlignmentFlag.AlignHCenter,
-                   'median  ·  5th–95th percentile band' + ('  ·  dashed = baseline' if self.ghost else ''))
+        yu = self.shown.get('y_unit', '')
+        p.setFont(QFont('Courier New', 8))
+        p.setPen(self._c('text', 200))
+        for i in range(7):                                   # value scale on every horizontal grid line
+            v = hi - (hi - lo) * i / 6
+            p.drawText(QRectF(r.left() - 72, r.top() + r.height() * i / 6 - 8, 66, 16),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, _num(v, yu))
+        for i in range(0, 11, 2):                            # time scale under every other vertical line
+            d = last * i / 10
+            x = r.left() + r.width() * i / 10
+            align = Qt.AlignmentFlag.AlignLeft if i == 0 else Qt.AlignmentFlag.AlignRight if i == 10 else Qt.AlignmentFlag.AlignHCenter
+            box = QRectF(x - (0 if i == 0 else 80 if i == 10 else 40), r.bottom() + 4, 80, 14)
+            p.drawText(box, align, f'{d:,.0f}')
+        p.setPen(self._c('dim'))
+        legend = self.shown.get('band_label') or 'line = median  ·  band = 5th–95th percentile'
+        text = f'{unit.upper()} →    ' + legend + ('  ·  dashed = baseline' if self.ghost else '')
+        p.drawText(QRectF(r.left(), r.bottom() + 18, r.width(), 14), Qt.AlignmentFlag.AlignLeft,
+                   p.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, int(r.width())))
+
+        if reveal < 1:                                       # live numbers riding the beam
+            day = last * reveal
+            row = _at(self.rows, day)
+            if row:
+                self._tag(p, QPointF(edge, Y(row['median'])), f"{unit[:-1] if unit.endswith('s') else unit} {day:,.0f}",
+                          _num(row['median'], yu), r, live=True)
+        else:
+            end = self.rows[-1]                              # final value pinned to the end of the line
+            self._tag(p, QPointF(X(end['day']), Y(end['median'])), 'END', _num(end['median'], yu), r)
+            hover = getattr(self, '_hover', None)
+            if hover is not None and r.contains(hover):
+                day = (hover.x() - r.left()) / r.width() * last
+                row = _at(self.rows, day)
+                if row:
+                    p.setPen(QPen(self._c('white', 120), 1, Qt.PenStyle.DotLine))
+                    p.drawLine(QPointF(hover.x(), r.top()), QPointF(hover.x(), r.bottom()))
+                    lines = [f"{unit[:-1] if unit.endswith('s') else unit} {day:,.0f}", f"median {_num(row['median'], yu)}"]
+                    if abs(row['p95'] - row['p05']) > 1e-9:
+                        lines.insert(1, f"95th   {_num(row['p95'], yu)}")
+                        lines.append(f"5th    {_num(row['p05'], yu)}")
+                    self._readout(p, QPointF(hover.x(), Y(row['median'])), lines, r)
+
+    def _tag(self, p, at, small, big, r, live=False):
+        """A value flag on the line: a dot and a small box with the number."""
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self._c('white'))
+        p.drawEllipse(at, 3.5, 3.5)
+        w = max(70, 9 * max(len(big), len(small)) + 14)
+        x = at.x() + 10 if at.x() + 10 + w < self.width() - 6 else at.x() - 10 - w
+        y = min(max(at.y() - 34, r.top() + 2), r.bottom() - 36)
+        box = QRectF(x, y, w, 32)
+        p.setPen(QPen(self._c('acc2' if live else 'pri', 220), 1))
+        p.setBrush(self._c('bg', 225))
+        p.drawRoundedRect(box, 3, 3)
+        p.setPen(self._c('dim'))
+        p.setFont(QFont('Courier New', 7))
+        p.drawText(QRectF(x + 6, y + 2, w - 8, 12), Qt.AlignmentFlag.AlignLeft, small.upper())
+        p.setPen(self._c('white'))
+        p.setFont(QFont('Courier New', 10, QFont.Weight.Bold))
+        p.drawText(QRectF(x + 6, y + 13, w - 8, 18), Qt.AlignmentFlag.AlignLeft, big)
+
+    def _readout(self, p, at, lines, r):
+        w = 9 * max(len(s) for s in lines) + 16
+        h = 15 * len(lines) + 8
+        x = at.x() + 12 if at.x() + 12 + w < r.right() else at.x() - 12 - w
+        y = min(max(at.y() - h / 2, r.top()), r.bottom() - h)
+        p.setPen(QPen(self._c('pri', 230), 1))
+        p.setBrush(self._c('bg', 235))
+        p.drawRoundedRect(QRectF(x, y, w, h), 4, 4)
+        p.setFont(QFont('Courier New', 9))
+        for i, s in enumerate(lines):
+            p.setPen(self._c('white' if i == 0 else 'text'))
+            p.drawText(QPointF(x + 8, y + 17 + 15 * i), s)
+        p.setBrush(self._c('white'))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(at, 4, 4)
+
+    def mouseMoveEvent(self, e):
+        self._hover = e.position()
+        if self.finished():
+            self.update()
+
+    def leaveEvent(self, e):
+        self._hover = None
+        self.update()
 
     def _no_chart(self, p, r, t):
         """Single-case scenarios have no band: draw a pulsing reticle instead."""
@@ -253,7 +378,7 @@ class SimulationHologram(QWidget):
         cols = 1 if side else 2
         rows = math.ceil(len(metrics) / cols)
         gap = 10
-        ch = min(78, (r.height() - gap * (rows - 1)) / max(1, rows))
+        ch = min(78, max(44.0, (r.height() - gap * (rows - 1)) / max(1, rows)))
         cw = (r.width() - gap * (cols - 1)) / cols
         for i, (label, value, tone) in enumerate(metrics):
             show = (t - BUILD_SECONDS * (.6 if side else .8) - CARD_STAGGER * i) / .35
@@ -275,7 +400,7 @@ class SimulationHologram(QWidget):
             p.drawText(QRectF(x + 12, y + 22, cw - 18, ch - 26), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
                        | Qt.TextFlag.TextWordWrap, value)
 
-    def _verdict(self, p, r, t):
+    def _verdict(self, p, r, t, small=False):
         begin = BUILD_SECONDS + CARD_STAGGER * len(self.head['metrics'])
         n = int(max(0.0, t - begin) * TYPE_CPS)
         text = self.head['verdict'][:n]
@@ -283,7 +408,7 @@ class SimulationHologram(QWidget):
         p.setPen(QPen(self._c('pri', 90), 1))
         p.drawLine(QPointF(r.left(), r.top() - 4), QPointF(r.right(), r.top() - 4))
         p.setPen(self._c('text'))
-        p.setFont(QFont('Courier New', 10))
+        p.setFont(QFont('Courier New', 9 if small else 10))
         p.drawText(r, Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap, text + cursor)
         p.setPen(self._c('dim'))
         p.setFont(QFont('Courier New', 7))
