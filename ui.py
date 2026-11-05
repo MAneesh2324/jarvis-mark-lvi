@@ -4814,8 +4814,15 @@ class MainWindow(QMainWindow):
         self._video_split = bool(audio_source)
         self._set_video_muted(bool(muted))
 
-        url = (QUrl.fromLocalFile(source) if Path(source).exists()
-               else QUrl(source))
+        # A stream URL is not a path: asking the disk about a 1,000-character
+        # googlevideo address raises "File name too long" and the video never opens.
+        if source.startswith(('http://', 'https://')):
+            url = QUrl(source)
+        else:
+            try:
+                url = QUrl.fromLocalFile(source) if Path(source).exists() else QUrl(source)
+            except OSError:
+                url = QUrl(source)
         self._video_player.setSource(url)
         if self._video_split:
             self._video_sound.setSource(QUrl(audio_source))

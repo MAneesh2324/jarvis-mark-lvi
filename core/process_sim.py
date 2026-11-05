@@ -56,11 +56,26 @@ _CMP = {ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b, ast.Gt: lambda
         ast.GtE: lambda a, b: a >= b, ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b}
 
 
+_CONTAINERS = r'(?:params|parameters|param|settings|variables|variable|vars|state|values)'
+
+
+def normalise(text: str) -> str:
+    """Accept the ways a model naturally writes a name and reduce them to the bare name:
+    params['x'], params["x"], params.x, variables.size, state['y'], math.exp(…), np.sqrt(…),
+    and C-style && / || / !."""
+    text = re.sub(_CONTAINERS + r"\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]", r'\1', text, flags=re.I)
+    text = re.sub(r'\b' + _CONTAINERS + r'\.([A-Za-z_][A-Za-z0-9_]*)', r'\1', text, flags=re.I)
+    text = re.sub(r'\b(?:math|np|numpy)\.', '', text)
+    text = text.replace('&&', ' and ').replace('||', ' or ')
+    text = re.sub(r'!(?!=)', ' not ', text)
+    return text
+
+
 class Formula:
     """A whitelisted arithmetic expression, compiled once and evaluated many times."""
 
     def __init__(self, text: str, names: set[str]):
-        text = str(text or '0').strip()
+        text = normalise(str(text or '0').strip())
         if len(text) > 600:
             raise ValueError('A formula is limited to 600 characters.')
         try:
@@ -95,7 +110,8 @@ class Formula:
             for a in node.args:
                 self._check(a, names)
         else:
-            raise ValueError(f'Formulas may only use arithmetic, comparisons and {", ".join(sorted(_FUNCS))}: {self.text}')
+            raise ValueError(f'Formulas may only use bare names (e.g. sunlight_hours, not params.sunlight_hours), arithmetic, '
+                             f'comparisons and {", ".join(sorted(_FUNCS))}: {self.text}')
 
     def __call__(self, env: dict) -> float:
         try:
@@ -158,7 +174,7 @@ def compile_spec(spec: dict) -> dict:
     names = set(params)
     variables = []
     for v in raw:
-        name = str(v.get('name', ''))
+        name = v['name'] = str(v.get('name', '')).strip().lower().replace(' ', '_')
         if not _NAME.match(name) or name in names or name == 't':
             raise ValueError(f'Bad or repeated variable name: {name!r}')
         names.add(name)
@@ -167,8 +183,8 @@ def compile_spec(spec: dict) -> dict:
         variables.append({'name': v['name'], 'unit': str(v.get('unit', ''))[:12], 'kind': kind,
                           'start': _num(v.get('start', 0), v['name'] + ' start'),
                           'f': Formula(v.get(kind, '0'), names),
-                          'min': None if v.get('min') is None else _num(v['min'], 'min'),
-                          'max': None if v.get('max') is None else _num(v['max'], 'max')})
+                          'min': (0.0 if str(v.get('unit', '')).strip() == '%' else None) if v.get('min') is None else _num(v['min'], 'min'),
+                          'max': (100.0 if str(v.get('unit', '')).strip() == '%' else None) if v.get('max') is None else _num(v['max'], 'max')})
     events = [{'label': str(e.get('label', 'event'))[:40], 'f': Formula(e.get('when', '0'), names)}
               for e in (spec.get('events') or [])[:8]]
     stages = []

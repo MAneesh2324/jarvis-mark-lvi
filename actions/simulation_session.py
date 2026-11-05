@@ -48,6 +48,10 @@ def _summary(board, extra=None):
             'verdict': {'success': 'MODEL SUCCESSFUL', 'failed': 'MODEL FAILED'}.get(sess.get('status'), 'no goal set'),
             'this_attempt': {k: last.get(k) for k in ('change', 'value', 'passed')},
             'headline': headline(board)['verdict'], 'current_settings': S.status().get('current_settings')}
+    cur = data['current_settings'] or {}
+    if isinstance(cur.get('variables'), list):               # a process: the settings, not the whole spec
+        data['current_settings'] = cur.get('params', {})
+        data['can_change'] = sorted(cur.get('params', {})) + ['focus', 'duration', 'uncertainty_percent']
     if extra:
         data.update(extra)
     return data
@@ -56,7 +60,13 @@ def _summary(board, extra=None):
 def session(parameters, player=None, **kwargs):
     from core import sim_session as S
     p = dict(parameters or {})
-    action = p.get('action', 'status')
+    action = p.get('action') or ('start' if p.get('parameters_json') else 'change' if p.get('changes_json')
+                                 else 'search' if p.get('param') else 'status')
+    if action == 'start' and not p.get('kind'):
+        try:
+            p['kind'] = 'process' if 'variables' in json.loads(p.get('parameters_json') or '{}') else ''
+        except ValueError:
+            pass
     try:
         def criterion():
             if p.get('goal_metric') is None:

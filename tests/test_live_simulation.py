@@ -156,5 +156,37 @@ class AccountLimits(unittest.TestCase):
         self.assertIn('only go back', s['window_note'])
 
 
+class ModelWrittenFormulas(unittest.TestCase):
+    """The exact shapes JARVIS wrote in the live app, which used to fail five times in a row."""
+
+    def test_params_dot_and_bracket_styles(self):
+        from core.process_sim import Formula, normalise
+        self.assertEqual(normalise("params.sunlight_hours * variables['size_cm']"), 'sunlight_hours * size_cm')
+        f = Formula("0.1 * params.a * params['b'] * (1 - variables.x / 10) + math.exp(0) && 1", {'a', 'b', 'x'})
+        self.assertAlmostEqual(f({'a': 2, 'b': 3, 'x': 5, 't': 0}), 1.0)
+        with self.assertRaisesRegex(ValueError, 'bare names'):
+            Formula('os.system(1)', set())
+
+    def test_call_without_action_or_kind_starts_a_process(self):
+        from actions.simulation_session import session
+        import core.sim_session as S
+        spec = {'title': 'Apple', 'duration': 180, 'params': {'sunlight_hours': 10, 'water_litres': .5},
+                'variables': [{'name': 'size_cm', 'unit': 'cm', 'start': .5,
+                               'rate': '0.1 * params.sunlight_hours * params.water_litres * (1 - variables.size_cm / 10)'},
+                              {'name': 'Ripeness_Percent', 'unit': '%', 'start': 0, 'rate': "0.5 * params['sunlight_hours']"}]}
+        out = session({'parameters_json': json.dumps(spec)}, player=MagicMock())
+        self.assertIn('"attempt": 1', out)
+        self.assertIn('"can_change"', out)
+        b = S.board()
+        self.assertLessEqual(max(b['series']['ripeness_percent']), 100)   # % stays within 0-100
+        S.reset()
+
+
+class VideoStreamUrl(unittest.TestCase):
+    def test_long_stream_url_is_not_treated_as_a_file(self):
+        src = (Path(__file__).parent.parent / 'ui.py').read_text(encoding='utf-8')
+        self.assertIn("if source.startswith(('http://', 'https://')):", src)
+
+
 if __name__ == '__main__':
     unittest.main()
