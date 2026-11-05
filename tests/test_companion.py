@@ -133,7 +133,7 @@ class Face(unittest.TestCase):
         for _ in range(60):
             a.step(0.05, 0.0)
         self.assertLess(a._smile, 0.0)
-        self.assertGreater(a._feel_brow, 0.3)
+        self.assertGreater(a._brow_shape, 0.5)                       # worried brows: inner ends raised
         import ui
         hud = ui.HudCanvas.__new__(ui.HudCanvas)
         hud._avatar = a

@@ -30,7 +30,7 @@ import random
 
 import numpy as np
 from PyQt6.QtCore import QLineF, QPointF, QRectF, Qt
-from PyQt6.QtGui import QBrush, QColor, QPainter, QPen, QPolygonF, QRadialGradient
+from PyQt6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF, QRadialGradient
 
 from core.avatar_mesh import JAW_MAX, JAW_PIVOT, get_head_mesh
 
@@ -150,6 +150,8 @@ class HoloAvatar:
         self.SPAN = mesh["span"][0] - mesh["span"][1]
         lip_x = np.abs(self._v0[self._lips_w > 0.3, 0] - self._lip_c[0]) if np.any(self._lips_w > 0.3) else np.array([0.2])
         self._lip_half = float(max(lip_x.max(), 1e-3))
+        brow_x = np.abs(self._v0[self._brow_w > 0.3, 0]) if np.any(self._brow_w > 0.3) else np.array([0.5])
+        self._brow_half = float(max(brow_x.max(), 1e-3))
 
         self._lut_cache: list = []
         self._lut_key = None
@@ -199,6 +201,8 @@ class HoloAvatar:
         self._smile = 0.0
         self._feel_brow = 0.0
         self._feel_lids = 1.0
+        self._brow_shape = 0.0
+        self._squint = 0.0
         self._feel_pitch = 0.0
         self._feel_yaw = 0.0
 
@@ -215,14 +219,16 @@ class HoloAvatar:
 
     # ── animation ───────────────────────────────────────────────────────────
 
-    # feeling → (smile, brow, lids, pitch, yaw) at full intensity
+    # feeling → (smile, brow lift, brow shape, eye opening, smiling eyes, pitch, yaw) at full intensity.
+    # brow shape: + raises the inner ends (worry, sympathy), - pulls them down into a furrow (resolve).
+    # smiling eyes: the lower lids rise, as in a real (Duchenne) smile.
     FEEL = {
-        'warm':       (0.45, 0.10, 1.00, 0.000, 0.00),
-        'calm':       (0.28, 0.00, 0.90, 0.000, 0.00),
-        'concerned':  (-0.25, 0.55, 0.97, 0.060, 0.09),  # brows up, corners down, head a little down and aside
-        'proud':      (1.00, 0.28, 1.00, -0.050, 0.00),  # broad smile, chin up
-        'determined': (0.10, -0.40, 0.88, 0.015, 0.00),  # brows down, eyes narrowed, steady
-        'playful':    (0.80, 0.42, 1.00, -0.015, -0.08),
+        'warm':       (0.55, 0.10, 0.00, 1.00, 0.25, 0.000, 0.00),
+        'calm':       (0.30, 0.00, 0.00, 0.84, 0.10, 0.000, 0.00),
+        'concerned':  (-0.60, 0.20, 1.00, 1.08, 0.00, 0.060, 0.09),   # inner brows up, corners down, head bowed aside
+        'proud':      (1.00, 0.30, -0.10, 1.00, 0.60, -0.050, 0.00),  # broad smile, smiling eyes, chin up
+        'determined': (0.05, -0.30, -1.00, 0.78, 0.15, 0.015, 0.00),  # furrowed brows, narrowed eyes
+        'playful':    (0.85, 0.45, 0.30, 1.05, 0.45, -0.015, -0.08),
     }
 
     def set_feeling(self, feeling: str, level: float = 0.6) -> None:
@@ -357,11 +363,13 @@ class HoloAvatar:
             self._expr_at = t + 0.8
         self._expr += (self._expr_tgt - self._expr) * 0.075
 
-        smile_t, fbrow, flids, fpitch, fyaw = self.FEEL.get(self.feeling, self.FEEL['warm'])
+        smile_t, fbrow, fshape, flids, fsquint, fpitch, fyaw = self.FEEL.get(self.feeling, self.FEEL['warm'])
         k = self.feeling_level
         ease = _rate(dt, 0.9)                     # about a second to change expression
         self._smile += (smile_t * k * (0.6 if live else 1.0) - self._smile) * ease
         self._feel_brow += (fbrow * k - self._feel_brow) * ease
+        self._brow_shape += (fshape * k - self._brow_shape) * ease
+        self._squint += (fsquint * k - self._squint) * ease
         self._feel_lids += ((1 - (1 - flids) * k) - self._feel_lids) * ease
         self._feel_pitch += (fpitch * k - self._feel_pitch) * ease
         self._feel_yaw += (fyaw * k - self._feel_yaw) * ease
@@ -473,6 +481,10 @@ class HoloAvatar:
             # weights, which average 0.5 — worked out to six pixels on a 250 px
             # head, which is to say invisible.
             v[:, 1] += self._brow_w * (self._brow * _BROW_LIFT)
+        if abs(self._brow_shape) > 0.01:
+            # +1 at the inner ends of the brows, -1 at the outer ends: worry lifts the middle, resolve knits it
+            shape = np.clip(1.0 - 2.0 * np.abs(v[:, 0]) / self._brow_half, -1.0, 1.0)
+            v[:, 1] += self._brow_w * (self._brow_shape * 0.10 * shape)
 
         if abs(self._wide) > 0.01 and self._mouth > 0.0:
             # Spread pulls the corners out and flattens the lips back; rounding
@@ -487,8 +499,8 @@ class HoloAvatar:
             dx = v[:, 0] - self._lip_c[0]
             reach = (dx / self._lip_half) ** 2
             w = self._lips_w * self._smile
-            v[:, 1] += w * reach * 0.075
-            v[:, 0] += w * dx * 0.14
+            v[:, 1] += w * reach * 0.12
+            v[:, 0] += w * dx * (0.16 if self._smile > 0 else 0.04)
 
         if self._mouth > 0.004:
             px, py, pz = JAW_PIVOT
@@ -592,7 +604,7 @@ class HoloAvatar:
         lam = np.clip(fn[:, 0] * -0.55 + fn[:, 1] * 0.50 + nz * 0.52, 0.0, 1.0)
         bright = 0.26 + 0.20 * fres + 0.66 * lam ** 1.05
         bright *= (self._fade[a][vis] + self._fade[b][vis] + self._fade[c][vis]) / 3.0
-        bright *= 0.88 + 0.24 * amp
+        bright *= 0.78 + 0.24 * amp                # a touch darker than the lines, so the features stand out
 
         idx = np.clip((bright * _LUT_N).astype(np.int32), 0, _LUT_N - 1)
 
@@ -626,9 +638,10 @@ class HoloAvatar:
             # The lit surface underneath is opaque, so back-facing edges would
             # float on top of the face — cull them and let the wire read as
             # structure lines over skin.
+            # Quiet on the face itself so the features read clearly, brighter toward the silhouette.
             front = nz > -0.05
-            va = np.where(front, 0.10 + 0.42 * fres, 0.0)
-            va += 0.30 * np.exp(-((verts[:, 1] - self._scan) / 0.13) ** 2) * front
+            va = np.where(front, 0.03 + 0.46 * fres ** 1.4, 0.0)
+            va += 0.22 * np.exp(-((verts[:, 1] - self._scan) / 0.13) ** 2) * front
         else:
             va = np.where(nz < 0.0, 0.13 + 0.26 * fres, 0.28 + 0.72 * fres)
             va += 0.42 * np.exp(-((verts[:, 1] - self._scan) / 0.13) ** 2)
@@ -695,15 +708,18 @@ class HoloAvatar:
             idx = lm[key]
             ex, ey = xs[idx], ys[idx]
             mid_y = float(ey.mean())
-            if vis < 0.999:
-                ey = mid_y + (ey - mid_y) * max(0.04, vis)
+            open_k = max(0.04, vis * self._lids)
+            upper = ey < mid_y                              # screen y grows downwards
+            # the upper lid follows openness; the lower lid rises with a real smile
+            ey = np.where(upper, mid_y + (ey - mid_y) * open_k,
+                          mid_y + (ey - mid_y) * open_k * (1.0 - 0.55 * max(0.0, self._squint)))
             poly = QPolygonF([QPointF(float(a), float(b)) for a, b in zip(ex, ey)])
 
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(_blend(bg, primary, 22)))       # socket shadow
+            p.setBrush(QBrush(_blend(bg, primary, 14)))       # socket shadow
             p.drawPolygon(poly)
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.setPen(QPen(_c(primary, 210 * face), 1.3))      # lid line
+            p.setPen(QPen(_c(primary, 245 * face), 1.9))      # lid line
             p.drawPolygon(poly)
 
             if vis > 0.35:
@@ -711,19 +727,30 @@ class HoloAvatar:
                 gx = br.center().x() + self._gaze[0] * br.width() * 0.16
                 gy = br.center().y() + self._gaze[1] * br.height() * 0.20
                 cpt = QPointF(gx, gy)
-                rad = min(br.height() * 0.62, br.width() * 0.20)
+                rad = br.width() * 0.19                     # a real-sized iris, cut by the lids like a real one
+                p.save()
+                clip = QPainterPath()
+                clip.addPolygon(poly)
+                p.setClipPath(clip)
                 p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(_c(accent, (70 + 60 * amp) * face * vis)))
-                p.drawEllipse(cpt, rad, rad * vis)            # iris
+                p.setBrush(QBrush(_c(accent, (150 + 60 * amp) * face * vis)))
+                p.drawEllipse(cpt, rad, rad)                  # iris
                 p.setBrush(QBrush(_c(accent, 245 * face * vis)))
-                p.drawEllipse(cpt, rad * 0.42, rad * 0.42 * vis)   # pupil
+                p.setBrush(QBrush(_blend(bg, accent, 90)))
+                p.drawEllipse(cpt, rad * 0.45, rad * 0.45)    # pupil
+                p.setBrush(QBrush(_c(accent, 245 * face * vis)))
+                p.drawEllipse(cpt, rad * 0.22, rad * 0.22)    # glowing core
+                p.setBrush(QBrush(QColor(255, 255, 255, int(220 * face * vis))))
+                p.drawEllipse(QPointF(gx - rad * 0.28, gy - rad * 0.30), rad * 0.16, rad * 0.16 * vis)   # catch-light
+                p.restore()
 
         # ── brows ───────────────────────────────────────────────────────────
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(_c(primary, 150 * face), 1.7))
-        for key in ("brow_l", "brow_r"):
-            idx = lm[key]
-            p.drawPolyline(self._ring(xs, ys, idx))
+        glow = QColor(primary)
+        for width, alpha in ((6.0, 45), (3.2, 245)):        # a soft glow under a bold brow line
+            p.setPen(QPen(_c(glow, alpha * face), width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            for key in ("brow_l", "brow_r"):
+                p.drawPolyline(self._ring(xs, ys, lm[key]))
 
         # ── mouth ───────────────────────────────────────────────────────────
         inner = self._ring(xs, ys, lm["lips_in"])
@@ -752,7 +779,9 @@ class HoloAvatar:
             p.drawPolygon(inner)
 
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(_c(primary, (150 + 70 * self._mouth) * face), 1.3))
+        p.setPen(QPen(_c(primary, 50 * face), 5.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolygon(inner)                       # glow along the lip seam: the line that smiles or frowns
+        p.setPen(QPen(_c(primary, 250 * face), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPolygon(inner)                       # lip edge
-        p.setPen(QPen(_c(primary, 110 * face), 1.1))
+        p.setPen(QPen(_c(primary, 170 * face), 1.5))
         p.drawPolygon(self._ring(xs, ys, lm["lips_out"]))
