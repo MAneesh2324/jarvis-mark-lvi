@@ -6,6 +6,7 @@ import concurrent.futures
 import importlib.util
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -149,6 +150,7 @@ def _real_profile_dir(browser: str) -> str:
             "vivaldi":  [lib / "Vivaldi"],
             "opera":    [lib / "com.operasoftware.Opera"],
             "operagx":  [lib / "com.operasoftware.OperaGX"],
+            "ulaa":     [lib / "Zoho" / "Ulaa"],
         }
         candidates = m.get(browser, [])
 
@@ -295,6 +297,7 @@ _BROWSER_SPECS: dict[str, dict] = {
         "operagx":  {"engine": "chromium", "channel": None,      "bins": ["opera"]},
         "brave":    {"engine": "chromium", "channel": None,      "bins": ["brave browser", "brave"]},
         "vivaldi":  {"engine": "chromium", "channel": None,      "bins": ["vivaldi"]},
+        "ulaa":     {"engine": "chromium", "channel": None,      "bins": []},   # Zoho Ulaa, Chromium-based
         "safari":   {"engine": "webkit",   "channel": None,      "bins": []},
     },
     "Linux": {
@@ -320,6 +323,7 @@ _ALIASES: dict[str, str] = {
     "mozilla firefox": "firefox",
     "opera gx":        "operagx",
     "opera_gx":        "operagx",
+    "zoho ulaa":       "ulaa",
 }
 
 
@@ -355,6 +359,7 @@ def _resolve_browser(name: str) -> dict | None:
             "opera":   ["Opera.app", "Opera GX.app"],
             "brave":   ["Brave Browser.app"],
             "vivaldi": ["Vivaldi.app"],
+            "ulaa":    ["Ulaa.app"],
         }
         for app in app_names.get(name, []):
             app_dir = Path("/Applications") / app / "Contents" / "MacOS"
@@ -391,8 +396,13 @@ def _detect_default_browser() -> str:
                  "LSHandlers"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             ).stdout.lower()
+            # The default is the https handler; Ulaa registers as com.primeum.browser.
+            m = re.search(r'lshandlerroleall = "([^"]+)";\s*lshandlerurlscheme = https', out)
+            handler = m.group(1) if m else out
+            if "primeum" in handler or "ulaa" in handler:
+                return "ulaa"
             for kw in ("firefox", "opera", "brave", "vivaldi", "safari", "chrome", "edge"):
-                if kw in out:
+                if kw in handler:
                     return kw
         elif _OS == "Linux":
             out = subprocess.run(
@@ -404,6 +414,12 @@ def _detect_default_browser() -> str:
                     return kw
     except Exception:
         pass
+    if _OS == "Darwin":
+        # Fall back to a Chromium browser that is actually installed: automation needs one.
+        for name, app in (("chrome", "Google Chrome.app"), ("ulaa", "Ulaa.app"), ("brave", "Brave Browser.app"),
+                          ("edge", "Microsoft Edge.app"), ("vivaldi", "Vivaldi.app")):
+            if (Path("/Applications") / app).exists():
+                return name
     return "chrome"
 
 
@@ -422,6 +438,7 @@ _MAC_APP_NAMES: dict[str, str] = {
     "operagx": "Opera GX",
     "brave":   "Brave Browser",
     "vivaldi": "Vivaldi",
+    "ulaa":    "Ulaa",
     "safari":  "Safari",
 }
 
