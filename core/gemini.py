@@ -275,6 +275,17 @@ def is_unavailable_error(err: str) -> bool:
             or "unavailable" in low or "deadline_exceeded" in low)
 
 
+_LIVE_RUNG_MS = 15_000
+
+
+def _is_timeout(e: BaseException) -> bool:
+    """A deadline that expired. Its message is often empty, so the text checks above cannot see it."""
+    import asyncio
+    import concurrent.futures
+    return isinstance(e, (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError)) or \
+        'timeout' in type(e).__name__.lower()
+
+
 def is_gone_error(err: str) -> bool:
     """The model is not there, or not ours to use — a different thing from busy."""
     low = err.lower()
@@ -709,7 +720,9 @@ def call(contents, tier: str = FAST, config=None,
     for model in tried:
         try:
             if model == LIVE:
-                reply = _live_call(contents, config, timeout_ms, resolved_key)
+                # The Live rung is for quick turns. A long caller deadline (45-90 s) must not become
+                # the wait in front of the REST models when Live is busy with the conversation.
+                reply = _live_call(contents, config, min(timeout_ms, _LIVE_RUNG_MS), resolved_key)
                 if reply is not None:
                     return reply
                 raise RuntimeError("the Live turn came back empty")
@@ -732,7 +745,7 @@ def call(contents, tier: str = FAST, config=None,
             elif is_gone_error(msg):
                 _cool(model, _GONE_SECONDS)
                 print(f"[Gemini] {model}: unavailable to this key — set aside")
-            elif is_unavailable_error(msg):
+            elif is_unavailable_error(msg) or _is_timeout(e):
                 _cool(model, _UNAVAILABLE_SECONDS)
                 print(f"[Gemini] {model}: not answering — resting it for "
                       f"{_UNAVAILABLE_SECONDS // 60} minutes")
@@ -763,7 +776,7 @@ def as_json(contents, tier: str = FAST, config=None,
     elif "[" in raw and "]" in raw:
         raw = raw[raw.find("["): raw.rfind("]") + 1]
     try:
-        return json.loads(raw)
+        return json.loads(raw, strict=False)    # tolerate raw line breaks inside strings, a common model slip
     except Exception as e:
         print(f"[Gemini] reply was not JSON: {e}")
         return default

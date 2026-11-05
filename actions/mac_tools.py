@@ -137,7 +137,10 @@ TOOLS = [
                      'for single steps the user dictates. It stops and asks before buying, paying, sending, posting, '
                      'deleting, signing up or accepting terms, and never types passwords or card details. start: goal. '
                      'status: progress or the question it is waiting on. reply: answer its question (approve=true to let '
-                     'a paused action go ahead, or text). stop: cancel. Tell the user it is working; it announces itself.'),
+                     'a paused action go ahead, or text), OR while it runs, pass text to change the plan ("laptops instead '
+                     'of PCs") — never start a second task for a correction. start while a task runs replaces it. stop: '
+                     'cancel. Tell the user it is working; its steps show in the activity log and it announces the result. '
+                     'Do not also drive the browser with browser_control or screenshots while it runs.'),
      'brief': 'Autonomous multi-step browser tasks with approval for risky steps.',
      'parameters': {'type': 'OBJECT', 'properties': {
          'action': {'type': 'STRING', 'enum': ['start', 'status', 'reply', 'stop']},
