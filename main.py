@@ -634,6 +634,12 @@ class JarvisLive:
             self._wellbeing = _wb.instance()
         except Exception as exc:
             print(f"[Wellbeing] disabled: {exc}"); self._wellbeing = None
+        try:                                     # JARVIS's feelings show on its face
+            from core import companion as _co
+            if hasattr(self.ui, 'set_feeling'):
+                _co.instance().listeners.append(self.ui.set_feeling)
+        except Exception as exc:
+            print(f"[Companion] disabled: {exc}")
         try:
             from core import owner_guard as _og
             self._voice_guard = _og.voice() if (_og.MODELS / 'speaker.onnx').exists() else None
@@ -1329,6 +1335,17 @@ class JarvisLive:
                     notes.append(note)
             except Exception as exc:
                 print(f"[Wellbeing] {exc}")
+        try:                                     # JARVIS's own feelings, and remembering what matters to the user
+            from core import companion as _co
+            heart = _co.instance()
+            if getattr(self, '_followups_offered', False):
+                self._followups_offered = False
+                heart.mark_asked()
+            note = heart.on_user_turn(text, getattr(self._wellbeing, 'mood', None) if self._wellbeing else None)
+            if note:
+                notes.insert(0, note)
+        except Exception as exc:
+            print(f"[Companion] {exc}")
         if self._voice_guard is not None:
             try:
                 verdict = await asyncio.to_thread(self._voice_guard.end_turn)
@@ -1370,6 +1387,14 @@ class JarvisLive:
             self.ui.write_log(f"SYS: {text}")
         except Exception:
             pass
+        if not urgent and kind != 'companion':
+            try:                                 # a focus session holds everything that can wait
+                from core import companion as _co
+                if _co.instance().focus_active():
+                    self._held_for_focus = (getattr(self, '_held_for_focus', []) + [text])[-8:]
+                    return
+            except Exception:
+                pass
         if speak and self._loop and self.session:
             if self._conversation_busy or self._is_speaking:
                 self._pending_spoken.append(text)
@@ -1449,6 +1474,14 @@ class JarvisLive:
                     msg = self._wellbeing.care_check()
                     if msg:
                         notify.send('wellbeing', msg, speak=True)
+                from core import companion as _co
+                done = _co.instance().tick()                 # ends a focus session that ran out; refreshes the face
+                if done:
+                    held = getattr(self, '_held_for_focus', [])
+                    self._held_for_focus = []
+                    if held:
+                        done += f' While you focused, {len(held)} update(s) came in: ' + ' | '.join(held)
+                    notify.send('companion', done, speak=True)
                 if self._pending_spoken and not self._conversation_busy and not self._is_speaking:
                     self.speak("[Notification for the user — say it briefly in your own words, then stop] "
                                + ' '.join(self._pending_spoken))
@@ -1586,6 +1619,14 @@ class JarvisLive:
         parts = [time_ctx, identity_ctx]
         if mem_str:
             parts.append(mem_str)
+        try:                                     # the user's goals, wins and what to ask them about
+            from core import companion as _co
+            heart_ctx = _co.instance().context_block()
+            if heart_ctx:
+                parts.append(heart_ctx)
+                self._followups_offered = bool(_co.instance().due_followups())
+        except Exception as exc:
+            print(f"[Companion] context skipped: {exc}")
         parts.append(sys_prompt)
         from core.response_speed import instruction as speed_instruction
         quick_delivery=speed_instruction()

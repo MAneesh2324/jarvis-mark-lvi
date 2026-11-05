@@ -546,6 +546,64 @@ class HudCanvas(QWidget):
         except Exception:
             pass
 
+    def set_feeling(self, feeling: str, level: float = 0.5, focus: dict | None = None) -> None:
+        """JARVIS's feeling (core/companion.py) and any focus session. Plain attribute stores: safe from any thread."""
+        try:
+            from core.companion import FEELINGS
+            info = FEELINGS.get(feeling) or FEELINGS['warm']
+            self._feel = (feeling, float(level), info['label'])
+            self._feel_color = info['color']
+            if focus and focus.get('active'):
+                self._focus = (str(focus.get('task', ''))[:40], time.monotonic() + float(focus.get('seconds_left', 0)),
+                               max(60.0, float(focus.get('minutes', 25)) * 60))
+            else:
+                self._focus = None
+            if self._avatar is not None:
+                self._avatar.set_feeling(feeling, level)
+        except Exception as exc:
+            print(f'[HUD] feeling: {exc}')
+
+    def _paint_heart(self, p, cx, head_cy, r, status_y):
+        """A small chip under the face saying how JARVIS feels, and a ring counting down a focus session."""
+        feel = getattr(self, '_feel', None)
+        focus = getattr(self, '_focus', None)
+        if not feel and not focus:
+            return
+        p.save()
+        col = QColor(getattr(self, '_feel_color', None) or C.PRI)
+        f = QFont('Courier New', 8)
+        f.setBold(True)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
+        p.setFont(f)
+        y = status_y - 30
+        if focus:
+            task, ends, total = focus
+            left = max(0.0, ends - time.monotonic())
+            ring = QRectF(cx - r * 1.12, head_cy - r * 1.12, r * 2.24, r * 2.24)
+            p.setPen(QPen(QColor(0, 255, 156, 40), 3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(ring)
+            p.setPen(QPen(QColor('#00ff9c'), 3, cap=Qt.PenCapStyle.RoundCap))
+            p.drawArc(ring, 90 * 16, int(-360 * 16 * (left / total)))
+            text = f'FOCUS · {task.upper()} · {int(left // 60):02d}:{int(left % 60):02d}'
+            p.setPen(QColor('#00ff9c'))
+            p.drawText(QRectF(cx - 200, y - 18, 400, 16), Qt.AlignmentFlag.AlignCenter, text)
+        if feel:
+            name, level, label = feel
+            pulse = 0.5 + 0.5 * math.sin(time.monotonic() * (1.2 + level))
+            w = 22 + len(label) * 8.5
+            chip = QRectF(cx - w / 2, y, w, 18)
+            fill = QColor(col)
+            fill.setAlpha(int(28 + 30 * level))
+            p.setBrush(fill)
+            edge = QColor(col)
+            edge.setAlpha(int(120 + 100 * pulse * level))
+            p.setPen(QPen(edge, 1))
+            p.drawRoundedRect(chip, 9, 9)
+            p.setPen(col)
+            p.drawText(chip, Qt.AlignmentFlag.AlignCenter, '♥ ' + label)
+        p.restore()
+
     def set_audio_level(self, level: float) -> None:
         """Thread-safe entry point for the audio threads. Stores the louder of
         the incoming level and the current value so brief gaps between chunks
@@ -897,8 +955,10 @@ class HudCanvas(QWidget):
                 elif self.state == "LISTENING":
                     _acc = qcol(C.GREEN)
                 else:
-                    _acc = qcol(C.PRI)
+                    _feel_col = getattr(self, '_feel_color', None)
+                    _acc = QColor(_feel_col) if _feel_col else qcol(C.PRI)   # at rest, the face takes on its feeling
             self._avatar.paint(p, cx, _head_cy, _r_head*self.gesture_zoom, _main, _acc, qcol(C.BG))
+            self._paint_heart(p, cx, _head_cy, _r_head, _sy_status)
 
         # reactor core — the other centrepiece, and the fallback if the head
         # could not be built. There is no third path: the old face.png branch
@@ -7475,6 +7535,13 @@ class JarvisUI:
     @wake_get_state.setter
     def wake_get_state(self, cb):
         self._win.wake_get_state = cb
+
+    def set_feeling(self, feeling: str, level: float = 0.5, focus: dict | None = None) -> None:
+        """Thread-safe: JARVIS's current feeling and focus session, shown on its face."""
+        try:
+            self._win.hud.set_feeling(feeling, level, focus)
+        except Exception:
+            pass
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe: feed a 0.0–1.0 live audio level to the HUD waveform.

@@ -148,6 +148,8 @@ class HoloAvatar:
         # Crown (+1.0) down to the bottom of the neck, in head-half-heights.
         # Callers size the head to the room they have with this.
         self.SPAN = mesh["span"][0] - mesh["span"][1]
+        lip_x = np.abs(self._v0[self._lips_w > 0.3, 0] - self._lip_c[0]) if np.any(self._lips_w > 0.3) else np.array([0.2])
+        self._lip_half = float(max(lip_x.max(), 1e-3))
 
         self._lut_cache: list = []
         self._lut_key = None
@@ -191,6 +193,14 @@ class HoloAvatar:
         self._lids = 1.0           # 1 = wide, 0 = shut; low while asleep
         self._brow_bias = 0.0      # concentration pulls the brows down
         self._glance = None        # (dx, dy, until_t) — a deliberate look
+        # Feelings (core/companion.py): a resting smile, the brows, the lids and a slight head
+        # tilt, each eased so the face changes the way a person's does — never a snap.
+        self.feeling, self.feeling_level = 'warm', 0.4
+        self._smile = 0.0
+        self._feel_brow = 0.0
+        self._feel_lids = 1.0
+        self._feel_pitch = 0.0
+        self._feel_yaw = 0.0
 
         # ── viseme ──────────────────────────────────────────────────────────
         # Loudness alone only answers "how far open", which is why an RMS-driven
@@ -204,6 +214,20 @@ class HoloAvatar:
         self._v_peak = 0.18        # running estimate of this voice's loud level
 
     # ── animation ───────────────────────────────────────────────────────────
+
+    # feeling → (smile, brow, lids, pitch, yaw) at full intensity
+    FEEL = {
+        'warm':       (0.45, 0.10, 1.00, 0.000, 0.00),
+        'calm':       (0.28, 0.00, 0.90, 0.000, 0.00),
+        'concerned':  (-0.25, 0.55, 0.97, 0.060, 0.09),  # brows up, corners down, head a little down and aside
+        'proud':      (1.00, 0.28, 1.00, -0.050, 0.00),  # broad smile, chin up
+        'determined': (0.10, -0.40, 0.88, 0.015, 0.00),  # brows down, eyes narrowed, steady
+        'playful':    (0.80, 0.42, 1.00, -0.015, -0.08),
+    }
+
+    def set_feeling(self, feeling: str, level: float = 0.6) -> None:
+        if feeling in self.FEEL:
+            self.feeling, self.feeling_level = feeling, max(0.0, min(1.0, float(level)))
 
     def _mouth_step(self, dt: float, amp: float, live: bool,
                     v_open: float | None, v_level: float | None) -> None:
@@ -333,7 +357,18 @@ class HoloAvatar:
             self._expr_at = t + 0.8
         self._expr += (self._expr_tgt - self._expr) * 0.075
 
-        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias
+        smile_t, fbrow, flids, fpitch, fyaw = self.FEEL.get(self.feeling, self.FEEL['warm'])
+        k = self.feeling_level
+        ease = _rate(dt, 0.9)                     # about a second to change expression
+        self._smile += (smile_t * k * (0.6 if live else 1.0) - self._smile) * ease
+        self._feel_brow += (fbrow * k - self._feel_brow) * ease
+        self._feel_lids += ((1 - (1 - flids) * k) - self._feel_lids) * ease
+        self._feel_pitch += (fpitch * k - self._feel_pitch) * ease
+        self._feel_yaw += (fyaw * k - self._feel_yaw) * ease
+        self._pitch += self._feel_pitch
+        self._yaw += self._feel_yaw
+
+        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias + self._feel_brow
         self._brow += (max(-0.4, min(1.2, brow_t)) - self._brow) * 0.20
 
         # ── what the state does to the face ─────────────────────────────────
@@ -361,7 +396,7 @@ class HoloAvatar:
 
         for i in (0, 1):
             self._gaze_bias[i] += (self._bias_tgt[i] - self._gaze_bias[i]) * 0.06
-        self._lids += (lid_tgt - self._lids) * 0.08
+        self._lids += (lid_tgt * self._feel_lids - self._lids) * 0.08
         self._brow_bias += (brow_bias - self._brow_bias) * 0.06
 
         # Gaze: saccades are near-instant jumps between fixations, and they get
@@ -446,6 +481,14 @@ class HoloAvatar:
             v[:, 0] += k * (v[:, 0] - self._lip_c[0]) * 0.55
             v[:, 1] += k * (v[:, 1] - self._lip_c[1]) * 0.30
             v[:, 2] -= k * 0.055
+
+        if abs(self._smile) > 0.01:
+            # A resting smile: the lip corners rise and spread a little; the middle stays put.
+            dx = v[:, 0] - self._lip_c[0]
+            reach = (dx / self._lip_half) ** 2
+            w = self._lips_w * self._smile
+            v[:, 1] += w * reach * 0.075
+            v[:, 0] += w * dx * 0.14
 
         if self._mouth > 0.004:
             px, py, pz = JAW_PIVOT
