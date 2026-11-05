@@ -90,7 +90,61 @@ class SimulationHologram(QWidget):
         self.ghost = list((base or {}).get('fan_chart') or [])
         self.started = time.monotonic() - (0 if animate else 600)
         self._timer.start(33 if animate else 120)
+        self._attach_3d()
         self.update()
+
+    # ── the 3D viewport (process models) ─────────────────────────────────────
+    @staticmethod
+    def make_3d(parent):
+        """The real three.js viewport, or None where it cannot run (no web engine, headless tests)."""
+        import os
+        if os.environ.get('QT_QPA_PLATFORM') == 'offscreen' or os.environ.get('JARVIS_NO_3D'):
+            return None
+        try:
+            from core.sim3d_view import Sim3DView
+            return Sim3DView(parent) if Sim3DView.available() else None
+        except Exception as exc:                             # missing QtWebEngine: the board still works in 2D
+            print(f'[Sim3D] 3D view unavailable: {exc}')
+            return None
+
+    def _attach_3d(self):
+        wants = self.shown.get('kind') == 'process' and bool(self.shown.get('series'))
+        view = getattr(self, '_view3d', None)
+        if wants and view is None and not getattr(self, '_3d_failed', False):
+            view = self._view3d = self.make_3d(self)
+            self._3d_failed = view is None
+        self._3d_on = bool(wants and view is not None)
+        if view is not None:
+            if self._3d_on:
+                session = self.result.get('session') or {}
+                view.show_model(self.shown, session.get('status'))
+                view.show()
+            else:
+                view.hide()
+
+    def _sync_3d(self, p, chart, t):
+        """Keep the 3D scene on the chart's time, and mark the chart where the 3D scene is."""
+        view = getattr(self, '_view3d', None)
+        if not getattr(self, '_3d_on', False) or view is None or not self.rows:
+            return
+        X, _Y, _lo, _hi, last = self._scale(chart)
+        reveal = 1 - (1 - min(1.0, t / BUILD_SECONDS)) ** 3
+        hover = getattr(self, '_hover', None)
+        if reveal < 1:
+            view.set_time(last * reveal)                     # the scene grows with the scanning beam
+        elif hover is not None and chart.contains(hover):
+            view.set_time((hover.x() - chart.left()) / chart.width() * last)
+        else:
+            view.set_time(None)                              # then plays the run as a time-lapse loop
+            now = view.current_time
+            if isinstance(now, (int, float)) and 0 <= now <= last:
+                x = X(now)
+                p.setPen(QPen(self._c('acc2', 170), 1.2))
+                p.drawLine(QPointF(x, chart.top()), QPointF(x, chart.bottom()))
+                p.setFont(QFont('Courier New', 7, QFont.Weight.Bold))
+                p.setPen(self._c('acc2'))
+                p.drawText(QRectF(x + 3, chart.top() + 2, 40, 10), Qt.AlignmentFlag.AlignLeft, '3D')
+        view.set_status((self.result.get('session') or {}).get('status'))
 
     def elapsed(self) -> float:
         return time.monotonic() - self.started
@@ -110,6 +164,12 @@ class SimulationHologram(QWidget):
     def hideEvent(self, e):
         self._timer.stop()
         super().hideEvent(e)
+
+    def showEvent(self, e):
+        # Adding the native 3D viewport makes Qt hide and re-show this widget once; keep animating.
+        super().showEvent(e)
+        if self.result:
+            self._timer.start(33 if not self.finished() else 50)
 
     # ── painting ────────────────────────────────────────────────────────────
     def _c(self, key, alpha=255):
@@ -141,7 +201,20 @@ class SimulationHologram(QWidget):
         n = len(metrics)
         cards_h = math.ceil(n / 2) * 62 if not side else 0
         left = 74                                            # room for the value scale
-        if side:
+        hero = None
+        if getattr(self, '_3d_on', False):                   # the 3D scene is the main picture, the chart below it
+            if side:
+                avail = h - 64 - 150
+                hero = QRectF(28, 64, w * .64 - 48, avail * .62)
+                chart = QRectF(left, hero.bottom() + 12, w * .64 - left - 20, avail - hero.height() - 12)
+            else:
+                hero = QRectF(28, 64, w - 56, max(150.0, h * .36))
+                chart = QRectF(left, hero.bottom() + 12, w - left - 24,
+                               max(90.0, h - hero.bottom() - 12 - 110 - cards_h - 40))
+            geo = hero.toRect()
+            if self._view3d.geometry() != geo:
+                self._view3d.setGeometry(geo)
+        elif side:
             chart = QRectF(left, 64, w * .64 - left - 20, h - 64 - 150)
         else:
             chart = QRectF(left, 64, w - left - 24, max(110.0, h - 64 - 110 - cards_h - 40))
@@ -169,8 +242,14 @@ class SimulationHologram(QWidget):
         if session:
             self._session(p, eq if self.rows else chart, t, session, side)
         scene = self.shown.get('scene')
-        if scene and self.rows:
-            self._scene(p, eq, t, scene)
+        if scene and self.rows and not getattr(self, '_3d_on', False):
+            self._scene(p, eq, t, scene)                     # the flat picture, when 3D is not available
+        if self.rows:
+            self._sync_3d(p, eq, t)
+        if hero is not None:                                 # a thin frame around the 3D viewport
+            p.setPen(QPen(self._c('pri', 120), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(hero.adjusted(-1, -1, 1, 1))
         if self._deferred:                                   # hover readouts sit on top of everything
             self._readout(p, *self._deferred)
         self._scanlines(p, w, h, t)
@@ -457,6 +536,9 @@ class SimulationHologram(QWidget):
         p.setBrush(self._c('bg', 170))
         p.drawRoundedRect(box, 6, 6)
         kind = str(scene.get('type', 'grow'))
+        if kind == 'columns':
+            return                                           # columns only exist in 3D; the chart says it all in 2D
+        kind = 'grow' if kind == 'tree' else kind
         cx, cy = box.center().x(), box.center().y() + 6
         mix = frac(scene.get('color'), float(scene.get('color_max', 100) or 100))
         a, b = QColor(str(scene.get('from', '#7cc242'))), QColor(str(scene.get('to', '#d62828')))

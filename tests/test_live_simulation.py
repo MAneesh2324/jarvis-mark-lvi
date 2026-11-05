@@ -207,5 +207,64 @@ class MoreFormulaFunctions(unittest.TestCase):
             Formula('gamma(x)', {'x'})
 
 
+class Board3D(unittest.TestCase):
+    """The 3D viewport on the board: layout, time sync and the bundled scene page."""
+
+    class FakeView:
+        def __init__(self, parent):
+            from PyQt6.QtWidgets import QWidget
+            self.w = QWidget(parent)
+            self.models, self.times, self.statuses, self.current_time = [], [], [], 42.0
+        def show_model(self, result, status=None): self.models.append((result.get('scene'), status))
+        def set_time(self, t): self.times.append(t)
+        def set_status(self, s): self.statuses.append(s)
+        def show(self): self.w.show()
+        def hide(self): self.w.hide()
+        def geometry(self): return self.w.geometry()
+        def setGeometry(self, g): self.w.setGeometry(g)
+
+    def test_process_results_get_a_3d_hero_synced_to_the_chart(self):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance() or QApplication([])
+        import core.sim_session as S
+        from core.simulation_view import SimulationHologram
+        made = []
+        with patch.object(SimulationHologram, 'make_3d', staticmethod(lambda parent: made.append(Board3D.FakeView(parent)) or made[-1])):
+            w = SimulationHologram()
+            w.resize(1100, 700)
+            S.start('process', APPLE, {'metric': 'ripe', 'op': '<=', 'value': 145})
+            w.set_result(S.board())
+            w.started -= 1.0
+            w.grab()
+            view = made[0]
+            self.assertTrue(w._3d_on)
+            self.assertEqual(view.models[-1][0]['type'], 'grow')
+            self.assertGreater(view.w.geometry().height(), 200)                 # the 3D scene is the main picture
+            self.assertGreater(w._chart.top(), view.w.geometry().bottom())      # the chart sits under it
+            self.assertIsNotNone(view.times[-1])                               # during the build it follows the beam
+            w.started -= 30
+            w.grab()
+            self.assertIsNone(view.times[-1])                                  # afterwards it plays the time-lapse
+            self.assertEqual(view.statuses[-1], 'success')
+            w.set_result(__import__('core.scenario_simulator', fromlist=['run']).run('goal', {'total_hours': 30, 'hours_per_day': 2}))
+            self.assertFalse(w._3d_on)                                         # other kinds keep the classic board
+            self.assertFalse(view.w.isVisible())
+            S.reset()
+        app.processEvents()
+
+    def test_scene_page_is_bundled_and_local(self):
+        root = Path(__file__).parent.parent / 'web' / 'sim3d'
+        page = (root / 'index.html').read_text()
+        bundle = (root / 'vendor' / 'sim3d.bundle.js').read_text()
+        self.assertIn('vendor/sim3d.bundle.js', page)
+        self.assertNotIn('http', page)                                         # nothing loads from the network
+        for name in ('Sim3D', 'setTime', 'buildTree', 'currentTime'):
+            self.assertIn(name, (root / 'src' / 'main.js').read_text())
+        self.assertIn('Sim3D', bundle)
+        from core.sim3d_view import Sim3DView
+        self.assertTrue(Sim3DView.available())
+
+
 if __name__ == '__main__':
     unittest.main()
