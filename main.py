@@ -638,6 +638,7 @@ class JarvisLive:
             from core import companion as _co
             if hasattr(self.ui, 'set_feeling'):
                 _co.instance().listeners.append(self.ui.set_feeling)
+                _co.instance()._tell()           # show the resting feeling from the start
         except Exception as exc:
             print(f"[Companion] disabled: {exc}")
         try:
