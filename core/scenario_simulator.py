@@ -101,11 +101,14 @@ def savings(monthly_contribution,months,start_balance=0,annual_return_percent=0,
 
 def from_backtest(stats):
  """A trading_lab backtest as a board result: the equity line in R, shaded down to its running peak (drawdown)."""
- curve=stats.get('equity_curve_r') or [[0,0.0]];peak=float('-inf');rows=[]
+ money=stats.get('money') or None
+ curve=(money or {}).get('curve') or stats.get('equity_curve_r') or [[0,0.0]];peak=float('-inf');rows=[]
  for n,eq in curve:
   peak=max(peak,eq);rows.append({'day':int(n),'p05':float(eq),'median':float(eq),'p95':float(peak)})
- return {'kind':'backtest','x_unit':'trades','y_unit':'R','target':None,'fan_chart':rows,'band_label':'line = equity in R  ·  shaded = drawdown from peak',
-  'assumptions':{'strategy':stats.get('strategy'),'instrument':stats.get('instrument'),'interval':stats.get('interval'),'reward_to_risk':(stats.get('settings') or {}).get('reward_to_risk'),'period':stats.get('period')},
+ trades=[{k:t.get(k) for k in ('n','direction','entry_time','exit_time','entry','stop','exit','r','pnl','balance','result')} for t in (stats.get('trades') or [])][-300:]
+ return {'kind':'backtest','x_unit':'trades','y_unit':'money' if money else 'R','target':None,'fan_chart':rows,'trades':trades,'money':money and {k:v for k,v in money.items() if k!='curve'},
+  'band_label':('line = balance' if money else 'line = equity in R')+'  ·  shaded = drawdown  ·  bars = each trade (green win, red loss)',
+  'assumptions':{'strategy':stats.get('strategy'),'instrument':str(stats.get('requested') or stats.get('instrument') or '').upper(),'interval':stats.get('interval'),'reward_to_risk':(stats.get('settings') or {}).get('reward_to_risk'),'period':stats.get('period')},
   'stats':{k:stats.get(k) for k in ('closed_trades','wins','losses','win_rate_percent','total_r','average_r_per_trade','profit_factor','max_drawdown_r','longest_losing_streak')},
   'limits':stats.get('assumptions','Past results do not predict future ones.'),'created':datetime.now(timezone.utc).isoformat()}
 
@@ -134,14 +137,20 @@ def headline(result):
    chance=result.get('simulated_fraction_reaching_target_percent',0);m.insert(1,('RUNS REACHING TARGET',f'{chance:.0f}%','green' if chance>=70 else 'acc2' if chance>=40 else 'red'))
   return {'title':'SAVINGS PLAN','metrics':m,'verdict':f"After {a.get('months')} months the median run ends near {_FMT(result.get('final_balance_median'),0)} from {_FMT(result.get('total_paid_in'),0)} paid in, under your assumed {a.get('annual_return_percent',0):.1f}% return."}
  if kind=='backtest':
-  st=result.get('stats',{});tot=st.get('total_r') or 0;wr=st.get('win_rate_percent')
-  m=[('TOTAL',f"{tot:+.1f}R",'green' if tot>0 else 'red'),('WIN RATE','—' if wr is None else f'{wr:.1f}%','acc2'),
-     ('TRADES',f"{st.get('closed_trades',0)}  ({st.get('wins',0)}W / {st.get('losses',0)}L)",'dim'),
-     ('MAX DRAWDOWN',f"{st.get('max_drawdown_r') or 0:.1f}R",'red'),('PROFIT FACTOR',_FMT(st.get('profit_factor'),2),'pri'),
-     ('AVG PER TRADE','—' if st.get('average_r_per_trade') is None else f"{st['average_r_per_trade']:+.3f}R",'dim')]
+  st=result.get('stats',{});tot=st.get('total_r') or 0;wr=st.get('win_rate_percent');mo=result.get('money')
+  m=[('WINS / LOSSES',f"{st.get('wins',0)} W  /  {st.get('losses',0)} L",'green' if st.get('wins',0)>=st.get('losses',0) else 'red'),
+     ('WIN RATE','—' if wr is None else f'{wr:.1f}%','acc2'),('TOTAL R',f"{tot:+.2f}R",'green' if tot>0 else 'red')]
+  if mo:
+   net=mo.get('net_pnl',0)
+   m=[('NET P&L',f"{net:+,.2f}  ({mo.get('return_percent',0):+.2f}%)",'green' if net>0 else 'red')]+m+[
+      ('BALANCE',f"{mo.get('start_balance',0):,.0f} → {mo.get('end_balance',0):,.2f}",'pri'),
+      ('BEST / WORST',f"{mo.get('largest_win',0):+,.2f} / {mo.get('largest_loss',0):+,.2f}",'dim'),
+      ('MAX DRAWDOWN',f"{mo.get('max_drawdown',0):,.2f}  ({st.get('max_drawdown_r') or 0:.1f}R)",'red')]
+  else:
+   m+=[('MAX DRAWDOWN',f"{st.get('max_drawdown_r') or 0:.1f}R",'red'),('PROFIT FACTOR',_FMT(st.get('profit_factor'),2),'pri')]
   name=str(a.get('strategy') or 'strategy').replace('_',' ');inst=a.get('instrument') or ''
   return {'title':f"BACKTEST · {name.upper()} · {inst} {a.get('interval') or ''}".strip(),'metrics':m,
-   'verdict':f"{st.get('closed_trades',0)} trades at 1:{a.get('reward_to_risk') or '?'}: {tot:+.1f}R total, {wr if wr is not None else '—'}% wins, worst drawdown {st.get('max_drawdown_r') or 0:.1f}R. Past results, no costs included."}
+   'verdict':f"{st.get('closed_trades',0)} trades at 1:{a.get('reward_to_risk') or '?'} from {(a.get('period') or ['?'])[0][:10]} to {(a.get('period') or ['?','?'])[-1][:10]}: {st.get('wins',0)} wins, {st.get('losses',0)} losses, {tot:+.2f}R"+(f", net {mo['net_pnl']:+,.2f}" if mo else '')+". Past results; hover a bar for that trade."}
  if kind=='forex':
   m=[('MEDIAN END RATE',_FMT(result.get('terminal_rate_median'),5),'pri'),('5TH–95TH PERCENTILE',f"{_FMT(result.get('terminal_rate_p05'),5)} – {_FMT(result.get('terminal_rate_p95'),5)}",'acc2'),('RUNS BELOW START',f"{result.get('simulated_fraction_below_unshocked_start_percent',0):.0f}%",'dim'),('P95 MAX DRAWDOWN',f"{result.get('p95_path_max_drawdown_percent',0):.1f}%",'red')]
   return {'title':'FOREX PATHS','metrics':m,'verdict':f"Over {a.get('trading_days')} trading days the median path ends at {_FMT(result.get('terminal_rate_median'),5)}; one run in twenty ends below {_FMT(result.get('terminal_rate_p05'),5)}."}

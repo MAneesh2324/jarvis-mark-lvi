@@ -283,7 +283,7 @@ class BacktestBoard(unittest.TestCase):
         self.assertEqual(board['fan_chart'][3]['p95'], 2.0)          # running peak shades the drawdown
         h = headline(board)
         self.assertIn('XAUUSD', h['title'])
-        self.assertEqual(h['metrics'][0][1], '+2.0R')
+        self.assertEqual(dict((k, v) for k, v, _ in h['metrics'])['TOTAL R'], '+2.00R')
 
     def test_trading_tool_shows_backtest_on_board(self):
         import actions.trading_lab as act
@@ -308,6 +308,67 @@ class BacktestBoard(unittest.TestCase):
         self.assertEqual(_num(1.10234), '1.1023')
         row = _at([{'day': 0, 'p05': 0, 'median': 0, 'p95': 0}, {'day': 10, 'p05': 10, 'median': 20, 'p95': 30}], 5)
         self.assertEqual(row['median'], 10)
+
+
+class SweepMssBreaker(unittest.TestCase):
+    """The user's setup on a hand-built chart: sweep at candle 32, MSS close at 35, breaker retest at 47."""
+
+    def setUp(self):
+        self.candles = json.loads((Path(__file__).parent / 'fixtures' / 'sweep_mss_breaker_short.json').read_text())
+
+    def test_detects_sweep_shift_and_retest(self):
+        import core.trading_lab as t
+        s = t.Series(self.candles, 3)
+        sig = t._sweep_mss_breaker(s, t.swings(s), {})
+        self.assertEqual(len(sig), 1)
+        e = sig[0]
+        self.assertEqual((e['direction'], e['i'], e['setup']['sweep_i'], e['setup']['mss_i']), ('short', 47, 32, 35))
+        self.assertAlmostEqual(e['entry'], 99.4)
+        self.assertGreater(e['stop'], 106.5)                        # stop above the sweep high
+        self.assertLess(t._sweep_mss_breaker(s, t.swings(s), {'stop_at': 'breaker'})[0]['stop'], 101)
+
+    def test_money_costs_and_trade_list(self):
+        import core.trading_lab as t
+        r = t.backtest({'candles': self.candles, 'symbol': 'T'}, 'sweep_mss_breaker', rr=2,
+                       account_balance=10000, risk_percent=1, spread=.3, commission=2)
+        tr = r['trades'][0]
+        risk = tr['stop'] - tr['entry']
+        self.assertAlmostEqual(tr['target'], tr['entry'] - 2 * risk, places=3)
+        self.assertAlmostEqual(tr['r'], 2 - .3 / risk, places=2)     # the spread costs R
+        self.assertAlmostEqual(tr['pnl'], tr['r'] * 100 - 2, places=1)
+        self.assertEqual(tr['result'], 'win')
+        self.assertEqual(r['money']['end_balance'], tr['balance'])
+        self.assertEqual(r['money']['largest_loss'], 0)
+        none = t.backtest({'candles': self.candles, 'symbol': 'T'}, 'sweep_mss_breaker', rr=2,
+                          from_time=self.candles[48]['t'])          # window starts after the entry
+        self.assertEqual(none['closed_trades'], 0)
+
+    def test_invalidated_when_sweep_high_is_taken_first(self):
+        import core.trading_lab as t
+        c = [dict(x) for x in self.candles]
+        c[40]['h'] = 107.0                                          # price runs above the sweep high before the retest
+        s = t.Series(c, 3)
+        self.assertEqual(t._sweep_mss_breaker(s, t.swings(s), {}), [])
+
+    def test_tool_lists_every_trade_and_uses_the_window(self):
+        import actions.trading_lab as act
+        import core.scenario_simulator as sim
+        ui = MagicMock()
+        data = {'candles': self.candles, 'symbol': 'GC=F', 'requested': 'XAUUSD', 'interval': '15m'}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(sim, 'LAST', Path(tmp) / 'l.json'), \
+                patch.object(sim, 'REPORTS', Path(tmp)), patch('core.trading_lab.load', return_value=data) as load, \
+                patch('time.time', return_value=self.candles[-1]['t'] + 60):
+            out = act.trading_lab({'action': 'backtest', 'symbol': 'XAUUSD', 'interval': '15m', 'past_days': 7,
+                                   'strategy': 'sweep_mss_breaker', 'account_balance': 10000, 'risk_percent': 1}, player=ui)
+        self.assertEqual(load.call_args[0][0]['range'], '1mo')       # enough history for a 7-day window
+        title, table = ui.show_content.call_args[0]
+        self.assertIn('XAUUSD', title)
+        self.assertIn('WIN', table)
+        self.assertIn('+200.00   10,200.00', table)          # no spread passed: exactly 2R of 100
+        board = ui.show_simulation.call_args[0][0]
+        self.assertEqual(board['trades'][0]['result'], 'win')
+        self.assertEqual(board['y_unit'], 'money')
+        self.assertIn('"wins": 1', out)
 
 
 if __name__ == '__main__':

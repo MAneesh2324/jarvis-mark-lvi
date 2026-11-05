@@ -132,7 +132,11 @@ class SimulationHologram(QWidget):
         p.fillRect(self.rect(), QBrush(glow))
 
         side = w >= 720
-        n = len(self.head['metrics'])
+        metrics = self.head['metrics']
+        if not side and len(metrics) > 4 and h < 820:
+            metrics = metrics[:4]                            # small panel: the four that matter most
+        self._metrics = metrics
+        n = len(metrics)
         cards_h = math.ceil(n / 2) * 62 if not side else 0
         left = 74                                            # room for the value scale
         if side:
@@ -140,10 +144,19 @@ class SimulationHologram(QWidget):
         else:
             chart = QRectF(left, 64, w - left - 24, max(110.0, h - 64 - 110 - cards_h - 40))
         self._chart = chart
-        self._grid(p, chart, t)
+        trades = self.shown.get('trades') if hasattr(self, 'shown') else None
+        if trades:
+            eq = QRectF(chart.left(), chart.top(), chart.width(), chart.height() * .66)
+            strip = QRectF(chart.left(), eq.bottom() + 36, chart.width(), max(24.0, chart.bottom() - eq.bottom() - 36))
+            self._eq = eq
+        else:
+            eq, strip = chart, None
+        self._grid(p, eq, t)
         self._header(p, w, t)
         if self.rows:
-            self._band(p, chart, t)
+            self._band(p, eq, t)
+            if strip is not None:
+                self._trade_bars(p, strip, eq, t, trades)
         else:
             self._no_chart(p, chart, t)
         cards = QRectF(w * .66, 64, w * .34 - 24, h - 64 - 110) if side else QRectF(28, chart.bottom() + 40, w - 56, cards_h - 6)
@@ -308,10 +321,48 @@ class SimulationHologram(QWidget):
                     p.setPen(QPen(self._c('white', 120), 1, Qt.PenStyle.DotLine))
                     p.drawLine(QPointF(hover.x(), r.top()), QPointF(hover.x(), r.bottom()))
                     lines = [f"{unit[:-1] if unit.endswith('s') else unit} {day:,.0f}", f"median {_num(row['median'], yu)}"]
-                    if abs(row['p95'] - row['p05']) > 1e-9:
+                    if self.shown.get('kind') == 'backtest':
+                        lines = [f"after trade {day:,.0f}", f"{'balance' if yu == 'money' else 'equity'}  {_num(row['median'], yu)}",
+                                 f"peak     {_num(row['p95'], yu)}", f"drawdown {_num(row['p95'] - row['median'], yu)}"]
+                    elif abs(row['p95'] - row['p05']) > 1e-9:
                         lines.insert(1, f"95th   {_num(row['p95'], yu)}")
                         lines.append(f"5th    {_num(row['p05'], yu)}")
                     self._readout(p, QPointF(hover.x(), Y(row['median'])), lines, r)
+
+    def _trade_bars(self, p, r, eq, t, trades):
+        """One bar per closed trade under the equity line: green up for a win, red down for a loss."""
+        X, _Y, _lo, _hi, last = self._scale(eq)
+        reveal = 1 - (1 - min(1.0, t / BUILD_SECONDS)) ** 3
+        edge = eq.left() + eq.width() * reveal
+        mid = r.center().y()
+        top = max((abs(x.get('r') or 0) for x in trades), default=1) or 1
+        bw = max(1.5, min(14.0, eq.width() / max(1, last) * .7))
+        p.setPen(QPen(self._c('pri', 70), 1))
+        p.drawLine(QPointF(r.left(), mid), QPointF(r.right(), mid))
+        p.setFont(QFont('Courier New', 7))
+        p.setPen(self._c('dim'))
+        p.drawText(QRectF(r.left() - 72, r.top() - 2, 66, 12), Qt.AlignmentFlag.AlignRight, 'WIN')
+        p.drawText(QRectF(r.left() - 72, r.bottom() - 10, 66, 12), Qt.AlignmentFlag.AlignRight, 'LOSS')
+        p.setPen(Qt.PenStyle.NoPen)
+        for tr in trades:
+            x = X(tr['n'])
+            if x > edge + 1:
+                break
+            k = (tr.get('r') or 0) / top
+            hgt = abs(k) * (r.height() / 2 - 2)
+            win = tr.get('result') == 'win'
+            p.setBrush(self._c('green' if win else 'red', 220))
+            p.drawRect(QRectF(x - bw / 2, mid - hgt if win else mid, bw, max(1.0, hgt)))
+        hover = getattr(self, '_hover', None)
+        if hover is not None and r.contains(hover) and self.finished():
+            n = round((hover.x() - eq.left()) / eq.width() * last)
+            tr = next((x for x in trades if x['n'] == n), None)
+            if tr:
+                lines = [f"#{tr['n']}  {'WIN' if tr.get('result') == 'win' else 'LOSS'}  {tr.get('direction', '')}",
+                         f"{(tr.get('entry_time') or '')[:16]}",
+                         f"entry {tr.get('entry')}  exit {tr.get('exit')}",
+                         f"R {tr.get('r', 0):+.2f}" + (f"   P&L {tr['pnl']:+,.2f}" if tr.get('pnl') is not None else '')]
+                self._readout(p, QPointF(X(n), mid), lines, QRectF(eq.left(), eq.top(), eq.width(), r.bottom() - eq.top()))
 
     def _tag(self, p, at, small, big, r, live=False):
         """A value flag on the line: a dot and a small box with the number."""
@@ -319,7 +370,7 @@ class SimulationHologram(QWidget):
         p.setBrush(self._c('white'))
         p.drawEllipse(at, 3.5, 3.5)
         w = max(70, 9 * max(len(big), len(small)) + 14)
-        x = at.x() + 10 if at.x() + 10 + w < self.width() - 6 else at.x() - 10 - w
+        x = at.x() + 10 if at.x() + 10 + w < min(self.width() - 6, r.right() + 24) else at.x() - 10 - w
         y = min(max(at.y() - 34, r.top() + 2), r.bottom() - 36)
         box = QRectF(x, y, w, 32)
         p.setPen(QPen(self._c('acc2' if live else 'pri', 220), 1))
@@ -336,6 +387,7 @@ class SimulationHologram(QWidget):
         w = 9 * max(len(s) for s in lines) + 16
         h = 15 * len(lines) + 8
         x = at.x() + 12 if at.x() + 12 + w < r.right() else at.x() - 12 - w
+        x = min(max(4.0, x), self.width() - w - 4)
         y = min(max(at.y() - h / 2, r.top()), r.bottom() - h)
         p.setPen(QPen(self._c('pri', 230), 1))
         p.setBrush(self._c('bg', 235))
@@ -372,7 +424,7 @@ class SimulationHologram(QWidget):
         p.drawLine(QPointF(cx, cy - rad), QPointF(cx, cy + rad))
 
     def _cards(self, p, r, t, side):
-        metrics = self.head['metrics']
+        metrics = getattr(self, '_metrics', self.head['metrics'])
         if not metrics:
             return
         cols = 1 if side else 2
@@ -401,7 +453,7 @@ class SimulationHologram(QWidget):
                        | Qt.TextFlag.TextWordWrap, value)
 
     def _verdict(self, p, r, t, small=False):
-        begin = BUILD_SECONDS + CARD_STAGGER * len(self.head['metrics'])
+        begin = BUILD_SECONDS + CARD_STAGGER * len(getattr(self, '_metrics', self.head['metrics']))
         n = int(max(0.0, t - begin) * TYPE_CPS)
         text = self.head['verdict'][:n]
         cursor = '▌' if n < len(self.head['verdict']) or int(t * 2) % 2 else ''
@@ -413,7 +465,8 @@ class SimulationHologram(QWidget):
         p.setPen(self._c('dim'))
         p.setFont(QFont('Courier New', 7))
         p.drawText(QRectF(r.left(), r.bottom(), r.width(), 14), Qt.AlignmentFlag.AlignRight,
-                   'HYPOTHETICAL MODEL ON YOUR ASSUMPTIONS · NOT A FORECAST')
+                   'PAST DATA · NO GUARANTEE OF FUTURE RESULTS' if self.shown.get('kind') == 'backtest'
+                   else 'HYPOTHETICAL MODEL ON YOUR ASSUMPTIONS · NOT A FORECAST')
 
     def _scanlines(self, p, w, h, t):
         y = (t * 90) % (h + 60) - 30

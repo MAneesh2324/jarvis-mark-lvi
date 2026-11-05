@@ -895,7 +895,7 @@ def scan(pairs=None, interval='1h', bias='both', top=8) -> dict:
 
 # ── backtesting ─────────────────────────────────────────────────────────────
 
-STRATEGIES = ('ema_cross', 'rsi_reversion', 'breakout', 'breaker_retest')
+STRATEGIES = ('ema_cross', 'rsi_reversion', 'breakout', 'breaker_retest', 'sweep_mss_breaker')
 
 
 def _signals(candles, strategy, p):
@@ -963,9 +963,83 @@ def _signals(candles, strategy, p):
                 stop = br['low'] - buffer
                 if entry > stop:
                     out.append({'i': x, 'direction': 'long', 'entry': entry, 'stop': stop, 'limit': entry != c[x]['o']})
+    elif strategy == 'sweep_mss_breaker':
+        out += _sweep_mss_breaker(s, swings(s), p)
     else:
         raise ValueError('Strategy must be one of ' + ', '.join(STRATEGIES) + '.')
     return sorted(out, key=lambda e: e['i'])
+
+
+def _sweep_mss_breaker(s: Series, sw, p):
+    """Liquidity sweep → market structure shift → breaker retest (the user's setup).
+
+    Bearish (mirror for bullish):
+      1. sweep   a candle wicks above a confirmed swing high and closes back below it
+      2. MSS     within sweep_window candles, a candle CLOSES below the swing low that started the
+                 leg up into the sweep, before price trades above the sweep high again
+      3. breaker the bullish order block at that low (last down-close candle at/just before it)
+                 has now failed: it is the bearish breaker zone
+      4. entry   sell limit at the zone's low edge on the first return into it, within
+                 retest_window candles of the shift; cancelled if price first goes above the sweep high
+      5. stop    above the sweep high (stop_at=sweep, default) or above the zone (stop_at=breaker)
+    Only information available at each candle is used: swings count once confirmed.
+    """
+    c, n = s.c, s.n
+    sweep_window = int(p.get('sweep_window', 30))
+    retest_window = int(p.get('retest_window', 40))
+    stop_at = str(p.get('stop_at', 'sweep')).lower()
+    if stop_at not in ('sweep', 'breaker'):
+        raise ValueError('stop_at must be sweep or breaker.')
+    out, used = [], set()
+    for ev in sweeps(s, sw):
+        x = ev['i']
+        bearish = ev['direction'] == 'bearish'
+        extreme = c[x]['h'] if bearish else c[x]['l']
+        want = 'low' if bearish else 'high'
+        base = max((q for q in sw if q['kind'] == want and q['confirmed'] <= x and q['i'] < x),
+                   key=lambda q: q['i'], default=None)
+        if base is None:
+            continue
+        # a shift needs price to have held the base from the base to the sweep; already broken is not a shift
+        held = all((c[k]['c'] > base['price']) if bearish else (c[k]['c'] < base['price']) for k in range(base['i'] + 1, x + 1))
+        if not held:
+            continue
+        mss = None
+        for j in range(x + 1, min(n, x + 1 + sweep_window)):
+            if (c[j]['h'] > extreme) if bearish else (c[j]['l'] < extreme):
+                break                                        # the sweep extreme was taken: no shift
+            if (c[j]['c'] < base['price']) if bearish else (c[j]['c'] > base['price']):
+                mss = j
+                break
+        if mss is None:
+            continue
+        b = base['i']                                        # order block: last opposite candle at the base
+        ob = next((k for k in range(b, max(b - 6, -1), -1)
+                   if (c[k]['c'] < c[k]['o'] if bearish else c[k]['c'] > c[k]['o'])), b)
+        if ob in used:
+            continue
+        lo, hi = c[ob]['l'], c[ob]['h']
+        buffer = 0.1 * s.a(mss)
+        for y in range(mss + 1, min(n, mss + 1 + retest_window)):
+            bar = c[y]
+            if (bar['h'] > extreme) if bearish else (bar['l'] < extreme):
+                break                                        # invalidated before a retest
+            if (bar['h'] >= lo) if bearish else (bar['l'] <= hi):
+                if bearish:
+                    entry = lo if bar['o'] < lo else bar['o']
+                    stop = (extreme if stop_at == 'sweep' else hi) + buffer
+                    ok = entry < stop
+                else:
+                    entry = hi if bar['o'] > hi else bar['o']
+                    stop = (extreme if stop_at == 'sweep' else lo) - buffer
+                    ok = entry > stop
+                if ok:
+                    used.add(ob)
+                    out.append({'i': y, 'direction': 'short' if bearish else 'long', 'entry': entry, 'stop': stop,
+                                'limit': entry != bar['o'], 'setup': {'sweep_i': x, 'swept_level': ev['level'],
+                                'mss_i': mss, 'zone': [lo, hi]}})
+                break
+    return out
 
 
 def _curve(rs, limit=300):
@@ -980,9 +1054,22 @@ def _curve(rs, limit=300):
     return pts
 
 
-def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **params) -> dict:
+def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, from_time=None, account_balance=None,
+             risk_percent=1.0, risk_amount=None, spread=0.0, commission=0.0, compound=False, **params) -> dict:
+    """Trades on the candles. Structure uses all the data; only entries at or after from_time are traded.
+
+    Money: each trade risks risk_amount, or risk_percent of the balance (of the start balance unless
+    compound). spread (price units) is paid once per trade and lowers its R; commission is money per trade.
+    """
     candles = data['candles']
     rr = float(rr)
+    spread, commission = max(0.0, float(spread or 0)), max(0.0, float(commission or 0))
+    balance0 = float(account_balance) if account_balance not in (None, '', 0) else None
+    if balance0 is not None and balance0 <= 0:
+        raise ValueError('Account balance must be above zero.')
+    risk_percent = float(risk_percent or 1.0)
+    if not 0 < risk_percent <= 100:
+        raise ValueError('Risk per trade must be between 0 and 100 percent.')
     if not 0.2 <= rr <= 20:
         raise ValueError('Reward-to-risk must be between 0.2 and 20.')
     if side not in ('both', 'long', 'short', 'buy', 'sell'):
@@ -993,6 +1080,8 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
     trades, busy_until = [], -1
     for e in _signals(candles, strategy, params):
         if e['i'] <= busy_until or (side != 'both' and e['direction'] != side):
+            continue
+        if from_time and c[e['i']]['t'] < from_time:
             continue
         long = e['direction'] == 'long'
         risk = abs(e['entry'] - e['stop'])
@@ -1019,6 +1108,21 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
         trades.append({**e, 'target': target, 'exit_i': exit_i, 'exit': exit_px, 'r': round(result, 3), 'open': False})
         busy_until = exit_i
     closed = [t for t in trades if not t['open']]
+    dec = _decimals(c[-1]['c'])
+    balance, money_curve, peak_m, dd_m = balance0, [[0, balance0]] if balance0 else [], balance0 or 0.0, 0.0
+    for t in closed:                                         # costs and money, trade by trade
+        cost_r = spread / abs(t['entry'] - t['stop']) if spread else 0.0
+        t['gross_r'] = t['r']
+        t['r'] = round(t['r'] - cost_r, 3)
+        if balance0 is not None:
+            risk_money = float(risk_amount) if risk_amount else (balance if compound else balance0) * risk_percent / 100
+            t['risk'] = round(risk_money, 2)
+            t['pnl'] = round(t['r'] * risk_money - commission, 2)
+            balance += t['pnl']
+            t['balance'] = round(balance, 2)
+            peak_m = max(peak_m, balance)
+            dd_m = max(dd_m, peak_m - balance)
+            money_curve.append([len(money_curve), round(balance, 2)])
     rs = [t['r'] for t in closed]
     wins = [r for r in rs if r > 0]
     losses = [r for r in rs if r <= 0]
@@ -1026,11 +1130,15 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
     for r in rs:
         equity += r; peak = max(peak, equity); dd = max(dd, peak - equity)
         streak = streak + 1 if r <= 0 else 0; worst = max(worst, streak)
-    dec = _decimals(c[-1]['c'])
     when = lambda i: _when(c, i)
+    window = [when(next((i for i in range(n) if c[i]['t'] >= from_time), n - 1)) if from_time else when(0), when(n - 1)]
     stats = {'strategy': strategy, 'instrument': data.get('symbol'), 'interval': data.get('interval'),
-             'source': data.get('source'), 'period': [when(0), when(n - 1)], 'candles': n,
+             'source': data.get('source'), 'period': window, 'candles': n,
+             'proxy_note': data.get('proxy_note') or None, 'requested': data.get('requested'),
              'settings': {'side': side, 'reward_to_risk': rr, 'max_hold_candles': max_hold or None,
+                          'spread': spread or None, 'commission': commission or None,
+                          'account_balance': balance0, 'risk_per_trade': (f'{risk_amount} per trade' if risk_amount else
+                                                                          f'{risk_percent}%' + (' compounding' if compound else '')) if balance0 else None,
                           **{k: v for k, v in params.items() if v is not None}},
              'closed_trades': len(rs), 'wins': len(wins), 'losses': len(losses),
              'win_rate_percent': round(100 * len(wins) / len(rs), 1) if rs else None,
@@ -1038,6 +1146,19 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
              'profit_factor': round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) else None,
              'max_drawdown_r': round(dd, 2), 'longest_losing_streak': worst,
              'equity_curve_r': _curve(rs),
+             'money': ({'start_balance': balance0, 'end_balance': round(balance, 2),
+                        'net_pnl': round(balance - balance0, 2), 'return_percent': round(100 * (balance - balance0) / balance0, 2),
+                        'gross_profit': round(sum(t['pnl'] for t in closed if t['pnl'] > 0), 2),
+                        'gross_loss': round(sum(t['pnl'] for t in closed if t['pnl'] <= 0), 2),
+                        'largest_win': max((t['pnl'] for t in closed if t['pnl'] > 0), default=0),
+                        'largest_loss': min((t['pnl'] for t in closed if t['pnl'] <= 0), default=0),
+                        'max_drawdown': round(dd_m, 2), 'curve': money_curve[:301]} if balance0 is not None else None),
+             'trades': [{'n': k, 'direction': t['direction'], 'entry_time': when(t['i']), 'exit_time': when(t['exit_i']),
+                         'entry': round(t['entry'], dec), 'stop': round(t['stop'], dec), 'target': round(t['target'], dec),
+                         'exit': round(t['exit'], dec), 'r': t['r'],
+                         'result': 'win' if t['r'] > 0 else 'loss',
+                         **({'pnl': t['pnl'], 'balance': t['balance']} if 'pnl' in t else {})}
+                        for k, t in enumerate(closed, 1)],
              'longs': sum(1 for t in closed if t['direction'] == 'long'),
              'shorts': sum(1 for t in closed if t['direction'] == 'short'),
              'open_trade': next(({'direction': t['direction'], 'entry': round(t['entry'], dec), 'stop': round(t['stop'], dec),
@@ -1046,7 +1167,8 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
                               'stop': round(t['stop'], dec), 'exit_time': when(t['exit_i']), 'r': t['r']} for t in closed[-8:]],
              'reliability': ('Too few trades to judge; aim for 30+ before trusting the numbers.' if len(rs) < 30 else
                              'Enough trades for a first read; still check other symbols and periods.'),
-             'assumptions': 'Results in R (1R = amount risked). No spread, commission, slippage or swap. '
+             'assumptions': 'Results in R (1R = amount risked)' + (f', after a spread of {spread}' if spread else ', no spread')
+                            + (f' and {commission} commission per trade' if commission else '') + '. No slippage or swap. '
                             'If stop and target fall in the same candle the stop is counted. Past results do not predict future ones.'}
     return stats
 

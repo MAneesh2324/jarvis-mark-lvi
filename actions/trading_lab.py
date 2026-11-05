@@ -18,6 +18,33 @@ def _show_backtest(data, player):
     return False
 
 
+def _trade_table(data, player):
+    """Every trade, as a table in the content panel below the board."""
+    trades = data.get('trades') or []
+    if player is None or not hasattr(player, 'show_content'):
+        return
+    money = data.get('money')
+    head = f"{'#':>3}  {'RESULT':6} {'SIDE':5} {'ENTRY TIME (UTC)':16}  {'ENTRY':>10} {'STOP':>10} {'EXIT':>10} {'R':>7}"
+    head += f" {'P&L':>10} {'BALANCE':>11}" if money else ''
+    lines = [head, '─' * len(head)]
+    for t in trades:
+        row = (f"{t['n']:>3}  {('✔ WIN' if t['result'] == 'win' else '✘ LOSS'):6} {t['direction'][:5]:5} "
+               f"{(t['entry_time'] or '')[:16]:16}  {t['entry']:>10} {t['stop']:>10} {t['exit']:>10} {t['r']:>+7.2f}")
+        if money:
+            row += f" {t['pnl']:>+10,.2f} {t['balance']:>11,.2f}"
+        lines.append(row)
+    if not trades:
+        lines.append('No closed trades in this period.')
+    lines.append('─' * len(head))
+    lines.append(f"{data.get('wins', 0)} wins · {data.get('losses', 0)} losses · {data.get('total_r', 0):+.2f}R"
+                 + (f" · net {money['net_pnl']:+,.2f} ({money['return_percent']:+.2f}%)" if money else ''))
+    title = f"TRADES · {str(data.get('strategy', '')).replace('_', ' ')} · {str(data.get('requested') or data.get('instrument') or '').upper()}"
+    try:
+        player.show_content(title, '\n'.join(lines))
+    except Exception as exc:
+        print(f'[TradingLab] trade table failed: {exc}')
+
+
 def trading_lab(parameters, player=None, **kwargs):
     p = dict(parameters or {})
     action = p.get('action', 'analyse')
@@ -52,12 +79,31 @@ def trading_lab(parameters, player=None, **kwargs):
             from core import setup_tracker
             data = setup_tracker.unwatch(p['symbol'], p.get('interval'))
         elif action == 'backtest':
+            import time as _time
+            hours = float(p.get('past_days') or 0) * 24 or float(p.get('past_hours') or 0)
+            from_time = int(_time.time() - hours * 3600) if hours else None
+            if hours and not p.get('range') and not p.get('csv_path'):
+                # enough history for the window plus room for swings to form before it
+                need = hours / 24 + 3
+                p['range'] = next(r for r, d in (('5d', 5), ('1mo', 30), ('3mo', 90), ('6mo', 180), ('1y', 365),
+                                                 ('2y', 730), ('5y', 1825), ('max', 1e9)) if d >= need)
+                if p.get('interval', '1h') in ('1m',) and need > 7:
+                    raise ValueError('1-minute data only goes back about 7 days; use 5m or higher for longer tests.')
             data = lab.backtest(lab.load(p), p.get('strategy', 'breaker_retest'), side=p.get('side', 'both'),
-                                rr=p.get('rr', 2.0), max_hold=p.get('max_hold', 0),
+                                rr=p.get('rr', 2.0), max_hold=p.get('max_hold', 0), from_time=from_time,
+                                **{k: p[k] for k in ('account_balance', 'risk_percent', 'risk_amount', 'spread',
+                                                     'commission', 'compound') if p.get(k) is not None},
                                 **{k: p[k] for k in ('fast', 'slow', 'length', 'atr_stop', 'oversold', 'overbought',
-                                                     'swing_length') if p.get(k) is not None})
+                                                     'swing_length', 'stop_at', 'sweep_window', 'retest_window')
+                                   if p.get(k) is not None})
             data['shown_on_hologram'] = _show_backtest(data, player)
+            _trade_table(data, player)
             data.pop('equity_curve_r', None)          # the board has it; keep the spoken payload small
+            if data.get('money'):
+                data['money'].pop('curve', None)
+            trades = data.pop('trades', [])
+            data['trades_shown'] = 'every trade is listed in the panel under the board'
+            data['last_trades'] = trades[-10:]
         elif action == 'compare':
             data = {'instrument': p.get('symbol') or p.get('csv_path'), 'results': []}
             candles = lab.load(p)
@@ -98,7 +144,14 @@ TOOL = {
         'breaker blocks with retest status, fair value gaps, liquidity sweeps and equal highs/lows, key support/resistance '
         'zones, candlestick patterns, double tops/bottoms, head and shoulders, triangles and RSI divergence, and rank '
         'setups by confluence with entry/stop/target ideas. bias=sell or buy filters setups. '
-        'backtest: test ema_cross, rsi_reversion, breakout or breaker_retest on the same data, results in R. '
+        'backtest: test ema_cross, rsi_reversion, breakout, breaker_retest (any failed order block) or '
+        'sweep_mss_breaker (THE USER\'S OWN SETUP: liquidity sweep of a high/low → market structure shift → breaker '
+        'retest entry; stop_at sweep (default) or breaker; sweep_window, retest_window candles). Use sweep_mss_breaker '
+        'whenever the user says "my setup", "my strategy", sweep/MSS/breaker. past_hours or past_days limits the test '
+        'to that recent window (the right history range is fetched). For P&L in money pass account_balance and '
+        'risk_percent (or risk_amount); spread (price units, e.g. 0.3 on gold) and commission per trade make it '
+        'realistic. Results are drawn on the holographic board and every win/loss trade is listed under it; say '
+        'wins, losses, win rate, R and net P&L. '
         'compare: all built-in strategies side by side. '
         'playbook: definitions and rules for trading concepts and strategies (query any term; empty lists topics). '
         'save_strategy/delete_strategy: store or remove the user\'s own strategy rules when they dictate them. '
@@ -132,6 +185,16 @@ TOOL = {
             'strategy': {'type': 'STRING', 'description': 'ema_cross, rsi_reversion, breakout, breaker_retest, or a playbook topic'},
             'side': {'type': 'STRING', 'enum': ['both', 'long', 'short']},
             'rr': {'type': 'NUMBER', 'description': 'Reward to risk (default 2)'},
+            'past_days': {'type': 'NUMBER', 'description': 'Backtest only the last N days'},
+            'account_balance': {'type': 'NUMBER', 'description': 'Starting balance for P&L in money'},
+            'risk_percent': {'type': 'NUMBER', 'description': 'Risk per trade, % of balance (default 1)'},
+            'risk_amount': {'type': 'NUMBER', 'description': 'Fixed money risked per trade (instead of %)'},
+            'spread': {'type': 'NUMBER', 'description': 'Spread in price units paid per trade (gold ≈ 0.2–0.4)'},
+            'commission': {'type': 'NUMBER', 'description': 'Commission per trade in money'},
+            'compound': {'type': 'BOOLEAN', 'description': 'Risk % of the current balance instead of the start'},
+            'stop_at': {'type': 'STRING', 'enum': ['sweep', 'breaker'], 'description': 'sweep_mss_breaker stop placement'},
+            'sweep_window': {'type': 'INTEGER', 'description': 'Max candles from sweep to structure shift (default 30)'},
+            'retest_window': {'type': 'INTEGER', 'description': 'Max candles from shift to breaker retest (default 40)'},
             'atr_stop': {'type': 'NUMBER'},
             'fast': {'type': 'INTEGER'},
             'slow': {'type': 'INTEGER'},

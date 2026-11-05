@@ -7541,7 +7541,7 @@ class JarvisUI:
 
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
-        self._win._content_sig.emit(title[:48], text[:4000])
+        self._win._content_sig.emit(title[:48], text[:24000])   # room for a full backtest trade list
 
     def show_quiz(self, topic: str, questions, grade=None) -> None:
         """Thread-safe: put an interactive quiz on the board.
