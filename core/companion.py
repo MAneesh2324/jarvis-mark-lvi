@@ -83,6 +83,23 @@ EVENT_REV = re.compile(r"\b(?:my|the|an?)\s+(?P<what>(?:job )?interview|exam|tes
                        r"[^.?!]{0,30}?\b(?:is )?(?P<when>day after tomorrow|tomorrow|today|tonight|next week|"
                        r"(?:on |this |next )?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b", re.I)
 
+# little face reactions to what the user says (played on JARVIS's face, see core/avatar.py CLIPS)
+REACT = [
+    (re.compile(r"\b(ha(ha)+|he(he)+|lol|lmao|rofl)\b|😂|🤣", re.I), 'laugh'),
+    (re.compile(r"^\s*(hi|hello|hey|good (morning|afternoon|evening))\b", re.I), 'brow_flash'),
+    (re.compile(r"\b(thank you|thanks|you'?re (the )?best|good job|well done)\b", re.I), 'smile'),
+    (re.compile(r"\b(no way|seriously\?|what\?!|wow|whoa|omg|oh my god)\b", re.I), 'surprise'),
+]
+
+
+def reaction(text: str) -> str | None:
+    """The expression JARVIS's face makes on hearing this, or None."""
+    for rx, name in REACT:
+        if rx.search(text or ''):
+            return name
+    return None
+
+
 HELPLINES = ('Tele-MANAS 14416 or 1-800-891-4416 (India, free, 24x7), KIRAN 1800-599-0019, '
              'or 112 for immediate danger')
 

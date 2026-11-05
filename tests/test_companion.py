@@ -159,5 +159,41 @@ class Face(unittest.TestCase):
             self.assertIn('jarvis_feels', str(companion({'action': 'feelings'})))
 
 
+class Animations(unittest.TestCase):
+    def test_clips_play_blend_and_finish(self):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        from core.avatar import HoloAvatar, EXPRESSIONS, CLIPS
+        for name in EXPRESSIONS:
+            a = HoloAvatar(); a._idle_at = 1e9
+            self.assertTrue(a.play(name))
+            peak = 0.0
+            for _ in range(int(CLIPS[name][0] / 0.02) + 5):
+                a.step(0.02, 0.0)
+                peak = max(peak, max(abs(v) for v in a._g.values()))
+            self.assertGreater(peak, 0.05, name)                      # it visibly moved
+            self.assertEqual(a._clips, [], name)                      # and it ended
+        a = HoloAvatar()
+        self.assertFalse(a.play('moonwalk'))
+
+    def test_feelings_react_and_listening_gets_attention(self):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        from core.avatar import HoloAvatar
+        a = HoloAvatar(); a._idle_at = 1e9
+        a.set_feeling('proud', 1.0)
+        self.assertEqual({c[0] for c in a._clips}, {'brow_flash', 'smile', 'nod'})
+        a._clips = []
+        a.step(0.02, 0.0, state='LISTENING')
+        self.assertIn('brow_flash', [c[0] for c in a._clips])
+
+    def test_words_get_face_reactions(self):
+        from core.companion import reaction
+        self.assertEqual(reaction('hahaha that is funny'), 'laugh')
+        self.assertEqual(reaction('good morning jarvis'), 'brow_flash')
+        self.assertEqual(reaction('thanks a lot'), 'smile')
+        self.assertIsNone(reaction('open the chart'))
+
+
 if __name__ == '__main__':
     unittest.main()

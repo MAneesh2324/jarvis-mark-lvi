@@ -1344,6 +1344,9 @@ class JarvisLive:
             note = heart.on_user_turn(text, getattr(self._wellbeing, 'mood', None) if self._wellbeing else None)
             if note:
                 notes.insert(0, note)
+            face = _co.reaction(text)            # a laugh, a greeting, thanks: the face answers first
+            if face and hasattr(self.ui, 'express'):
+                self.ui.express(face)
         except Exception as exc:
             print(f"[Companion] {exc}")
         if self._voice_guard is not None:

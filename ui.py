@@ -7536,6 +7536,14 @@ class JarvisUI:
     def wake_get_state(self, cb):
         self._win.wake_get_state = cb
 
+    def express(self, name: str, strength: float = 1.0) -> bool:
+        """Thread-safe: play an animated expression on the face (nod, laugh, wink, surprise ...)."""
+        try:
+            av = self._win.hud._avatar
+            return bool(av is not None and av.play(name, strength))
+        except Exception:
+            return False
+
     def set_feeling(self, feeling: str, level: float = 0.5, focus: dict | None = None) -> None:
         """Thread-safe: JARVIS's current feeling and focus session, shown on its face."""
         try:

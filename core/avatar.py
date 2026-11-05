@@ -111,6 +111,62 @@ def _blend(bg: QColor, col: QColor, a: float) -> QColor:
                   int(bg.blue() + (col.blue() - bg.blue()) * f))
 
 
+# ── animated expressions ─────────────────────────────────────────────────────
+# Each clip is (seconds, fn(u) -> {channel: offset}) with u running 0 → 1. Offsets add on top of the
+# resting feeling, so a laugh on a proud face is bigger than a laugh on a calm one would look.
+# Channels: smile, brow, shape (inner brows + / furrow -), squint, lids (+ wider / - lower),
+# wink_l, wink_r (0..1 closed), pitch (+ nods down), yaw, roll (+ tilts right), jaw (mouth open).
+
+def _bell(u: float) -> float:
+    return math.sin(math.pi * max(0.0, min(1.0, u))) ** 2
+
+
+def _ahr(u: float, attack: float = 0.2, release: float = 0.3) -> float:
+    """Attack, hold, release — eased at both ends."""
+    if u <= 0 or u >= 1:
+        return 0.0
+    if u < attack:
+        x = u / attack
+    elif u > 1 - release:
+        x = (1 - u) / release
+    else:
+        return 1.0
+    return x * x * (3 - 2 * x)
+
+
+CLIPS = {
+    'nod':        (0.95, lambda u: {'pitch': 0.10 * math.sin(2 * math.pi * 2 * u) * (1 - u) ** 0.6}),
+    'shake':      (1.10, lambda u: {'yaw': 0.16 * math.sin(2 * math.pi * 2.5 * u) * (1 - u) ** 0.7, 'shape': 0.3 * _bell(u)}),
+    'brow_flash': (0.65, lambda u: {'brow': 1.0 * _bell(u), 'lids': 0.12 * _bell(u)}),
+    'smile':      (1.80, lambda u: {'smile': 0.75 * _ahr(u, .25, .35), 'squint': 0.45 * _ahr(u, .3, .35), 'pitch': -0.02 * _ahr(u)}),
+    'laugh':      (1.60, lambda u: {'smile': 1.0 * _ahr(u, .12, .3), 'squint': 0.8 * _ahr(u, .12, .3), 'brow': 0.45 * _ahr(u),
+                                    'jaw': _ahr(u, .12, .3) * (0.18 + 0.22 * abs(math.sin(2 * math.pi * 4 * u))),
+                                    'pitch': -0.05 * _ahr(u) + 0.025 * math.sin(2 * math.pi * 4 * u) * _ahr(u), 'roll': 0.05 * _ahr(u)}),
+    'wink':       (0.80, lambda u: {'wink_r': _ahr(u, .25, .35), 'smile': 0.55 * _ahr(u, .2, .4), 'roll': -0.06 * _ahr(u, .2, .4),
+                                    'squint': 0.3 * _ahr(u)}),
+    'surprise':   (1.30, lambda u: {'brow': 1.25 * _ahr(u, .1, .45), 'lids': 0.32 * _ahr(u, .1, .45), 'jaw': 0.45 * _ahr(u, .12, .4),
+                                    'pitch': -0.05 * _ahr(u, .1, .45), 'smile': -0.2 * _ahr(u)}),
+    'sigh':       (2.20, lambda u: {'shape': 0.9 * _ahr(u, .3, .35), 'lids': -0.35 * _ahr(u, .3, .35), 'pitch': 0.09 * _ahr(u, .3, .35),
+                                    'jaw': 0.10 * _bell(u * 1.6), 'smile': -0.25 * _ahr(u), 'roll': 0.05 * _ahr(u)}),
+    'think':      (2.00, lambda u: {'shape': -0.5 * _ahr(u), 'brow': -0.15 * _ahr(u), 'squint': 0.25 * _ahr(u),
+                                    'yaw': 0.07 * _ahr(u), 'pitch': -0.06 * _ahr(u), 'roll': -0.05 * _ahr(u)}),
+    'tilt':       (1.80, lambda u: {'roll': 0.09 * _ahr(u, .3, .35), 'brow': 0.30 * _ahr(u, .3, .35), 'pitch': 0.03 * _ahr(u)}),
+    'micro_smile': (1.40, lambda u: {'smile': 0.35 * _bell(u), 'squint': 0.15 * _bell(u)}),
+    'micro_brow': (0.55, lambda u: {'brow': 0.45 * _bell(u)}),
+}
+EXPRESSIONS = ('nod', 'shake', 'brow_flash', 'smile', 'laugh', 'wink', 'surprise', 'sigh', 'think', 'tilt')
+# what the face does the moment a feeling arrives: (clip, delay seconds, strength)
+REACTIONS = {
+    'proud':      [('brow_flash', 0.0, 1.0), ('smile', 0.15, 1.0), ('nod', 0.5, 0.8)],
+    'concerned':  [('sigh', 0.0, 1.0), ('tilt', 0.9, 0.8)],
+    'determined': [('nod', 0.0, 1.0)],
+    'playful':    [('wink', 0.0, 1.0), ('micro_smile', 0.7, 1.0)],
+    'warm':       [('micro_smile', 0.0, 1.0)],
+    'calm':       [('micro_smile', 0.0, 0.6)],
+}
+_CHANNELS = ('smile', 'brow', 'shape', 'squint', 'lids', 'wink_l', 'wink_r', 'pitch', 'yaw', 'roll', 'jaw')
+
+
 class HoloAvatar:
     """Animated holographic head. One instance per HUD canvas.
 
@@ -203,6 +259,13 @@ class HoloAvatar:
         self._feel_lids = 1.0
         self._brow_shape = 0.0
         self._squint = 0.0
+        self._feel_roll = 0.0
+        self._roll = 0.0
+        self._clips: list = []           # [name, start_t, seconds, strength]
+        self._g = dict.fromkeys(_CHANNELS, 0.0)
+        self._idle_at = 6.0               # next little idle expression
+        self._last_state = ''
+        self._listen_react = -99.0
         self._feel_pitch = 0.0
         self._feel_yaw = 0.0
 
@@ -233,7 +296,52 @@ class HoloAvatar:
 
     def set_feeling(self, feeling: str, level: float = 0.6) -> None:
         if feeling in self.FEEL:
+            changed = feeling != self.feeling
             self.feeling, self.feeling_level = feeling, max(0.0, min(1.0, float(level)))
+            if changed:                           # react the moment the feeling arrives, then settle into it
+                for name, delay, strength in REACTIONS.get(feeling, ()):
+                    self.play(name, strength * (0.6 + 0.4 * self.feeling_level), delay)
+
+    def play(self, name: str, strength: float = 1.0, delay: float = 0.0) -> bool:
+        """Play an animated expression (see CLIPS). Safe to call from any thread: one list append."""
+        if name not in CLIPS:
+            return False
+        self._clips = [c for c in self._clips if c[0] != name or c[1] > self._t + delay] + \
+            [[name, self._t + max(0.0, delay), CLIPS[name][0], max(0.0, min(1.5, float(strength)))]]
+        return True
+
+    def _animate(self, t: float, dt: float, live: bool, st: str) -> None:
+        """Sum the playing clips into channel offsets, and add the small expressions of a living face."""
+        thinking = st in ("THINKING", "PROCESSING")
+        asleep = st in ("SLEEPING", "STANDBY", "OFFLINE")
+        if st != self._last_state:
+            if st == "LISTENING" and t - self._listen_react > 20:
+                self._listen_react = t
+                self.play('brow_flash', 0.45)     # "I'm listening"
+                self.play('tilt', 0.6, 0.25)
+            elif thinking:
+                self.play('think', 0.8)
+            self._last_state = st
+        if not live and not thinking and not asleep and t >= self._idle_at:
+            self.play(random.choice(('micro_smile', 'micro_brow', 'tilt', 'micro_smile')), random.uniform(0.35, 0.6))
+            self._idle_at = t + random.uniform(7.0, 15.0)
+        elif live or asleep:
+            self._idle_at = max(self._idle_at, t + 4.0)
+        g = dict.fromkeys(_CHANNELS, 0.0)
+        keep = []
+        for clip in self._clips:
+            name, start, dur, strength = clip
+            if t < start:
+                keep.append(clip)
+                continue
+            u = (t - start) / dur
+            if u >= 1:
+                continue
+            keep.append(clip)
+            for ch, val in CLIPS[name][1](u).items():
+                g[ch] += val * strength
+        self._clips = keep
+        self._g = g
 
     def _mouth_step(self, dt: float, amp: float, live: bool,
                     v_open: float | None, v_level: float | None) -> None:
@@ -339,6 +447,8 @@ class HoloAvatar:
                 self._mouth_step(v_hop, amp, live, op, lv)
         else:
             self._mouth_step(dt, amp, live, v_open, v_level)
+        if not live and self._g.get('jaw', 0.0) > self._mouth:
+            self._mouth = self._g['jaw']          # a laugh or a gasp opens the mouth
 
         # Syllable emphasis. Applied unconditionally: `_emph` decays to zero on
         # its own once the mouth closes, whereas gating it on `live` deleted the
@@ -373,10 +483,14 @@ class HoloAvatar:
         self._feel_lids += ((1 - (1 - flids) * k) - self._feel_lids) * ease
         self._feel_pitch += (fpitch * k - self._feel_pitch) * ease
         self._feel_yaw += (fyaw * k - self._feel_yaw) * ease
-        self._pitch += self._feel_pitch
-        self._yaw += self._feel_yaw
+        self._feel_roll += ({'concerned': 0.07, 'playful': -0.05}.get(self.feeling, 0.0) * k - self._feel_roll) * ease
+        self._animate(t, dt, live, (state or "").upper())
+        g = self._g
+        self._pitch += self._feel_pitch + g['pitch']
+        self._yaw += self._feel_yaw + g['yaw']
+        self._roll = self._feel_roll + g['roll']
 
-        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias + self._feel_brow
+        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias + self._feel_brow + g['brow']
         self._brow += (max(-0.4, min(1.2, brow_t)) - self._brow) * 0.20
 
         # ── what the state does to the face ─────────────────────────────────
@@ -481,10 +595,11 @@ class HoloAvatar:
             # weights, which average 0.5 — worked out to six pixels on a 250 px
             # head, which is to say invisible.
             v[:, 1] += self._brow_w * (self._brow * _BROW_LIFT)
-        if abs(self._brow_shape) > 0.01:
+        bshape = self._brow_shape + self._g['shape']
+        if abs(bshape) > 0.01:
             # +1 at the inner ends of the brows, -1 at the outer ends: worry lifts the middle, resolve knits it
             shape = np.clip(1.0 - 2.0 * np.abs(v[:, 0]) / self._brow_half, -1.0, 1.0)
-            v[:, 1] += self._brow_w * (self._brow_shape * 0.10 * shape)
+            v[:, 1] += self._brow_w * (bshape * 0.10 * shape)
 
         if abs(self._wide) > 0.01 and self._mouth > 0.0:
             # Spread pulls the corners out and flattens the lips back; rounding
@@ -494,13 +609,14 @@ class HoloAvatar:
             v[:, 1] += k * (v[:, 1] - self._lip_c[1]) * 0.30
             v[:, 2] -= k * 0.055
 
-        if abs(self._smile) > 0.01:
+        smile = max(-1.0, min(1.5, self._smile + self._g['smile']))
+        if abs(smile) > 0.01:
             # A resting smile: the lip corners rise and spread a little; the middle stays put.
             dx = v[:, 0] - self._lip_c[0]
             reach = (dx / self._lip_half) ** 2
-            w = self._lips_w * self._smile
+            w = self._lips_w * smile
             v[:, 1] += w * reach * 0.12
-            v[:, 0] += w * dx * (0.16 if self._smile > 0 else 0.04)
+            v[:, 0] += w * dx * (0.16 if smile > 0 else 0.04)
 
         if self._mouth > 0.004:
             px, py, pz = JAW_PIVOT
@@ -519,6 +635,9 @@ class HoloAvatar:
             [-cp * sy, sp, cp * cy],
         ], dtype=np.float32)
 
+        if abs(self._roll) > 1e-4:                # a sideways tilt of the head (sympathy, curiosity, a laugh)
+            cr, sr = math.cos(self._roll), math.sin(self._roll)
+            m = np.array([[cr, -sr, 0.0], [sr, cr, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32) @ m
         return v @ m.T, self._n0 @ m.T
 
     # ── rendering ───────────────────────────────────────────────────────────
@@ -708,11 +827,14 @@ class HoloAvatar:
             idx = lm[key]
             ex, ey = xs[idx], ys[idx]
             mid_y = float(ey.mean())
-            open_k = max(0.04, vis * self._lids)
+            g = self._g
+            wink = g['wink_l'] if key == 'eye_l' else g['wink_r']
+            open_k = max(0.04, vis * max(0.05, self._lids + g['lids']) * (1.0 - 0.96 * min(1.0, wink)))
+            squint = max(0.0, min(1.0, self._squint + g['squint']))
             upper = ey < mid_y                              # screen y grows downwards
             # the upper lid follows openness; the lower lid rises with a real smile
             ey = np.where(upper, mid_y + (ey - mid_y) * open_k,
-                          mid_y + (ey - mid_y) * open_k * (1.0 - 0.55 * max(0.0, self._squint)))
+                          mid_y + (ey - mid_y) * open_k * (1.0 - 0.55 * squint))
             poly = QPolygonF([QPointF(float(a), float(b)) for a, b in zip(ex, ey)])
 
             p.setPen(Qt.PenStyle.NoPen)
@@ -722,7 +844,7 @@ class HoloAvatar:
             p.setPen(QPen(_c(primary, 245 * face), 1.9))      # lid line
             p.drawPolygon(poly)
 
-            if vis > 0.35:
+            if vis > 0.35 and open_k > 0.15:
                 br = poly.boundingRect()
                 gx = br.center().x() + self._gaze[0] * br.width() * 0.16
                 gy = br.center().y() + self._gaze[1] * br.height() * 0.20
