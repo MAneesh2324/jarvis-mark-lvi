@@ -1328,6 +1328,26 @@ class JarvisLive:
                 pass
         self.ui.write_log("SYS: Interrupted — listening...")
 
+    def _proactive_wanted(self) -> bool:
+        """Proactive audio lets the model stay silent for speech not meant for it, but it weighs
+        every sentence first, which slows replies. In the fast profile it is on only while a second
+        voice is in the room; alone with the user, JARVIS answers at full speed."""
+        from core.response_speed import get_profile
+        if not get_proactive_audio_enabled():
+            return False
+        if get_profile() != "fast":
+            return True
+        room = getattr(self, "_room", None)
+        return bool(room is not None and room.active)
+
+    def _room_changed(self):
+        """The room went from just-us to a conversation with someone else, or back: in the fast
+        profile that switches proactive audio, which needs a new session (the conversation is kept)."""
+        from core.response_speed import get_profile
+        if get_proactive_audio_enabled() and get_profile() == "fast":
+            self.request_reconnect(keep_context=True,
+                                   reason="someone else is talking" if self._room.active else "back to just us")
+
     def _face_from_reply(self, chunk: str):
         """JARVIS's face reacts to its own words as they are spoken: pure string work, no tool call."""
         try:
@@ -1394,9 +1414,13 @@ class JarvisLive:
                 notes.append(room)
                 self.ui.write_log('SYS: ' + ('Someone else is talking with you; I will stay quiet unless you turn to me.'
                                              if self._room.active else 'Back to just us.'))
+        else:
+            room = None
         self._pending_notes.extend(notes)
         if self._pending_notes and not self._conversation_busy and not self._is_speaking:
             await self._flush_notes()
+        if room:
+            self._room_changed()
 
     async def _flush_notes(self):
         """Private context for the model, added without asking it to reply (Gemini Live only)."""
@@ -1509,6 +1533,7 @@ class JarvisLive:
                     self.ui.write_log('SYS: Back to just us.')
                     if not self._conversation_busy and not self._is_speaking:
                         await self._flush_notes()
+                    self._room_changed()                     # back to full-speed replies
                 done = _co.instance().tick()                 # ends a focus session that ran out; refreshes the face
                 if done:
                     held = getattr(self, '_held_for_focus', [])
@@ -1744,9 +1769,9 @@ class JarvisLive:
             #  support it, and it never reliably detected tone in practice.
             #  To restore it on a 2.5 native-audio model, add back:
             #  cfg["enable_affective_dialog"] = True )
-            # On in the fast profile too: answering every conversation in the room was
-            # worse than the occasional reply that waits for the next sentence.
-            if get_proactive_audio_enabled():
+            # In the fast profile only while someone else is talking in the room (see
+            # _proactive_wanted): judging every sentence costs reply time when it is just you.
+            if self._proactive_wanted():
                 cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
 
         if self._tuned_live:
@@ -2332,6 +2357,7 @@ class JarvisLive:
                                 self._conversation_busy = True
                                 self._last_input_voice = True
                                 self._last_user_speech = time.monotonic()
+                                performance.voice_heard()
                                 self._rx_deadline = self._last_user_speech + _STALL_LIMIT
 
                         if sc.turn_complete:
@@ -3048,7 +3074,7 @@ class JarvisLive:
             client = genai.Client(
                 api_key=_get_api_key(),
                 http_options={"api_version":
-                              "v1alpha" if self._enhanced_live and get_proactive_audio_enabled() else "v1beta"},
+                              "v1alpha" if self._enhanced_live and self._proactive_wanted() else "v1beta"},
             )
             async with client.aio.live.connect(model=live_model,
                                                config=config) as session:

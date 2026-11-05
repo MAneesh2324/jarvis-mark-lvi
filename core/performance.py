@@ -20,12 +20,25 @@ def begin_typed_response():
         _pending_typed = monotonic()
 
 
+_pending_voice = None
+
+
+def voice_heard():
+    """Each time a piece of the user's spoken words arrives; the last one is about when they stopped."""
+    global _pending_voice
+    with _lock:
+        _pending_voice = monotonic()
+
+
 def first_audio():
-    global _pending_typed
+    global _pending_typed, _pending_voice
     with _lock:
         started, _pending_typed = _pending_typed, None
+        heard, _pending_voice = _pending_voice, None
     if started is not None:
         record('response', 'typed_request_to_first_audio_received', monotonic() - started)
+    elif heard is not None:
+        record('response', 'speech_to_first_audio_received', monotonic() - heard)
 
 
 def cancel_response():
