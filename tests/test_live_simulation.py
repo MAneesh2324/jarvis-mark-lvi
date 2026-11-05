@@ -1,0 +1,160 @@
+"""Live simulation lab: process models of anything, iterative attempts and verdicts."""
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+APPLE = json.loads((Path(__file__).parent / 'fixtures' / 'apple_process.json').read_text())
+
+
+class Formulas(unittest.TestCase):
+    def test_arithmetic_and_helpers(self):
+        from core.process_sim import Formula
+        f = Formula('clamp(x * 2, 0, 10) + between(t, 1, 5) + (3 if x > 1 else 4) + 2^3', {'x'})
+        self.assertEqual(f({'x': 3, 't': 2}), 6 + 1 + 3 + 8)
+
+    def test_code_cannot_run(self):
+        from core.process_sim import Formula
+        for bad in ('__import__("os").system("x")', 'x.__class__', '[1, 2]', 'open("f")', 'lambda: 1',
+                    'y + 1', '"text"', 'min(x, key=1)'):
+            with self.assertRaises(ValueError, msg=bad):
+                Formula(bad, {'x'})
+
+
+class Process(unittest.TestCase):
+    def test_apple_grows_ripens_and_reacts_to_settings(self):
+        from core.process_sim import simulate
+        r = simulate(APPLE)
+        self.assertEqual(r['kind'], 'process')
+        self.assertGreater(r['finals']['diameter_mm'], 70)
+        ev = {e['label']: e['at'] for e in r['events']}
+        self.assertIsNotNone(ev['ripe'])
+        shade = simulate({**APPLE, 'params': {**APPLE['params'], 'sunlight_hours': 4}})
+        self.assertLess(shade['finals']['diameter_mm'], r['finals']['diameter_mm'])
+        self.assertLessEqual(r['fan_chart'][-1]['p05'], r['fan_chart'][-1]['median'])   # uncertainty band
+        self.assertEqual(set(r['series']), {'diameter_mm', 'sugar_percent', 'red_percent'})
+
+    def test_bad_specs_are_refused(self):
+        from core.process_sim import simulate
+        with self.assertRaises(ValueError):
+            simulate({**APPLE, 'focus': 'nope'})
+        with self.assertRaises(ValueError):
+            simulate({'variables': [{'name': 'x', 'rate': 'x * 1e300 ** 2'}], 'duration': 10})  # ** capped, then inf
+        with self.assertRaises(ValueError):
+            simulate({'variables': []})
+
+
+class Session(unittest.TestCase):
+    def test_attempts_verdicts_and_search(self):
+        import core.sim_session as S
+        b = S.start('goal', {'total_hours': 300, 'hours_per_day': 2, 'consistency_percent': 75},
+                    {'metric': 'finish_day', 'op': '<=', 'value': 120})
+        self.assertEqual((b['session']['attempt'], b['session']['status']), (1, 'failed'))
+        boards = S.search('hours_per_day', [2.5, 3, 3.5, 4, 5])
+        self.assertEqual(boards[-1]['session']['status'], 'success')
+        self.assertEqual(len(boards), 3)                            # stopped at the first success (3.5 h)
+        self.assertEqual(S.status()['current_settings']['hours_per_day'], 3.5)
+        S.search('hours_per_day', [1, 1.5])                           # nothing works → model unchanged
+        self.assertEqual(S.status()['current_settings']['hours_per_day'], 3.5)
+        S.reset()
+
+    def test_process_changes_reach_the_spec_and_goals_use_events(self):
+        import core.sim_session as S
+        b = S.start('process', APPLE, {'metric': 'ripe', 'op': '<=', 'value': 145})
+        self.assertEqual(b['session']['status'], 'success')
+        b = S.change({'sunlight_hours': 5})
+        self.assertEqual(b['session']['status'], 'failed')
+        self.assertIn('sunlight hours 8→5', b['session']['attempts'][-1]['change'])
+        self.assertEqual(S.status()['current_settings']['params']['sunlight_hours'], 5)
+        b = S.change({'focus': 'sugar_percent'})
+        self.assertEqual(b['focus'], 'sugar_percent')
+        with self.assertRaisesRegex(ValueError, 'ripe'):
+            S.set_goal({'metric': 'colour', 'value': 1})
+        S.reset()
+
+    def test_invert_flips_the_side(self):
+        from core.sim_session import _apply
+        self.assertEqual(_apply({'side': 'short'}, {'side': 'invert'})[0]['side'], 'long')
+
+
+class Tool(unittest.TestCase):
+    def setUp(self):
+        import core.scenario_simulator as sim
+        import actions.simulation_session as act
+        self.tmp = tempfile.TemporaryDirectory()
+        self.p = [patch.object(sim, 'LAST', Path(self.tmp.name) / 'l.json'), patch.object(act, 'MONTAGE_SECONDS', 0)]
+        for x in self.p:
+            x.start()
+
+    def tearDown(self):
+        for x in self.p:
+            x.stop()
+        self.tmp.cleanup()
+        import core.sim_session as S
+        S.reset()
+
+    def test_voice_flow(self):
+        import time
+        from actions.simulation_session import session
+        ui = MagicMock()
+        out = session({'action': 'start', 'kind': 'process', 'parameters_json': json.dumps(APPLE),
+                       'goal_metric': 'ripe', 'goal_op': '<=', 'goal_value': 145, 'label': 'Apple'}, player=ui)
+        self.assertIn('MODEL SUCCESSFUL', out)
+        out = session({'action': 'search', 'param': 'sunlight_hours', 'values': [3, 4, 9]}, player=ui)
+        self.assertIn('"first_success"', out)
+        time.sleep(.2)
+        shown = [c[0][0]['session']['attempt'] for c in ui.show_simulation.call_args_list if c[0][0]]
+        self.assertEqual(shown[-1], 4)                              # the montage ended on the success
+        self.assertIn('failed', session({'action': 'change', 'changes_json': '{}'}, player=ui))
+        session({'action': 'reset'}, player=ui)
+        ui.show_simulation.assert_called_with(None)
+
+
+class BoardDraws(unittest.TestCase):
+    def test_session_and_scene_paint(self):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import QPointF
+        app = QApplication.instance() or QApplication([])
+        import core.sim_session as S
+        from core.simulation_view import SimulationHologram
+        w = SimulationHologram()
+        for scene in ('grow', 'fill', 'dots'):
+            spec = {**APPLE, 'scene': {**APPLE['scene'], 'type': scene}}
+            S.start('process', spec, {'metric': 'ripe', 'op': '<=', 'value': 145})
+            b = S.change({'sunlight_hours': 5})
+            for size in ((1100, 640), (490, 640)):
+                w.resize(*size)
+                for t in (0, 1.2, 3.0, 20):
+                    w.set_result(b)
+                    w.started -= t
+                    self.assertFalse(w.grab().isNull())
+                w._hover = QPointF(200, 200)
+                self.assertFalse(w.grab().isNull())
+        S.reset()
+        app.processEvents()
+
+
+class AccountLimits(unittest.TestCase):
+    def test_balance_never_goes_below_zero(self):
+        import core.trading_lab as t
+        fx = json.loads((Path(__file__).parent / 'fixtures' / 'sweep_mss_breaker_short.json').read_text())
+        # the fixture's one trade wins; force a loss by flipping to longs only on a copy where the setup is short
+        r = t.backtest({'candles': fx, 'symbol': 'T'}, 'sweep_mss_breaker', rr=2, account_balance=100, risk_amount=500)
+        self.assertGreaterEqual(min(x['balance'] for x in r['trades']), 0)
+        self.assertIn('500%', r['money']['risk_warning'])
+
+    def test_clipped_window_is_reported(self):
+        import time
+        from actions.trading_lab import run_backtest
+        fx = json.loads((Path(__file__).parent / 'fixtures' / 'sweep_mss_breaker_short.json').read_text())
+        data = {'candles': fx, 'symbol': 'T', 'interval': '5m'}
+        with patch('core.trading_lab.load', return_value=data), patch('time.time', return_value=fx[-1]['t'] + 60):
+            s = run_backtest({'symbol': 'T', 'interval': '5m', 'past_days': 180, 'strategy': 'sweep_mss_breaker'})
+        self.assertIn('only go back', s['window_note'])
+
+
+if __name__ == '__main__':
+    unittest.main()

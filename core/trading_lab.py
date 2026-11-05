@@ -1110,15 +1110,21 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, from_ti
     closed = [t for t in trades if not t['open']]
     dec = _decimals(c[-1]['c'])
     balance, money_curve, peak_m, dd_m = balance0, [[0, balance0]] if balance0 else [], balance0 or 0.0, 0.0
+    blown = None
     for t in closed:                                         # costs and money, trade by trade
         cost_r = spread / abs(t['entry'] - t['stop']) if spread else 0.0
         t['gross_r'] = t['r']
         t['r'] = round(t['r'] - cost_r, 3)
         if balance0 is not None:
+            if blown is not None:                            # an empty account takes no more trades
+                t['risk'], t['pnl'], t['balance'] = 0.0, 0.0, 0.0
+                continue
             risk_money = float(risk_amount) if risk_amount else (balance if compound else balance0) * risk_percent / 100
             t['risk'] = round(risk_money, 2)
-            t['pnl'] = round(t['r'] * risk_money - commission, 2)
+            t['pnl'] = round(max(t['r'] * risk_money - commission, -balance), 2)    # cannot lose more than is there
             balance += t['pnl']
+            if balance <= 0.005:
+                balance, blown = 0.0, len(money_curve)
             t['balance'] = round(balance, 2)
             peak_m = max(peak_m, balance)
             dd_m = max(dd_m, peak_m - balance)
@@ -1152,7 +1158,11 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, from_ti
                         'gross_loss': round(sum(t['pnl'] for t in closed if t['pnl'] <= 0), 2),
                         'largest_win': max((t['pnl'] for t in closed if t['pnl'] > 0), default=0),
                         'largest_loss': min((t['pnl'] for t in closed if t['pnl'] <= 0), default=0),
-                        'max_drawdown': round(dd_m, 2), 'curve': money_curve[:301]} if balance0 is not None else None),
+                        'max_drawdown': round(dd_m, 2), 'curve': money_curve[:301],
+                        'account_blown_at_trade': blown,
+                        'risk_warning': (f'Risking {risk_amount} on a {balance0:g} account is {100 * float(risk_amount) / balance0:.0f}% '
+                                         'per trade; one loss can empty it.' if risk_amount and float(risk_amount) >= balance0 * .1 else None)}
+                       if balance0 is not None else None),
              'trades': [{'n': k, 'direction': t['direction'], 'entry_time': when(t['i']), 'exit_time': when(t['exit_i']),
                          'entry': round(t['entry'], dec), 'stop': round(t['stop'], dec), 'target': round(t['target'], dec),
                          'exit': round(t['exit'], dec), 'r': t['r'],

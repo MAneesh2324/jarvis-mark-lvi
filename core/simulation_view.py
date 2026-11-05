@@ -123,8 +123,10 @@ class SimulationHologram(QWidget):
         w, h = self.width(), self.height()
         t = self.elapsed()
         if self.finished() and self._timer.isActive():
-            self._timer.setInterval(120)            # idle shimmer only
+            # idle shimmer only — but a live session's hologram keeps turning smoothly
+            self._timer.setInterval(50 if self.result.get('session') or self.shown.get('scene') else 120)
 
+        self._deferred = None
         p.fillRect(self.rect(), self.col['bg'])
         glow = QRadialGradient(QPointF(w * .4, h * .45), max(w, h) * .6)
         glow.setColorAt(0, self._c('pri', 34))
@@ -163,6 +165,14 @@ class SimulationHologram(QWidget):
         self._cards(p, cards, t, side)
         top = h - 92 if side else min(h - 92, cards.bottom() + 16)
         self._verdict(p, QRectF(28, top, w - 56, h - 26 - top), t, small=not side)
+        session = self.result.get('session')
+        if session:
+            self._session(p, eq if self.rows else chart, t, session, side)
+        scene = self.shown.get('scene')
+        if scene and self.rows:
+            self._scene(p, eq, t, scene)
+        if self._deferred:                                   # hover readouts sit on top of everything
+            self._readout(p, *self._deferred)
         self._scanlines(p, w, h, t)
 
     def _header(self, p, w, t):
@@ -176,12 +186,15 @@ class SimulationHologram(QWidget):
         p.setPen(self._c('acc2' if t < BUILD_SECONDS else 'green'))
         a = self.shown.get('assumptions', {}) if hasattr(self, 'shown') else {}
         paths = a.get('paths')
-        if self.shown.get('kind') == 'backtest':
+        session = self.result.get('session')
+        if session:
+            info = f"ATTEMPT {session['attempt']:02d}   ·   GOAL: {session['criterion'].upper()}"
+        elif self.shown.get('kind') == 'backtest':
             st = self.shown.get('stats', {})
             info = f"{st.get('closed_trades', 0)} trades   ·   RR 1:{a.get('reward_to_risk') or '?'}"
         else:
             info = f"{paths or 1} {'paths' if paths else 'case'}   ·   seed {a.get('seed', '—')}"
-        p.drawText(QPointF(28, 48), f"{state}   ·   {info}")
+        p.drawText(QPointF(28, 48), p.fontMetrics().elidedText(f"{state}   ·   {info}", Qt.TextElideMode.ElideRight, w - 28 - 150))
         self._close_rect = QRectF(w - 128, 14, 104, 26)
         p.setPen(QPen(self._c('pri', 160), 1))
         p.setBrush(self._c('pri', 18))
@@ -229,6 +242,10 @@ class SimulationHologram(QWidget):
         p.save()
         p.setClipRect(QRectF(r.left() - 2, r.top() - 4, edge - r.left() + 4, r.height() + 8))
 
+        stages = self.shown.get('stages') or []
+        for k, st in enumerate(stages):                      # process stages as alternating bands
+            x1, x2 = X(st['start']), X(st['end'])
+            p.fillRect(QRectF(x1, r.top(), x2 - x1, r.height()), self._c('pri', 16 if k % 2 else 6))
         if self.ghost:                                       # baseline of a comparison, faint
             p.setPen(QPen(self._c('dim', 160), 1.4, Qt.PenStyle.DashLine))
             p.setBrush(Qt.BrushStyle.NoBrush)          # an open path with a brush would fill as a wedge
@@ -304,6 +321,24 @@ class SimulationHologram(QWidget):
         p.drawText(QRectF(r.left(), r.bottom() + 18, r.width(), 14), Qt.AlignmentFlag.AlignLeft,
                    p.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, int(r.width())))
 
+        if stages:
+            p.setFont(QFont('Courier New', 7))
+            for k, st in enumerate(stages):
+                x1, x2 = X(st['start']), X(st['end'])
+                active = x1 <= edge
+                p.setPen(self._c('text' if active else 'dim', 230 if active else 120))
+                p.drawText(QRectF(x1 + 2, r.top() + 2 + (k % 2) * 10, max(10.0, x2 - x1 - 4), 10), Qt.AlignmentFlag.AlignLeft,
+                           p.fontMetrics().elidedText(st['name'].upper(), Qt.TextElideMode.ElideRight, int(max(10.0, x2 - x1 - 4))))
+        for ev in self.shown.get('events') or []:
+            if ev.get('at') is None or X(ev['at']) > edge:
+                continue
+            x = X(ev['at'])
+            p.setPen(QPen(self._c('green', 200), 1.2, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(x, r.top() + 22), QPointF(x, r.bottom()))
+            p.setFont(QFont('Courier New', 8, QFont.Weight.Bold))
+            p.setPen(self._c('green'))
+            p.drawText(QRectF(x - 124, r.bottom() - 32, 120, 14), Qt.AlignmentFlag.AlignRight, '◆ ' + ev['label'].upper())
+
         if reveal < 1:                                       # live numbers riding the beam
             day = last * reveal
             row = _at(self.rows, day)
@@ -321,13 +356,154 @@ class SimulationHologram(QWidget):
                     p.setPen(QPen(self._c('white', 120), 1, Qt.PenStyle.DotLine))
                     p.drawLine(QPointF(hover.x(), r.top()), QPointF(hover.x(), r.bottom()))
                     lines = [f"{unit[:-1] if unit.endswith('s') else unit} {day:,.0f}", f"median {_num(row['median'], yu)}"]
-                    if self.shown.get('kind') == 'backtest':
+                    if self.shown.get('kind') == 'process' and self.shown.get('series'):
+                        ts = self.shown['series_t']
+                        k = min(range(len(ts)), key=lambda i: abs(ts[i] - day))
+                        lines = [f"{unit[:-1] if unit.endswith('s') else unit} {ts[k]:,.0f}"] + [
+                            f"{n.replace('_', ' ')[:14]:14} {v[k]:,.1f} {self.shown['units'].get(n, '')}"
+                            for n, v in list(self.shown['series'].items())[:5]]
+                    elif self.shown.get('kind') == 'backtest':
                         lines = [f"after trade {day:,.0f}", f"{'balance' if yu == 'money' else 'equity'}  {_num(row['median'], yu)}",
                                  f"peak     {_num(row['p95'], yu)}", f"drawdown {_num(row['p95'] - row['median'], yu)}"]
                     elif abs(row['p95'] - row['p05']) > 1e-9:
                         lines.insert(1, f"95th   {_num(row['p95'], yu)}")
                         lines.append(f"5th    {_num(row['p05'], yu)}")
-                    self._readout(p, QPointF(hover.x(), Y(row['median'])), lines, r)
+                    self._defer(QPointF(hover.x(), Y(row['median'])), lines, r)
+
+    # ── live session: attempt log, verdict, hologram ─────────────────────────
+    def _session(self, p, r, t, session, side):
+        status = session.get('status')
+        tone = 'green' if status == 'success' else 'red' if status == 'failed' else 'pri'
+        # spinning wireframe knot; its shape changes with every attempt and it glows with the verdict
+        size = min(92.0, r.width() * .22, r.height() * .42)
+        cx, cy = r.right() - size * .62, r.top() + size * .62 + 6
+        knots = ((2, 3), (3, 4), (2, 5), (3, 5), (4, 5), (3, 7), (5, 6), (4, 7))
+        pk, qk = knots[(session.get('attempt', 1) - 1) % len(knots)]
+        ang, tilt = t * (.9 if status != 'success' else .4), .55 + .25 * math.sin(t * .5)
+        pts = []
+        for i in range(181):
+            u = 2 * math.pi * i / 180
+            rr = 2 + math.cos(qk * u)
+            x, y, z = rr * math.cos(pk * u), rr * math.sin(pk * u), -math.sin(qk * u)
+            x, z = x * math.cos(ang) + z * math.sin(ang), -x * math.sin(ang) + z * math.cos(ang)
+            y, z = y * math.cos(tilt) - z * math.sin(tilt), y * math.sin(tilt) + z * math.cos(tilt)
+            k = size / 7.2 * (1 + z * .06)
+            pts.append(QPointF(cx + x * k, cy + y * k))
+        build = min(1.0, t / BUILD_SECONDS)
+        path = QPainterPath(pts[0])
+        for q in pts[1:int(1 + 180 * build)]:
+            path.lineTo(q)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for width, alpha in ((6, 40), (1.4, 230)):
+            p.setPen(QPen(self._c(tone, alpha), width))
+            p.drawPath(path)
+        if status == 'success':                              # lock-on rings
+            for i in range(2):
+                rad = size * (.5 + .12 * i + .04 * math.sin(t * 4 + i))
+                p.setPen(QPen(self._c('green', 110 - 40 * i), 1.2))
+                p.drawEllipse(QPointF(cx, cy), rad, rad)
+
+        # attempt log, newest last
+        rows = session.get('attempts', [])[-(5 if side else 3):]
+        if rows:
+            lw = min(r.width() - size - 30, 330.0)
+            lh = 14 * len(rows) + 10
+            box = QRectF(r.left() + 8, r.top() + 22, lw, lh)
+            p.setPen(QPen(self._c('pri', 90), 1))
+            p.setBrush(self._c('bg', 200))
+            p.drawRoundedRect(box, 3, 3)
+            p.setFont(QFont('Courier New', 8))
+            for i, a in enumerate(rows):
+                mark = '✔' if a.get('passed') else '✘' if a.get('passed') is False else '·'
+                col = 'green' if a.get('passed') else 'red' if a.get('passed') is False else 'text'
+                text = f"{mark} #{a['n']:02d} {a['change']}  →  {a['value']}"
+                p.setPen(self._c(col, 235))
+                p.drawText(QRectF(box.left() + 6, box.top() + 5 + 14 * i, lw - 10, 14), Qt.AlignmentFlag.AlignLeft,
+                           p.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, int(lw - 10)))
+
+        # the verdict, big, once the build finishes
+        if status in ('success', 'failed'):
+            k = t - BUILD_SECONDS
+            if 0 < k < 3.2:
+                a = min(1.0, k / .25) * (1 if k < 2.4 else max(0.0, (3.2 - k) / .8))
+                flicker = .75 + .25 * math.sin(k * 30) if k < .6 else 1
+                word = 'MODEL SUCCESSFUL' if status == 'success' else 'MODEL FAILED'
+                p.setFont(QFont('Courier New', 22 if side else 15, QFont.Weight.Bold))
+                band = QRectF(r.left(), r.center().y() - 26, r.width(), 52)
+                p.fillRect(band, self._c('bg', 190 * a))
+                p.setPen(QPen(self._c(tone, 230 * a), 1.5))
+                p.drawLine(QPointF(band.left(), band.top()), QPointF(band.right(), band.top()))
+                p.drawLine(QPointF(band.left(), band.bottom()), QPointF(band.right(), band.bottom()))
+                p.setPen(self._c(tone, 255 * a * flicker))
+                p.drawText(band, Qt.AlignmentFlag.AlignCenter, word)
+
+    def _scene(self, p, r, t, scene):
+        """A small picture of the process, driven by its own variables as the beam sweeps."""
+        series, ts = self.shown.get('series') or {}, self.shown.get('series_t') or []
+        if not ts:
+            return
+        X, _Y, _lo, _hi, last = self._scale(r)
+        reveal = 1 - (1 - min(1.0, t / BUILD_SECONDS)) ** 3
+        hover = getattr(self, '_hover', None)
+        day = last * reveal
+        if reveal >= 1 and hover is not None and r.contains(hover):
+            day = (hover.x() - r.left()) / r.width() * last
+        k = min(range(len(ts)), key=lambda i: abs(ts[i] - day))
+        val = lambda name, default=0.0: (series.get(name) or [default] * len(ts))[k]
+        frac = lambda name, top: max(0.0, min(1.0, val(name) / top)) if name in series and top else 0.0
+        side = min(140.0, max(90.0, r.height() * .52), r.width() * .36)
+        box = QRectF(r.right() - side - 8, r.bottom() - side - 4, side, side)
+        p.setPen(QPen(self._c('pri', 70), 1))
+        p.setBrush(self._c('bg', 170))
+        p.drawRoundedRect(box, 6, 6)
+        kind = str(scene.get('type', 'grow'))
+        cx, cy = box.center().x(), box.center().y() + 6
+        mix = frac(scene.get('color'), float(scene.get('color_max', 100) or 100))
+        a, b = QColor(str(scene.get('from', '#7cc242'))), QColor(str(scene.get('to', '#d62828')))
+        col = QColor(int(a.red() + (b.red() - a.red()) * mix), int(a.green() + (b.green() - a.green()) * mix),
+                     int(a.blue() + (b.blue() - a.blue()) * mix))
+        if kind == 'grow':
+            # a branch, a stem and a fruit that swells and changes colour
+            p.setPen(QPen(QColor('#6b4b2a'), 4))
+            p.drawLine(QPointF(box.left() + 10, box.top() + 20), QPointF(box.right() - 10, box.top() + 14))
+            p.setPen(QPen(QColor('#6b4b2a'), 2))
+            p.drawLine(QPointF(cx, box.top() + 17), QPointF(cx, box.top() + side * .3))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor('#3fa34d'))
+            leaf = QPainterPath(QPointF(cx, box.top() + 24))
+            leaf.quadTo(QPointF(cx + 22, box.top() + 14), QPointF(cx + 30, box.top() + 30))
+            leaf.quadTo(QPointF(cx + 12, box.top() + 36), QPointF(cx, box.top() + 24))
+            p.drawPath(leaf)
+            hang = box.top() + side * .3                     # where the stem meets the fruit
+            room = (box.bottom() - 18 - hang) / 2
+            rad = 3 + (room - 3) * frac(scene.get('size'), float(scene.get('max', 1) or 1))
+            g = QRadialGradient(QPointF(cx - rad * .35, hang + rad * .65), rad * 1.3)
+            g.setColorAt(0, col.lighter(150))
+            g.setColorAt(1, col.darker(130))
+            p.setBrush(QBrush(g))
+            p.drawEllipse(QPointF(cx, hang + rad), rad, rad * .94)
+        elif kind == 'fill':
+            level = frac(scene.get('size'), float(scene.get('max', 1) or 1))
+            tank = QRectF(box.left() + 30, box.top() + 22, box.width() - 60, box.height() - 44)
+            p.setPen(QPen(self._c('text', 200), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(tank)
+            p.fillRect(QRectF(tank.left() + 1, tank.bottom() - tank.height() * level, tank.width() - 2, tank.height() * level), col)
+        else:                                                # dots: a population that grows or shrinks
+            import random as _r
+            rnd = _r.Random(7)
+            count = int(120 * frac(scene.get('size'), float(scene.get('max', 1) or 1)))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(col)
+            for _ in range(count):
+                p.drawEllipse(QPointF(box.left() + 10 + rnd.random() * (box.width() - 20),
+                                      box.top() + 18 + rnd.random() * (box.height() - 36)), 2.2, 2.2)
+        p.setFont(QFont('Courier New', 8))
+        p.setPen(self._c('text'))
+        label = str(scene.get('label', '')).upper()
+        unit = self.shown.get('x_unit', '')
+        p.drawText(QRectF(box.left() + 6, box.bottom() - 16, box.width() - 12, 14), Qt.AlignmentFlag.AlignLeft,
+                   f"{label}  {unit[:-1] if unit.endswith('s') else unit} {ts[k]:,.0f}")
 
     def _trade_bars(self, p, r, eq, t, trades):
         """One bar per closed trade under the equity line: green up for a win, red down for a loss."""
@@ -362,7 +538,7 @@ class SimulationHologram(QWidget):
                          f"{(tr.get('entry_time') or '')[:16]}",
                          f"entry {tr.get('entry')}  exit {tr.get('exit')}",
                          f"R {tr.get('r', 0):+.2f}" + (f"   P&L {tr['pnl']:+,.2f}" if tr.get('pnl') is not None else '')]
-                self._readout(p, QPointF(X(n), mid), lines, QRectF(eq.left(), eq.top(), eq.width(), r.bottom() - eq.top()))
+                self._defer(QPointF(X(n), mid), lines, QRectF(eq.left(), eq.top(), eq.width(), r.bottom() - eq.top()))
 
     def _tag(self, p, at, small, big, r, live=False):
         """A value flag on the line: a dot and a small box with the number."""
@@ -399,6 +575,9 @@ class SimulationHologram(QWidget):
         p.setBrush(self._c('white'))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(at, 4, 4)
+
+    def _defer(self, at, lines, r):
+        self._deferred = (at, lines, r)
 
     def mouseMoveEvent(self, e):
         self._hover = e.position()
@@ -466,6 +645,7 @@ class SimulationHologram(QWidget):
         p.setFont(QFont('Courier New', 7))
         p.drawText(QRectF(r.left(), r.bottom(), r.width(), 14), Qt.AlignmentFlag.AlignRight,
                    'PAST DATA · NO GUARANTEE OF FUTURE RESULTS' if self.shown.get('kind') == 'backtest'
+                   else 'ILLUSTRATIVE MODEL BUILT BY JARVIS · NOT MEASURED DATA' if self.shown.get('kind') == 'process'
                    else 'HYPOTHETICAL MODEL ON YOUR ASSUMPTIONS · NOT A FORECAST')
 
     def _scanlines(self, p, w, h, t):

@@ -108,7 +108,7 @@ def from_backtest(stats):
  trades=[{k:t.get(k) for k in ('n','direction','entry_time','exit_time','entry','stop','exit','r','pnl','balance','result')} for t in (stats.get('trades') or [])][-300:]
  return {'kind':'backtest','x_unit':'trades','y_unit':'money' if money else 'R','target':None,'fan_chart':rows,'trades':trades,'money':money and {k:v for k,v in money.items() if k!='curve'},
   'band_label':('line = balance' if money else 'line = equity in R')+'  ·  shaded = drawdown  ·  bars = each trade (green win, red loss)',
-  'assumptions':{'strategy':stats.get('strategy'),'instrument':str(stats.get('requested') or stats.get('instrument') or '').upper(),'interval':stats.get('interval'),'reward_to_risk':(stats.get('settings') or {}).get('reward_to_risk'),'period':stats.get('period')},
+  'assumptions':{'strategy':stats.get('strategy'),'instrument':str(stats.get('requested') or stats.get('instrument') or '').upper(),'interval':stats.get('interval'),'reward_to_risk':(stats.get('settings') or {}).get('reward_to_risk'),'period':stats.get('period'),'window_note':stats.get('window_note')},
   'stats':{k:stats.get(k) for k in ('closed_trades','wins','losses','win_rate_percent','total_r','average_r_per_trade','profit_factor','max_drawdown_r','longest_losing_streak')},
   'limits':stats.get('assumptions','Past results do not predict future ones.'),'created':datetime.now(timezone.utc).isoformat()}
 
@@ -117,6 +117,9 @@ _FMT=lambda v,d=1:'—' if v is None else (f'{v:,.{d}f}' if abs(v)<1e6 else f'{v
 def headline(result):
  """Title, metric cards and a one-line verdict for the holographic display and for JARVIS to say."""
  kind=result.get('kind');a=result.get('assumptions',{});m=[]
+ if kind=='process':
+  from core.process_sim import headline as process_headline
+  return process_headline(result)
  if kind=='comparison':
   inner=headline(result.get('alternative',{}));base=headline(result.get('baseline',{}))
   changed=', '.join(f"{k} {v['baseline']}→{v['alternative']}" for k,v in result.get('changed_assumptions',{}).items()) or 'no assumption changed'
@@ -150,7 +153,7 @@ def headline(result):
    m+=[('MAX DRAWDOWN',f"{st.get('max_drawdown_r') or 0:.1f}R",'red'),('PROFIT FACTOR',_FMT(st.get('profit_factor'),2),'pri')]
   name=str(a.get('strategy') or 'strategy').replace('_',' ');inst=a.get('instrument') or ''
   return {'title':f"BACKTEST · {name.upper()} · {inst} {a.get('interval') or ''}".strip(),'metrics':m,
-   'verdict':f"{st.get('closed_trades',0)} trades at 1:{a.get('reward_to_risk') or '?'} from {(a.get('period') or ['?'])[0][:10]} to {(a.get('period') or ['?','?'])[-1][:10]}: {st.get('wins',0)} wins, {st.get('losses',0)} losses, {tot:+.2f}R"+(f", net {mo['net_pnl']:+,.2f}" if mo else '')+". Past results; hover a bar for that trade."}
+   'verdict':f"{st.get('closed_trades',0)} trades at 1:{a.get('reward_to_risk') or '?'} from {(a.get('period') or ['?'])[0][:10]} to {(a.get('period') or ['?','?'])[-1][:10]}: {st.get('wins',0)} wins, {st.get('losses',0)} losses, {tot:+.2f}R"+(f", net {mo['net_pnl']:+,.2f}" if mo else '')+"."+(f" Account emptied at trade {mo['account_blown_at_trade']}." if mo and mo.get('account_blown_at_trade') else '')+(' '+a['window_note'] if a.get('window_note') else '')+" Past results; hover a bar for that trade."}
  if kind=='forex':
   m=[('MEDIAN END RATE',_FMT(result.get('terminal_rate_median'),5),'pri'),('5TH–95TH PERCENTILE',f"{_FMT(result.get('terminal_rate_p05'),5)} – {_FMT(result.get('terminal_rate_p95'),5)}",'acc2'),('RUNS BELOW START',f"{result.get('simulated_fraction_below_unshocked_start_percent',0):.0f}%",'dim'),('P95 MAX DRAWDOWN',f"{result.get('p95_path_max_drawdown_percent',0):.1f}%",'red')]
   return {'title':'FOREX PATHS','metrics':m,'verdict':f"Over {a.get('trading_days')} trading days the median path ends at {_FMT(result.get('terminal_rate_median'),5)}; one run in twenty ends below {_FMT(result.get('terminal_rate_p05'),5)}."}
@@ -166,8 +169,11 @@ def headline(result):
 
 def run(kind,parameters):
  if not isinstance(parameters,dict):raise ValueError('Provide a parameter object.')
+ if kind=='process':
+  from core.process_sim import simulate
+  result=simulate(parameters);result['created']=datetime.now(timezone.utc).isoformat();return result
  functions={'forex':forex,'trade_stress':trade_stress,'outage':outage,'goal':goal,'savings':savings}
- if kind not in functions:raise ValueError('Choose forex, trade_stress, outage, goal or savings.')
+ if kind not in functions:raise ValueError('Choose forex, trade_stress, outage, goal, savings or process.')
  import inspect
  accepted=inspect.signature(functions[kind]).parameters
  ignored=sorted(k for k in parameters if k not in accepted)
@@ -178,7 +184,7 @@ def run(kind,parameters):
  result['created']=datetime.now(timezone.utc).isoformat();return result
 
 def save(result):
- if not isinstance(result,dict) or result.get('kind') not in ('forex','trade_stress','outage','goal','savings','backtest','comparison'):raise ValueError('Run a scenario first.')
+ if not isinstance(result,dict) or result.get('kind') not in ('forex','trade_stress','outage','goal','savings','backtest','process','comparison'):raise ValueError('Run a scenario first.')
  REPORTS.mkdir(parents=True,exist_ok=True,mode=0o700);path=REPORTS/('scenario-'+uuid.uuid4().hex[:12]+'.json')
  write_file(path,json.dumps(result,ensure_ascii=False,allow_nan=False,indent=2));return str(path)
 

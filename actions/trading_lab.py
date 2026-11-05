@@ -4,6 +4,48 @@ import json
 from core import outcome
 
 
+def run_backtest(p):
+    """A backtest from tool parameters: the window, history range, money and strategy settings. Raw stats."""
+    p = dict(p)
+    import time as _time
+    hours = float(p.get('past_days') or 0) * 24 or float(p.get('past_hours') or 0)
+    from_time = int(_time.time() - hours * 3600) if hours else None
+    if hours and not p.get('range') and not p.get('csv_path'):
+        # enough history for the window plus room for swings to form before it
+        need = hours / 24 + 3
+        p['range'] = next(r for r, d in (('5d', 5), ('1mo', 30), ('3mo', 90), ('6mo', 180), ('1y', 365),
+                                         ('2y', 730), ('5y', 1825), ('max', 1e9)) if d >= need)
+        interval = p.get('interval', '1h')
+        if interval == '1m' and need > 7:
+            raise ValueError('1-minute data only goes back about 7 days; use 5m or higher for longer tests.')
+        # Yahoo serves intraday candles below 1h for about 60 days, 1h/4h for about 2 years
+        if interval in ('2m', '5m', '15m', '30m') and p['range'] not in ('5d', '1mo'):
+            p['range'] = '1mo'
+        elif interval in ('1h', '4h') and p['range'] in ('5y', 'max'):
+            p['range'] = '2y'
+    from core import trading_lab as lab
+    data = lab.load(p)
+    clipped = None
+    if from_time and data['candles'] and data['candles'][0]['t'] > from_time + 86400:
+        have = (data['candles'][-1]['t'] - data['candles'][0]['t']) / 86400
+        clipped = (f"Asked for the past {hours / 24:.0f} days, but {p.get('interval', '1h')} candles only go back "
+                   f"{have:.0f} days from this data source; the test covers those {have:.0f} days. Use 1h or 4h for longer.")
+    stats = _backtest(lab, data, p, from_time)
+    if clipped:
+        stats['window_note'] = clipped
+    return stats
+
+
+def _backtest(lab, data, p, from_time):
+    return lab.backtest(data, p.get('strategy', 'breaker_retest'), side=p.get('side', 'both'),
+                        rr=p.get('rr', 2.0), max_hold=p.get('max_hold', 0), from_time=from_time,
+                        **{k: p[k] for k in ('account_balance', 'risk_percent', 'risk_amount', 'spread',
+                                             'commission', 'compound') if p.get(k) is not None},
+                        **{k: p[k] for k in ('fast', 'slow', 'length', 'atr_stop', 'oversold', 'overbought',
+                                             'swing_length', 'stop_at', 'sweep_window', 'retest_window')
+                           if p.get(k) is not None})
+
+
 def _show_backtest(data, player):
     """Put a finished backtest on the holographic board and keep it for "show me the simulation"."""
     try:
@@ -79,23 +121,7 @@ def trading_lab(parameters, player=None, **kwargs):
             from core import setup_tracker
             data = setup_tracker.unwatch(p['symbol'], p.get('interval'))
         elif action == 'backtest':
-            import time as _time
-            hours = float(p.get('past_days') or 0) * 24 or float(p.get('past_hours') or 0)
-            from_time = int(_time.time() - hours * 3600) if hours else None
-            if hours and not p.get('range') and not p.get('csv_path'):
-                # enough history for the window plus room for swings to form before it
-                need = hours / 24 + 3
-                p['range'] = next(r for r, d in (('5d', 5), ('1mo', 30), ('3mo', 90), ('6mo', 180), ('1y', 365),
-                                                 ('2y', 730), ('5y', 1825), ('max', 1e9)) if d >= need)
-                if p.get('interval', '1h') in ('1m',) and need > 7:
-                    raise ValueError('1-minute data only goes back about 7 days; use 5m or higher for longer tests.')
-            data = lab.backtest(lab.load(p), p.get('strategy', 'breaker_retest'), side=p.get('side', 'both'),
-                                rr=p.get('rr', 2.0), max_hold=p.get('max_hold', 0), from_time=from_time,
-                                **{k: p[k] for k in ('account_balance', 'risk_percent', 'risk_amount', 'spread',
-                                                     'commission', 'compound') if p.get(k) is not None},
-                                **{k: p[k] for k in ('fast', 'slow', 'length', 'atr_stop', 'oversold', 'overbought',
-                                                     'swing_length', 'stop_at', 'sweep_window', 'retest_window')
-                                   if p.get(k) is not None})
+            data = run_backtest(p)
             data['shown_on_hologram'] = _show_backtest(data, player)
             _trade_table(data, player)
             data.pop('equity_curve_r', None)          # the board has it; keep the spoken payload small
