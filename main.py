@@ -617,6 +617,9 @@ class JarvisLive:
         self._echo                 = EchoGuard()
         from core.voice_interaction import VoiceInterrupt
         self._voice_interrupt = VoiceInterrupt()
+        # Set while JARVIS holds its sentence because the user seems to be
+        # starting to talk; the playback loop waits on it instead of writing.
+        self._barge_pause = threading.Event()
         # `stream.write()` returns when the buffer accepts the audio, not when the
         # speaker has finished with it, so sound is still in the room after the
         # speaking flag drops. Streaming the microphone during that gap is how an
@@ -1222,6 +1225,8 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        self._barge_pause.clear()
+        self._voice_interrupt.reset()
         performance.cancel_response()
         q = self.audio_in_queue
         if q:
@@ -1764,14 +1769,23 @@ class JarvisLive:
             # that a cough or a keystroke cannot trigger it.
             if jarvis_speaking:
                 allowed=not self.ui.muted and not self._phone_active and not self._local_voice.enabled and (not self._ptt_enabled or self._ptt_held)
-                blocks=self._voice_interrupt.feed(indata,SEND_SAMPLE_RATE,_pcm_level(indata),self._echo,allowed)
-                if blocks:
+                action,blocks=self._voice_interrupt.feed(indata,SEND_SAMPLE_RATE,_pcm_level(indata),self._echo,allowed)
+                if action=='pause':
+                    # A voice is starting: stop talking over it while we find out.
+                    self._barge_pause.set()
+                    loop.call_soon_threadsafe(lambda:self.ui.write_log('SYS: Pausing — listening to you...'))
+                elif action=='resume':
+                    self._barge_pause.clear()
+                elif action=='interrupt':
                     def interrupt_and_replay():
                         self.interrupt();self._tail_until=0.0
+                        # What the user said while we were deciding goes to the model, so no words are lost.
                         for data in blocks:
                             enqueue_latest(self.out_queue, {'data':data,'mime_type':'audio/pcm'})
                     loop.call_soon_threadsafe(interrupt_and_replay)
                 return
+            if self._voice_interrupt.paused:
+                self._barge_pause.clear()
             self._voice_interrupt.reset()
 
             # ── Echo tail ────────────────────────────────────────────────────
@@ -2127,9 +2141,9 @@ class JarvisLive:
 
                 # Batch all immediately-available chunks into one write to reduce
                 # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
-                # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
+                # Cap at ~100 ms so a barge-in pause or interrupt is heard quickly.
                 batch = bytearray(chunk)
-                while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
+                while len(batch) < 4800:   # 4800 bytes ≈ 100 ms at 24 kHz / 16-bit mono
                     try:
                         batch.extend(self.audio_in_queue.get_nowait())
                     except asyncio.QueueEmpty:
@@ -2185,6 +2199,18 @@ class JarvisLive:
                 except Exception:
                     pass
 
+                # Barge-in pause: hold this batch (not discard it) until the mic
+                # decides — resume where we stopped, or drop it on interrupt.
+                if self._barge_pause.is_set():
+                    from core.voice_interaction import MAX_PAUSE
+                    held_until = time.monotonic() + MAX_PAUSE + 0.5
+                    while (self._barge_pause.is_set() and not self._interrupted
+                           and time.monotonic() < held_until):
+                        await asyncio.sleep(0.02)
+                    self._barge_pause.clear()
+                    self._play_cursor = 0.0      # mouth timeline restarts with the audio
+                    if self._interrupted:
+                        continue
                 try:
                     await asyncio.wait_for(asyncio.to_thread(stream.write, bytes(batch)), timeout=8)
                     last_write = time.monotonic()

@@ -186,7 +186,7 @@ class MissionPanel(QDialog):
     def _voice_screen(self,box):
         self.info(box,'Use JARVIS’s existing interruption, speech corrections and Fast response profile for natural conversation. Screen co-pilot follows only the target you select in Projects & Workspace, shares changed screenshots with your configured vision service, and offers suggestions while you are idle. It does not click or execute screenshot instructions.')
         from core.voice_interaction import enabled,set_enabled
-        self.voice_interrupt=QCheckBox('Voice interruption (experimental; headphones recommended)');self.voice_interrupt.setChecked(enabled());box.addWidget(self.voice_interrupt)
+        self.voice_interrupt=QCheckBox('Voice interruption: pause when I start talking, stop if I keep talking');self.voice_interrupt.setChecked(enabled());box.addWidget(self.voice_interrupt)
         self.voice_interrupt.toggled.connect(lambda value:self.call(lambda:set_enabled(value)))
         self.button(box,'Open project memory, screen target and routines',self.host._open_work_panel)
         self.button(box,'Analyze selected screen now',lambda:self.send('/screen analyze'))

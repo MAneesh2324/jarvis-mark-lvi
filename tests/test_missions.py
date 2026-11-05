@@ -115,10 +115,35 @@ class InteractionTests(unittest.TestCase):
         gate=voice.VoiceInterrupt();pcm=np.ones(1024,dtype=np.int16)
         echo=Mock(required_blocks=3);echo.is_user_speech.return_value=True
         with patch.object(voice,'enabled',return_value=True):
-            self.assertEqual(gate.feed(pcm,16000,0.2,echo),[]);self.assertEqual(gate.feed(pcm,16000,0.2,echo),[]);self.assertEqual(len(gate.feed(pcm,16000,0.2,echo)),3)
-            self.assertEqual(gate.feed(pcm,16000,0.2,echo,allowed=False),[])
-            echo.is_user_speech.return_value=False;self.assertEqual(gate.feed(pcm,16000,0.2,echo),[])
-        with patch.object(voice,'enabled',return_value=False):self.assertEqual(gate.feed(pcm,16000,0.2,echo),[])
+            self.assertEqual(gate.feed(pcm,16000,0.2,echo,now=0.0)[0],'none')
+            self.assertEqual(gate.feed(pcm,16000,0.2,echo,now=0.07)[0],'pause')
+            action,blocks=gate.feed(pcm,16000,0.2,echo,now=0.14)
+            self.assertEqual((action,len(blocks)),('interrupt',3))
+            self.assertEqual(gate.feed(pcm,16000,0.2,echo,allowed=False)[0],'none')
+            echo.is_user_speech.return_value=False;self.assertEqual(gate.feed(pcm,16000,0.2,echo)[0],'none')
+        with patch.object(voice,'enabled',return_value=False):self.assertEqual(gate.feed(pcm,16000,0.2,echo)[0],'none')
+    def test_voice_pause_resumes_after_a_cough_and_tolerates_syllable_gaps(self):
+        import numpy as np
+        from core import voice_interaction as voice
+        gate=voice.VoiceInterrupt();pcm=np.ones(1024,dtype=np.int16)
+        echo=Mock(required_blocks=6)
+        with patch.object(voice,'enabled',return_value=True):
+            echo.is_user_speech.return_value=True
+            gate.feed(pcm,16000,0.2,echo,now=0.0);self.assertEqual(gate.feed(pcm,16000,0.2,echo,now=0.07)[0],'pause')
+            echo.is_user_speech.return_value=False   # a cough: then quiet
+            self.assertEqual(gate.feed(pcm,16000,0.2,echo,now=0.4)[0],'none')
+            self.assertEqual(gate.feed(pcm,16000,0.2,echo,now=0.8)[0],'resume')
+            self.assertFalse(gate.paused)
+            # Speech with short gaps between syllables still adds up to an interruption.
+            seq=[True,True,False,True,False,False,True,True,True]
+            actions=[]
+            for n,v in enumerate(seq):
+                echo.is_user_speech.return_value=v;actions.append(gate.feed(pcm,16000,0.2,echo,now=2+n*0.064)[0])
+            self.assertIn('pause',actions);self.assertEqual(actions[-1],'interrupt')
+    def test_voice_interruption_is_on_by_default(self):
+        from core import voice_interaction as voice
+        with patch.object(voice,'CONFIG',Path('/nonexistent/voice-interaction.json')),patch.object(voice,'_enabled',None):
+            self.assertTrue(voice.enabled())
     def test_browser_typing_checks_observed_value_and_never_claims_mismatch_success(self):
         import asyncio
         from unittest.mock import AsyncMock
