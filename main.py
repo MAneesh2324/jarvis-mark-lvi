@@ -2483,6 +2483,13 @@ class JarvisLive:
                         self.set_speaking(False)
                     continue
 
+                if getattr(self.ui, 'voice_muted', False):
+                    # JARVIS's voice is muted: the reply is shown as text, nothing is played, and the
+                    # microphone stays open because there is no echo to guard against
+                    if self._is_speaking:
+                        self.set_speaking(False)
+                    continue
+
                 self.set_speaking(True)
 
                 # Batch all immediately-available chunks into one write to reduce

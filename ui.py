@@ -4438,6 +4438,7 @@ class MainWindow(QMainWindow):
     _state_sig      = pyqtSignal(str)
     _hand_gesture_sig = pyqtSignal(object)
     _gesture_control_sig = pyqtSignal(str)
+    _voice_mute_sig = pyqtSignal(bool)
     _portable_sig = pyqtSignal()
     _camera_permission_sig = pyqtSignal()
     _screen_permission_sig = pyqtSignal()
@@ -4734,6 +4735,7 @@ class MainWindow(QMainWindow):
         self._portable_sig.connect(self._open_portable_memory)
         self._hand_gesture_sig.connect(self._apply_hand_gesture)
         self._gesture_control_sig.connect(self._gesture_control)
+        self._voice_mute_sig.connect(self._set_voice_muted)
         self._screen_permission_sig.connect(self._show_screen_permissions)
         self._camera_permission_sig.connect(self._show_camera_permissions)
         self._reconfig_sig.connect(self._show_setup)
@@ -4768,6 +4770,8 @@ class MainWindow(QMainWindow):
 
         sc_mute = QShortcut(QKeySequence("F4"), self)
         sc_mute.activated.connect(self._toggle_mute)
+        sc_voice = QShortcut(QKeySequence("F5"), self)
+        sc_voice.activated.connect(self._toggle_voice_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
@@ -5697,6 +5701,17 @@ class MainWindow(QMainWindow):
         self._mute_btn.clicked.connect(self._toggle_mute)
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
+
+        # JARVIS's own voice: muted, it still listens and works, and replies appear here as text
+        self._voice_muted = False
+        self._voice_btn = QPushButton("🔊  JARVIS VOICE ON")
+        self._voice_btn.setFixedHeight(30)
+        self._voice_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._voice_btn.setToolTip("Mute JARVIS's voice (F5). It keeps listening and replies in the activity log.")
+        self._voice_btn.clicked.connect(self._toggle_voice_mute)
+        self._style_voice_btn()
+        lay.addWidget(self._voice_btn)
 
         return w
 
@@ -6690,7 +6705,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[F4] Mute mic  ·  [F5] Mute JARVIS  ·  [F11] Fullscreen"))
         lay.addStretch()
         lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
         return w
@@ -7362,6 +7377,39 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ background: #001f10; }}
             """)
 
+    def _toggle_voice_mute(self):
+        self._set_voice_muted(not self._voice_muted)
+
+    def _set_voice_muted(self, muted: bool):
+        muted = bool(muted)
+        if muted == self._voice_muted:
+            return
+        self._voice_muted = muted
+        self._style_voice_btn()
+        self._log.append_log("SYS: JARVIS's voice muted. I'm still listening; my replies will appear here."
+                             if muted else "SYS: JARVIS's voice is back on.")
+        if muted and self.on_interrupt and self.hud.speaking:
+            self.on_interrupt()                  # stop the sentence that is playing now
+
+    def _style_voice_btn(self):
+        if self._voice_muted:
+            self._voice_btn.setText("🔇  JARVIS VOICE MUTED")
+            self._voice_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #140006; color: {C.MUTED_C};
+                    border: 1px solid {C.MUTED_C}; border-radius: 3px;
+                }}
+            """)
+        else:
+            self._voice_btn.setText("🔊  JARVIS VOICE ON")
+            self._voice_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #00101a; color: {C.PRI};
+                    border: 1px solid {C.PRI}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ background: #001a26; }}
+            """)
+
     def _send(self):
         txt = self._input.text().strip()
         if not txt: return
@@ -7442,6 +7490,15 @@ class JarvisUI:
     def muted(self, v: bool):
         if v != self._win._muted:
             self._win._toggle_mute()
+
+    @property
+    def voice_muted(self) -> bool:
+        """JARVIS's own voice is muted: it listens and works, replies show as text. Read from any thread."""
+        return bool(getattr(self._win, '_voice_muted', False))
+
+    def set_voice_muted(self, muted: bool) -> None:
+        """Thread-safe: mute or unmute JARVIS's voice."""
+        self._win._voice_mute_sig.emit(bool(muted))
 
     @property
     def current_file(self) -> str | None:
