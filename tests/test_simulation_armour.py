@@ -225,5 +225,39 @@ class ArmourCommands(unittest.TestCase):
         self.assertIn('never-send', out)
 
 
+class ShowAndLab(unittest.TestCase):
+    def test_stray_parameter_no_longer_cancels_the_run(self):
+        from core.scenario_simulator import run
+        r = run('trade_stress', {'equity': 10000, 'pair_start': 1.1, 'pair_move_percent': 1, 'quote_to_account': 1,
+                                 'units': 20000, 'rr': 2})              # the exact call that failed in the live app
+        self.assertEqual(r['ignored_parameters'], ['rr'])
+        with self.assertRaisesRegex(ValueError, 'total_hours'):
+            run('goal', {'hours_per_day': 3})
+
+    def test_show_last_replays_or_demos(self):
+        import core.scenario_simulator as sim
+        from actions.scenario_simulator import simulate
+        with tempfile.TemporaryDirectory() as tmp, patch.object(sim, 'LAST', Path(tmp) / 'last.json'), \
+                patch.object(sim, 'REPORTS', Path(tmp)):
+            ui = MagicMock()
+            out = simulate({}, player=ui)                                # nothing run yet → demo
+            self.assertIn('demo', out)
+            simulate({'kind': 'goal', 'parameters_json': json.dumps({'total_hours': 40, 'hours_per_day': 2})}, player=ui)
+            out = simulate({'show_last': True}, player=ui)
+            self.assertIn('last simulation', out)
+            self.assertEqual(ui.show_simulation.call_args[0][0]['assumptions']['total_hours'], 40)
+
+    def test_open_lab_starts_the_window_process(self):
+        import actions.scenario_simulator as act
+        proc = MagicMock()
+        proc.poll.return_value = None
+        with patch('subprocess.Popen', return_value=proc) as popen, patch('time.sleep'):
+            act._lab = None
+            out = act.simulate({'open_lab': True})
+        self.assertIn('simulation_live.py', popen.call_args[0][0][1])
+        self.assertIn('opened', out)
+        act._lab = None
+
+
 if __name__ == '__main__':
     unittest.main()

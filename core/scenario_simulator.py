@@ -5,6 +5,7 @@ import json,math,uuid
 import numpy as np
 from core.mission_store import write_file
 REPORTS=Path(__file__).resolve().parent.parent/'memory'/'scenarios'
+LAST=REPORTS/'last-shown.json'
 def number(value,name,low=None,high=None):
  try:result=float(value)
  except (ValueError,TypeError):raise ValueError(name+' must be a finite number.')
@@ -136,8 +137,13 @@ def run(kind,parameters):
  if not isinstance(parameters,dict):raise ValueError('Provide a parameter object.')
  functions={'forex':forex,'trade_stress':trade_stress,'outage':outage,'goal':goal,'savings':savings}
  if kind not in functions:raise ValueError('Choose forex, trade_stress, outage, goal or savings.')
- try:result=functions[kind](**parameters)
- except TypeError:raise ValueError('Missing or unsupported scenario parameters.') from None
+ import inspect
+ accepted=inspect.signature(functions[kind]).parameters
+ ignored=sorted(k for k in parameters if k not in accepted)
+ missing=[k for k,v in accepted.items() if v.default is inspect.Parameter.empty and k not in parameters]
+ if missing:raise ValueError(f'{kind} needs: '+', '.join(missing)+'.')
+ result=functions[kind](**{k:v for k,v in parameters.items() if k in accepted})
+ if ignored:result['ignored_parameters']=ignored     # a stray model key must not cancel the whole run
  result['created']=datetime.now(timezone.utc).isoformat();return result
 
 def save(result):
@@ -150,3 +156,17 @@ def compare(kind,baseline,alternative):
     changed={k:{'baseline':baseline.get(k),'alternative':v} for k,v in alternative.items() if baseline.get(k)!=v}
     metrics={k:{'baseline':a[k],'alternative':b[k],'difference':b[k]-a[k]} for k in a if isinstance(a[k],(int,float)) and not isinstance(a[k],bool) and isinstance(b.get(k),(int,float)) and not isinstance(b[k],bool)}
     return {'kind':'comparison','scenario_kind':kind,'changed_assumptions':changed,'metrics':metrics,'baseline':a,'alternative':b,'limits':'Both runs are hypothetical and conditional on their assumptions. Using the same random seed improves controlled comparison; it does not establish real-world probabilities.'}
+
+
+def remember(result):
+ """Keep the last result so "show me the simulation again" works, also after a restart."""
+ try:REPORTS.mkdir(parents=True,exist_ok=True,mode=0o700);write_file(LAST,json.dumps(result,ensure_ascii=False,allow_nan=False))
+ except Exception:pass
+
+def last():
+ try:return json.loads(LAST.read_text())
+ except (OSError,ValueError):return None
+
+def demo():
+ """Something to show when nothing has been simulated yet: a study plan vs one more hour a day."""
+ return compare('goal',{'total_hours':300,'hours_per_day':3,'consistency_percent':80,'deadline_days':150},{'hours_per_day':4})
