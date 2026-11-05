@@ -195,5 +195,24 @@ class Animations(unittest.TestCase):
         self.assertIsNone(reaction('open the chart'))
 
 
+class Speed(unittest.TestCase):
+    def test_expressions_never_hold_up_speech(self):
+        from core import action_loader as al
+        reg = al.discover_actions(Path(__file__).resolve().parent.parent / 'actions', logger=lambda m: None)
+        self.assertTrue(reg.has('face_expression'))
+        self.assertEqual(reg.scheduling('face_expression'), 'SILENT')
+        decl = [d for d in reg.get_tool_declarations() if d.get('name') == 'face_expression'][0]
+        self.assertEqual(decl.get('behavior'), 'NON_BLOCKING')
+        from actions.companion import TOOL
+        self.assertNotIn('express', TOOL['parameters']['properties']['action']['enum'])
+
+    def test_face_follows_jarvis_own_words(self):
+        from core.companion import reply_reaction
+        self.assertEqual(reply_reaction('Congratulations, that is a proper win.'), 'smile')
+        self.assertEqual(reply_reaction("I'm sorry, that's a rough one."), 'sigh')
+        self.assertEqual(reply_reaction('Let me check the chart.'), 'think')
+        self.assertIsNone(reply_reaction('The file is in Downloads.'))
+
+
 if __name__ == '__main__':
     unittest.main()

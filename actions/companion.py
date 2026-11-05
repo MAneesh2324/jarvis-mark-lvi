@@ -4,20 +4,12 @@ import json
 from core import outcome
 
 
-def companion(parameters, player=None, **kwargs):
+def companion(parameters, **kwargs):
     p = dict(parameters or {})
     action = p.get('action', 'status')
     try:
         from core import companion as co
         heart = co.instance()
-        if action == 'express':
-            from core.avatar import EXPRESSIONS
-            name = str(p.get('expression') or '').lower()
-            if name not in EXPRESSIONS:
-                raise ValueError('Expression must be one of: ' + ', '.join(EXPRESSIONS))
-            if player is None or not hasattr(player, 'express') or not player.express(name):
-                raise ValueError('The face is not showing right now.')
-            return outcome.done('companion', expression=name, note='Played on your face. Do not describe it unless asked.')
         if action in ('status', 'feelings'):
             data = heart.status()
         elif action == 'focus_start':
@@ -51,18 +43,14 @@ TOOL = {
         'focus minutes today and the streak — use it when asked "how are you feeling", "what are my goals", "how much '
         'did I focus". focus_start: start a focus session (task, minutes; default 25) when the user wants to concentrate, '
         'is procrastinating, or says they cannot focus — a countdown ring shows on the face and non-urgent notifications '
-        'wait. focus_stop: end it early. focus_status. add_goal / remove_goal (goal): goals JARVIS uses to motivate them. '
-        'express (expression): play an animated expression on your own face — nod, shake, brow_flash, smile, laugh, wink, '
-        'surprise, sigh, think, tilt — when the user asks you to, or now and then when it truly fits the moment.'
+        'wait. focus_stop: end it early. focus_status. add_goal / remove_goal (goal): goals JARVIS uses to motivate them.'
     ),
     'brief': 'JARVIS\'s feelings, the user\'s goals and wins, focus sessions.',
     'parameters': {
         'type': 'OBJECT',
         'properties': {
             'action': {'type': 'STRING', 'enum': ['status', 'feelings', 'focus_start', 'focus_stop', 'focus_status',
-                                                  'add_goal', 'remove_goal', 'express']},
-            'expression': {'type': 'STRING', 'enum': ['nod', 'shake', 'brow_flash', 'smile', 'laugh', 'wink', 'surprise',
-                                                      'sigh', 'think', 'tilt']},
+                                                  'add_goal', 'remove_goal']},
             'task': {'type': 'STRING'},
             'minutes': {'type': 'INTEGER'},
             'goal': {'type': 'STRING'},

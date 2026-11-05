@@ -100,6 +100,26 @@ def reaction(text: str) -> str | None:
     return None
 
 
+# the face answering JARVIS's own words as it says them (no tool call, so speech is never delayed)
+REPLY_REACT = [
+    (re.compile(r"\b(ha(ha)+|ha ha)\b", re.I), 'laugh'),
+    (re.compile(r"\b(congratulations|well done|great (job|work|news)|proper win|i'?m (so )?(glad|proud|happy)|wonderful|excellent|brilliant)\b", re.I), 'smile'),
+    (re.compile(r"\b(i'?m (so )?sorry|sorry to hear|that'?s (rough|hard|tough|a shame)|that must (be|have been) hard)\b", re.I), 'sigh'),
+    (re.compile(r"\b(really\?|wow|whoa|remarkable|impressive|no way)\b", re.I), 'surprise'),
+    (re.compile(r"\b(let me (think|check|see|look)|hmm+|one moment)\b", re.I), 'think'),
+    (re.compile(r"^\s*(good (morning|afternoon|evening)|hello|welcome back)\b", re.I), 'brow_flash'),
+    (re.compile(r"^\s*(yes|indeed|certainly|of course|absolutely|right away|done)\b", re.I), 'nod'),
+]
+
+
+def reply_reaction(text: str) -> str | None:
+    """The expression JARVIS's face makes while saying this, or None."""
+    for rx, name in REPLY_REACT:
+        if rx.search(text or ''):
+            return name
+    return None
+
+
 HELPLINES = ('Tele-MANAS 14416 or 1-800-891-4416 (India, free, 24x7), KIRAN 1800-599-0019, '
              'or 112 for immediate danger')
 

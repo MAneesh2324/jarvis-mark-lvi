@@ -1326,6 +1326,20 @@ class JarvisLive:
                 pass
         self.ui.write_log("SYS: Interrupted — listening...")
 
+    def _face_from_reply(self, chunk: str):
+        """JARVIS's face reacts to its own words as they are spoken: pure string work, no tool call."""
+        try:
+            now = time.monotonic()
+            if now - getattr(self, '_face_said_at', 0.0) < 3.0 or not hasattr(self.ui, 'express'):
+                return
+            from core.companion import reply_reaction
+            face = reply_reaction(chunk)
+            if face:
+                self._face_said_at = now
+                self.ui.express(face, 0.8)
+        except Exception:
+            pass
+
     # ── wellbeing, owner recognition, phone link, notifications ─────────────
     async def _after_user_turn(self, text: str):
         notes = []
@@ -2285,6 +2299,7 @@ class JarvisLive:
                                 # alone cannot show. Pure string work — it adds
                                 # nothing measurable to the response path.
                                 self._visemes.feed_text(txt)
+                                self._face_from_reply(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
