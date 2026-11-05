@@ -97,3 +97,7 @@ memory/restore-work/
 
 # Persistent provider quota cooldowns
 memory/provider-cooldowns.json
+
+# Personal runtime data written by the news and trading tools
+memory/news-interests.json
+memory/trading-playbook-user.json

@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "note": "Educational reference for chart reading. Definitions vary between traders; every rule here is a starting point to test, not a guarantee. Detectors named in 'detector' are what trading_lab analyse can find automatically on candle data.",
+  "entries": [
+    {
+      "id": "market_structure",
+      "name": "Market structure (HH, HL, LH, LL)",
+      "kind": "concept",
+      "aliases": ["structure", "trend", "higher high", "lower low", "swing"],
+      "definition": "Price moves in swings. An uptrend prints higher highs (HH) and higher lows (HL); a downtrend prints lower highs (LH) and lower lows (LL). Swing points are local extremes confirmed by several candles on each side.",
+      "identify": ["Mark confirmed swing highs and lows (a fractal with N candles each side).", "Compare each swing high with the previous swing high and each swing low with the previous swing low.", "Read structure on the higher timeframe first, then the execution timeframe."],
+      "mistakes": ["Labelling unconfirmed swings that the next candles erase.", "Mixing timeframes so a 5-minute pullback looks like a daily reversal."],
+      "detector": "structure"
+    },
+    {
+      "id": "bos_choch",
+      "name": "Break of structure (BOS) and change of character (CHoCH)",
+      "kind": "concept",
+      "aliases": ["bos", "choch", "mss", "market structure shift", "break of structure", "change of character"],
+      "definition": "A BOS is a candle close beyond the last swing in the direction of the trend (continuation). A CHoCH is the first close beyond the last swing against the trend, the first sign the trend may be turning.",
+      "identify": ["In an uptrend, a close above the last swing high is a bullish BOS.", "In an uptrend, a close below the last higher low is a bearish CHoCH.", "Prefer closes over wicks; a wick through and close back inside is a liquidity sweep, not a break."],
+      "mistakes": ["Treating every wick as a break.", "Trading a CHoCH on a low timeframe straight into a higher-timeframe level."],
+      "detector": "structure"
+    },
+    {
+      "id": "order_block",
+      "name": "Order block",
+      "kind": "concept",
+      "aliases": ["ob", "order block", "bullish order block", "bearish order block"],
+      "definition": "The last opposite-coloured candle before an impulsive move that breaks structure. A bullish order block is the last down candle before a rally that breaks a swing high; a bearish order block is the last up candle before a drop that breaks a swing low.",
+      "identify": ["Find a structure break with a strong displacement candle.", "Walk back to the extreme of the move and take the last opposite candle there.", "The zone is that candle's high to low; many traders refine it to open-to-wick."],
+      "entry": "Limit order at the zone edge on the first return, in the direction of the break.",
+      "stop": "Beyond the far side of the zone.",
+      "invalidation": "A candle close through the far side of the zone. That failed order block becomes a breaker block.",
+      "mistakes": ["Marking order blocks that did not cause a structure break.", "Using an order block that has already been revisited several times."],
+      "detector": "order_blocks"
+    },
+    {
+      "id": "breaker_block",
+      "name": "Breaker block",
+      "kind": "concept",
+      "aliases": ["breaker", "breaker block", "breakers", "failed order block", "bearish breaker", "bullish breaker"],
+      "definition": "An order block that failed. When price closes through a bullish order block, that zone flips into a bearish breaker (expected resistance). When price closes through a bearish order block, it becomes a bullish breaker (expected support). The idea is that traders trapped in the failed zone exit on the return, adding to the new direction.",
+      "identify": ["Find a valid order block (it caused a structure break).", "Wait for a candle to close beyond its far side, ideally with a structure break the other way.", "The old order block range is now the breaker zone; mark when price first returns to it."],
+      "entry": "Bearish breaker: sell on the first retest of the zone (limit at zone low or after a rejection candle inside it). Bullish breaker: mirror.",
+      "stop": "A buffer beyond the far edge of the breaker zone (for a bearish breaker, above the zone high).",
+      "target": "The next opposing liquidity (an untaken swing low for sells) or a fixed 2R to 3R.",
+      "invalidation": "A candle close back through the far side of the breaker zone.",
+      "confluence": ["Breaker overlaps a higher-timeframe key level.", "A liquidity sweep happened just before the break.", "Fair value gap inside or next to the breaker.", "Breaker sits in the premium half of the range for sells (discount half for buys)."],
+      "mistakes": ["Trading the third or fourth retest; the first is the cleanest.", "Taking a bearish breaker in a strong higher-timeframe uptrend without other confluence."],
+      "detector": "breakers"
+    },
+    {
+      "id": "mitigation_block",
+      "name": "Mitigation block",
+      "kind": "concept",
+      "aliases": ["mitigation", "mitigation block"],
+      "definition": "Similar to a breaker, but the failed swing did not take liquidity first (no new high or low before the reversal). Price returns to the zone where earlier positions were opened, letting those traders exit at breakeven.",
+      "identify": ["A failed swing that did not make a new extreme.", "A structure break through the origin of that swing.", "The origin candle range is the mitigation zone."],
+      "mistakes": ["Calling every retest a mitigation block without a structure break."],
+      "detector": "breakers"
+    },
+    {
+      "id": "fair_value_gap",
+      "name": "Fair value gap (FVG) / imbalance",
+      "kind": "concept",
+      "aliases": ["fvg", "imbalance", "fair value gap", "inefficiency", "gap"],
+      "definition": "A three-candle pattern where the first candle's high and third candle's low do not overlap (bullish) or the first candle's low and third candle's high do not overlap (bearish). The untraded space often gets revisited.",
+      "identify": ["Bullish FVG: low of candle 3 above high of candle 1.", "Bearish FVG: high of candle 3 below low of candle 1.", "Ignore tiny gaps; compare the size with ATR."],
+      "entry": "Limit inside the gap (often the 50% level) in the direction of the displacement.",
+      "stop": "Beyond the candle that created the gap.",
+      "mistakes": ["Trading gaps against the higher-timeframe trend.", "Assuming every gap must fill."],
+      "detector": "fvgs"
+    },
+    {
+      "id": "liquidity",
+      "name": "Liquidity, equal highs/lows and sweeps",
+      "kind": "concept",
+      "aliases": ["liquidity", "sweep", "stop hunt", "equal highs", "equal lows", "eqh", "eql", "buy side liquidity", "sell side liquidity", "bsl", "ssl", "liquidity grab"],
+      "definition": "Stop orders cluster above swing highs (buy-side liquidity) and below swing lows (sell-side liquidity). Equal highs or lows are obvious pools. A sweep is a wick through the pool and a close back inside, often before a reversal.",
+      "identify": ["Mark swing highs/lows and equal highs/lows (within a small ATR tolerance).", "A sweep: high above the level, close back below it (bearish), or the mirror.", "Strongest when followed by a structure break in the opposite direction."],
+      "mistakes": ["Calling a clean breakout and close beyond the level a sweep."],
+      "detector": "sweeps"
+    },
+    {
+      "id": "key_levels",
+      "name": "Key levels: support, resistance and S/R flip",
+      "kind": "concept",
+      "aliases": ["support", "resistance", "key level", "key levels", "s/r", "sr flip", "level", "zone", "supply", "demand", "supply and demand"],
+      "definition": "Prices where several swings turned. Treat them as zones, not lines. A broken resistance that is retested from above often acts as support (and the reverse).",
+      "identify": ["Cluster swing highs and lows that sit within a fraction of ATR of each other.", "More touches and more recent touches make a stronger level.", "Use daily and 4-hour levels for direction, lower timeframes for entries."],
+      "mistakes": ["Drawing a level for every candle.", "Expecting the exact price to hold; levels are areas."],
+      "detector": "key_levels"
+    },
+    {
+      "id": "premium_discount",
+      "name": "Premium, discount and optimal trade entry (OTE)",
+      "kind": "concept",
+      "aliases": ["premium", "discount", "equilibrium", "ote", "fibonacci", "fib", "golden zone", "retracement"],
+      "definition": "Split the current dealing range (swing low to swing high) at 50%. Above is premium (better for selling), below is discount (better for buying). The OTE zone is the 62% to 79% retracement of the impulse leg.",
+      "identify": ["Pick the last significant swing range on the trading timeframe.", "Sell setups are preferred in premium, buy setups in discount.", "Overlap of OTE with an order block, breaker or FVG adds confluence."],
+      "mistakes": ["Drawing the range on random swings so every price is 'premium'."],
+      "detector": "summary"
+    },
+    {
+      "id": "sessions",
+      "name": "Trading sessions and kill zones",
+      "kind": "concept",
+      "aliases": ["session", "london", "new york", "asia", "kill zone", "killzone", "london open", "ny open"],
+      "definition": "Forex volume concentrates in the London (about 07:00-10:00 UK time) and New York (about 13:00-16:00 UK time) opens. The Asian range often forms liquidity that London sweeps.",
+      "identify": ["Mark the Asian session high and low.", "Watch for a sweep of one side during London, then a structure break the other way."],
+      "mistakes": ["Ignoring daylight-saving shifts when converting session times."]
+    },
+    {
+      "id": "multi_timeframe",
+      "name": "Multi-timeframe analysis",
+      "kind": "concept",
+      "aliases": ["mtf", "top down", "higher timeframe", "htf", "ltf", "timeframe"],
+      "definition": "Read direction and key zones on a higher timeframe (daily/4H), then wait for a confirming structure break on a lower timeframe (15m/5m) inside that zone.",
+      "identify": ["HTF: trend and the zone you will trade from.", "LTF: CHoCH or BOS in your direction inside the HTF zone.", "Entry on the LTF order block, breaker or FVG created by that break."],
+      "mistakes": ["Letting a low timeframe signal override a clear higher-timeframe level."]
+    },
+    {
+      "id": "candlestick_patterns",
+      "name": "Candlestick patterns",
+      "kind": "concept",
+      "aliases": ["candle", "candlestick", "engulfing", "pin bar", "hammer", "shooting star", "doji", "inside bar", "morning star", "evening star"],
+      "definition": "Single and multi-candle shapes that show rejection or momentum. Engulfing: the body fully covers the previous body. Pin bar/hammer/shooting star: long wick at least twice the body. Doji: almost no body. Inside bar: range inside the previous candle. Morning/evening star: three-candle reversal.",
+      "identify": ["Only weight a pattern when it forms at a key level, breaker, order block or after a sweep.", "Bearish engulfing or shooting star at resistance supports sells."],
+      "mistakes": ["Trading candle patterns in the middle of a range with no level behind them."],
+      "detector": "candles"
+    },
+    {
+      "id": "chart_patterns",
+      "name": "Classic chart patterns",
+      "kind": "concept",
+      "aliases": ["double top", "double bottom", "head and shoulders", "inverse head and shoulders", "triangle", "ascending triangle", "descending triangle", "symmetrical triangle", "wedge", "flag", "pennant", "pattern"],
+      "definition": "Shapes formed by swing points. Double top/bottom: two similar extremes with a neckline between. Head and shoulders: a higher middle peak between two similar shoulders. Triangles: converging trendlines; ascending has flat highs and rising lows, descending has falling highs and flat lows.",
+      "identify": ["The pattern is only confirmed by a close through the neckline or the triangle boundary.", "Measured move: pattern height projected from the breakout point."],
+      "mistakes": ["Entering before the neckline breaks.", "Forcing patterns onto noisy swings."],
+      "detector": "chart_patterns"
+    },
+    {
+      "id": "divergence",
+      "name": "RSI divergence",
+      "kind": "concept",
+      "aliases": ["divergence", "rsi divergence", "bearish divergence", "bullish divergence", "hidden divergence"],
+      "definition": "Regular bearish divergence: price makes a higher high while RSI makes a lower high, showing fading momentum. Regular bullish divergence is the mirror at lows.",
+      "identify": ["Compare RSI values at two consecutive confirmed swing highs (or lows)."],
+      "mistakes": ["Shorting every divergence in a strong trend; wait for a structure break."],
+      "detector": "divergences"
+    },
+    {
+      "id": "indicators",
+      "name": "Common indicators (EMA, RSI, ATR, MACD)",
+      "kind": "concept",
+      "aliases": ["ema", "moving average", "sma", "rsi", "atr", "macd", "indicator"],
+      "definition": "EMA: trend filter (price above a rising 200 EMA = bullish bias). RSI(14): momentum, 70/30 extremes. ATR(14): average range, used for stop distance and to size zones. MACD: difference of 12 and 26 EMAs with a 9 signal line.",
+      "identify": ["Use indicators as filters for price-action setups rather than as the whole strategy."],
+      "detector": "summary"
+    },
+    {
+      "id": "risk_management",
+      "name": "Risk management and R-multiples",
+      "kind": "concept",
+      "aliases": ["risk", "risk management", "r multiple", "rr", "risk reward", "stop loss", "drawdown", "position size", "lot size"],
+      "definition": "Risk a fixed small percentage per trade (commonly 0.5% to 1%). Measure results in R, where 1R is the amount risked. A 40% win rate is profitable at an average win of 2R.",
+      "identify": ["Expectancy = win rate x average win R - loss rate x average loss R.", "Position size = account risk / (stop distance x value per unit).", "Cap daily loss and stop trading after it is hit."],
+      "mistakes": ["Moving the stop further away once in a trade.", "Increasing size after losses."]
+    },
+    {
+      "id": "journaling",
+      "name": "Trade journaling and review",
+      "kind": "concept",
+      "aliases": ["journal", "review", "backtest", "backtesting", "forward test"],
+      "definition": "Record every setup with screenshot, reason, R result and mistakes. Backtest rules on history, then forward test on demo before risking money.",
+      "identify": ["Track results per setup type to find which one actually pays.", "Need at least 30 to 50 trades per setup before trusting its statistics."],
+      "detector": "backtest"
+    },
+    {
+      "id": "strategy_breaker_retest",
+      "name": "Strategy: breaker block retest (sell or buy)",
+      "kind": "strategy",
+      "aliases": ["breaker retest", "breaker strategy", "breaker sell", "sell breaker"],
+      "definition": "Trade the first return to a fresh breaker block in the direction of the structure break that created it.",
+      "rules": ["1. Higher timeframe: note trend and key levels.", "2. Find a liquidity sweep of a swing high (for sells), then a bearish structure break that closes through the last bullish order block.", "3. That order block is now a bearish breaker. Mark the zone.", "4. Enter short on the first retest of the zone (limit at zone low, or wait for a bearish rejection candle inside it).", "5. Stop above the zone high plus a small buffer (about 0.1 ATR).", "6. Target the next untaken swing low or 2R; move to breakeven at 1R if you manage actively."],
+      "invalidation": "Close above the breaker zone high.",
+      "best_with": ["Breaker overlapping a key level or premium zone.", "Bearish candle pattern on the retest.", "Lower-timeframe CHoCH inside the zone."],
+      "backtest": "breaker_retest",
+      "pine": "breaker_retest"
+    },
+    {
+      "id": "strategy_sweep_reversal",
+      "name": "Strategy: liquidity sweep reversal",
+      "kind": "strategy",
+      "aliases": ["sweep reversal", "stop hunt reversal", "turtle soup"],
+      "definition": "Fade a sweep of an obvious high or low once structure confirms the reversal.",
+      "rules": ["1. Mark equal highs/lows or the session high/low.", "2. Wait for a wick through the level and a close back inside.", "3. Require a CHoCH on the execution timeframe in the reversal direction.", "4. Enter on the order block or FVG created by that CHoCH.", "5. Stop beyond the sweep extreme; target the opposite side of the range."],
+      "invalidation": "Price accepts beyond the swept level (closes and holds there)."
+    },
+    {
+      "id": "strategy_fvg_continuation",
+      "name": "Strategy: FVG continuation",
+      "kind": "strategy",
+      "aliases": ["fvg entry", "fvg strategy", "imbalance entry"],
+      "definition": "After a BOS with displacement, enter on the return into the fair value gap left by the impulse.",
+      "rules": ["1. Trend confirmed by BOS with a large-bodied candle.", "2. Mark the FVG created during that impulse.", "3. Limit order at the 50% of the gap.", "4. Stop beyond the impulse origin; target the next liquidity in trend direction."],
+      "invalidation": "Close through the far side of the gap."
+    },
+    {
+      "id": "strategy_ema_pullback",
+      "name": "Strategy: EMA trend pullback / crossover",
+      "kind": "strategy",
+      "aliases": ["ema cross", "moving average crossover", "golden cross", "death cross", "ema pullback", "trend following"],
+      "definition": "Trade in the direction of the moving-average trend: crossover of a fast EMA over a slow EMA, or a pullback to the fast EMA while the trend holds.",
+      "rules": ["1. Long when EMA fast crosses above EMA slow (short on the cross below).", "2. Stop 1.5 ATR from entry.", "3. Target 2R or exit on the opposite cross."],
+      "invalidation": "Opposite crossover.",
+      "backtest": "ema_cross",
+      "pine": "ema_cross"
+    },
+    {
+      "id": "strategy_rsi_reversion",
+      "name": "Strategy: RSI mean reversion",
+      "kind": "strategy",
+      "aliases": ["rsi strategy", "oversold", "overbought", "mean reversion"],
+      "definition": "Buy when RSI recovers from oversold, sell when it falls back from overbought. Works best in ranges.",
+      "rules": ["1. Long when RSI(14) crosses back above 30; short when it crosses back below 70.", "2. Stop 1.5 ATR; target 1.5R to 2R.", "3. Skip signals against a strong higher-timeframe trend."],
+      "invalidation": "New extreme beyond the signal candle.",
+      "backtest": "rsi_reversion",
+      "pine": "rsi_reversion"
+    },
+    {
+      "id": "strategy_breakout_retest",
+      "name": "Strategy: range breakout and retest",
+      "kind": "strategy",
+      "aliases": ["breakout", "donchian", "range breakout", "break and retest", "london breakout"],
+      "definition": "Trade a close beyond the highest high (or lowest low) of the last N candles, ideally entering on the retest of the broken level.",
+      "rules": ["1. Mark the N-candle range (20 by default) or the Asian session range.", "2. Signal on a close beyond it.", "3. Stop 1.5 ATR or back inside the range; target 2R."],
+      "invalidation": "Close back inside the range.",
+      "backtest": "breakout",
+      "pine": "breakout"
+    }
+  ]
+}

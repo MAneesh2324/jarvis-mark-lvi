@@ -102,6 +102,23 @@ def _has_error(output: str, run_command: str) -> bool:
     error_type = _classify_error(output)
     return error_type != "none"
 
+def _verify(code: str, file_path: str, all_files: list[dict], goal: str, language: str) -> str:
+    """Static-check one project file (syntax, undefined names, bad imports) and repair it before it is written."""
+    from core import code_quality as cq
+    ext = Path(file_path).suffix.lower()
+    lang = next((k for k, v in cq.EXT.items() if v == ext), language)
+    known = set()
+    for f in all_files:
+        p = Path(f['path'])
+        known.add(p.with_suffix('').as_posix().replace('/', '.'))
+        known.add(p.parts[0].removesuffix('.py'))
+    code, check = cq.repair(code, lang, goal, known_modules=known,
+                            context=f"{file_path} in a project with files: " + ", ".join(f['path'] for f in all_files))
+    if check['errors']:
+        print(f"[DevAgent] ⚠️ {file_path} still has: {check['errors'][0][:160]}")
+    return code
+
+
 class RateLimitError(Exception):
     pass
 
@@ -224,8 +241,9 @@ General rules:
 Code for {file_path}:"""
 
     try:
-        response = model.generate_content(prompt)
-        code = _strip_fences(response.text)
+        from core import code_quality as cq
+        code = cq.extract_code(cq.ask_model(prompt))
+        code = _verify(code, file_path, all_files, project_description, language)
 
         full_path = project_dir / file_path
         full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,8 +440,9 @@ Rules:
 Fixed code for {fix_path}:"""
 
         try:
-            response = model.generate_content(prompt)
-            fixed = _strip_fences(response.text)
+            from core import code_quality as cq
+            fixed = cq.extract_code(cq.ask_model(prompt))
+            fixed = _verify(fixed, fix_path, all_files, f"Fix {fix_path}: {error_type}", language)
 
             full_path = project_dir / fix_path
             full_path.parent.mkdir(parents=True, exist_ok=True)

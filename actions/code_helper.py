@@ -46,7 +46,7 @@ def _clean_code(text: str) -> str:
     return text.strip()
 
 
-def _resolve_save_path(output_path: str, language: str) -> Path:
+def _resolve_save_path(output_path: str, language: str, description: str = "") -> Path:
     ext_map = {
         "python": ".py", "py": ".py",
         "javascript": ".js", "js": ".js",
@@ -59,8 +59,15 @@ def _resolve_save_path(output_path: str, language: str) -> Path:
     if output_path:
         p = Path(output_path)
         return p if p.is_absolute() else DESKTOP / p
-    ext = ext_map.get((language or "python").lower(), ".py")
-    return DESKTOP / f"jarvis_code{ext}"
+    from core import code_quality as cq
+    ext = ext_map.get((language or "python").lower()) or cq.EXT.get(cq.norm_lang(language), ".txt")
+    stem = re.sub(r"[^a-z0-9]+", "_", (description or "jarvis code").lower()).strip("_")[:40] or "jarvis_code"
+    folder = DESKTOP / "JARVIS Code"
+    path = folder / f"{stem}{ext}"
+    n = 2
+    while path.exists():
+        path = folder / f"{stem}_{n}{ext}"; n += 1
+    return path
 
 
 def _read_file(file_path: str) -> tuple[str, str]:
@@ -92,9 +99,8 @@ def _preview(code: str, lines: int = 10) -> str:
 
 
 def _has_error(output: str) -> bool:
-    error_signals = ["error", "exception", "traceback", "syntaxerror",
-                     "nameerror", "typeerror", "stderr", "failed", "crash"]
-    return any(s in output.lower() for s in error_signals)
+    """Judged by the exit code _run_file reports, not by words a program happens to print."""
+    return output.startswith("Exit code:") or output.startswith("No interpreter") or output.startswith("Interpreter not found")
 
 
 def _take_screenshot() -> Path | None:
@@ -164,138 +170,86 @@ def _detect_intent(description: str, file_path: str, code: str) -> str:
         return "explain"
     return "write"
 
-def _write(description: str, language: str, output_path: str, player=None) -> tuple[str, Path]:
-    lang  = language or "python"
-    model = _get_gemini()
-
-    prompt = f"""You are an expert {lang} developer.
-Write clean, working, well-commented {lang} code for the description below.
-
-Rules:
-- Output ONLY the code. No explanation, no markdown, no backticks.
-- Add helpful inline comments.
-- Handle errors and edge cases properly.
-- Use modern best practices.
-
-Description: {description}
-
-Code:"""
-
-    response = model.generate_content(prompt)
-    code     = _clean_code(response.text)
-    path     = _resolve_save_path(output_path, lang)
+def _write(description: str, language: str, output_path: str, player=None, runner=None) -> tuple[str, Path]:
+    """Write → static check → repair loop (core.code_quality). The report lands in _LAST_REPORT."""
+    global _LAST_REPORT
+    from core import code_quality as cq
+    lang = cq.norm_lang(language or "python")
+    path = _resolve_save_path(output_path, lang, description)
+    log = (lambda m: (print(m), player.write_log(m))) if player else print
+    code, report = cq.generate(description, lang, runner=runner(path) if runner else None, log=log)
     _save_file(path, code)
+    _LAST_REPORT = report
     return code, path
 
 
-def _fix_code(code: str, error_output: str, description: str) -> str:
-    model  = _get_gemini()
-    prompt = f"""You are an expert debugger.
-The code below failed with the following error. Fix it.
-Return ONLY the corrected code — no explanation, no markdown, no backticks.
+_LAST_REPORT: dict = {}
 
-Original goal: {description}
 
-Error:
-{error_output[:2000]}
+def _report_line(report: dict) -> str:
+    if not report:
+        return ""
+    if report.get("ok"):
+        ran = report.get("run") or {}
+        return (f"Checked: {report['checker']}"
+                + (" and a test run" if ran.get("ok") else "")
+                + f", clean after {report['rounds']} round(s).")
+    bits = report.get("remaining_errors") or []
+    miss = report.get("missing_modules") or []
+    return ("Not fully verified. "
+            + (f"Remaining issues: {'; '.join(bits[:3])}. " if bits else "")
+            + (f"Needs: pip install {' '.join(miss)}. " if miss else ""))
 
-Broken code:
-{code}
 
-Fixed code:"""
-
-    response = model.generate_content(prompt)
-    return _clean_code(response.text)
+def _fix_code(code: str, error_output: str, description: str, language: str = "python") -> str:
+    from core import code_quality as cq
+    fixed = cq.extract_code(cq.ask_model(cq.repair_prompt(description, language, code, [error_output[:2500]])))
+    fixed, _ = cq.repair(fixed, language, description)
+    return fixed
 
 
 def _run_file(path: Path, args: list, timeout: int) -> str:
-    interpreters = {
-        ".py":  [sys.executable],
-        ".js":  ["node"],
-        ".ts":  ["ts-node"],
-        ".sh":  ["bash"],
-        ".ps1": ["powershell", "-File"],
-        ".rb":  ["ruby"],
-        ".php": ["php"],
-    }
-    interp = interpreters.get(path.suffix.lower())
-    if not interp:
-        return f"No interpreter for {path.suffix}."
-
-    try:
-        result = subprocess.run(
-            interp + [str(path)] + (args or []),
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout, cwd=str(path.parent)
-        )
-        output = result.stdout.strip()
-        error  = result.stderr.strip()
-        parts  = []
-        if output: parts.append(f"Output:\n{output}")
-        if error:  parts.append(f"Stderr:\n{error}")
-        return "\n\n".join(parts) if parts else "Executed with no output."
-
-    except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s."
-    except FileNotFoundError:
-        return f"Interpreter not found: {interp[0]}."
-    except Exception as e:
-        return f"Execution error: {e}"
+    from core import code_quality as cq
+    res = cq.run_file(path, args or [], timeout)
+    status = ("" if res.get("ok") else
+              f"Exit code: {res.get('exit_code')}\n" if res.get("ran") else "")
+    return status + res["output"]
 
 
 def _build(description, language, output_path, args, timeout, speak=None, player=None) -> str:
+    """Write, check, run and repair until the program runs cleanly (or rounds run out)."""
     if not description:
         return "Please describe what you want me to build, sir."
-
     if player:
         player.write_log("[Code] Build started...")
+    from core import code_quality as cq
+    lang = cq.norm_lang(language or "python")
 
-    lang = language or "python"
+    def runner(path):
+        def run(code):
+            _save_file(path, code)
+            return cq.run_file(path, args or [], timeout)
+        return run
 
+    runnable = cq.EXT.get(lang, "") in cq.INTERPRETERS
     try:
-        code, path = _write(description, lang, output_path, player)
-        print(f"[Code] ✅ Written: {path}")
+        code, path = _write(description, lang, output_path, player, runner=runner if runnable else None)
     except Exception as e:
-        msg = f"Could not write initial code: {e}"
+        msg = f"Could not write the code: {e}"
         if speak: speak(msg)
         return msg
-
-    last_output = ""
-    for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
-        print(f"[Code] 🔄 Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
-        if player:
-            player.write_log(f"[Code] Attempt {attempt}...")
-
-        last_output = _run_file(path, args, timeout)
-
-        if not _has_error(last_output):
-            msg = (
-                f"Build complete, sir. "
-                f"The code is working after {attempt} attempt{'s' if attempt > 1 else ''}. "
-                f"Saved to {path}."
-            )
-            if speak: speak(msg)
-            return f"{msg}\n\nOutput:\n{last_output}"
-
-        print(f"[Code] ⚠️ Error on attempt {attempt}, fixing...")
-        if player:
-            player.write_log(f"[Code] Fixing (attempt {attempt})...")
-
-        try:
-            code = _fix_code(code, last_output, description)
-            _save_file(path, code)
-        except Exception as e:
-            msg = f"Could not fix code on attempt {attempt}: {e}"
-            if speak: speak(msg)
-            return msg
-
-    msg = (
-        f"I was unable to build a working version after {MAX_BUILD_ATTEMPTS} attempts, sir. "
-        f"The last error was: {last_output[:200]}"
-    )
+    report = _LAST_REPORT
+    run = report.get("run") or {}
+    if report.get("ok"):
+        msg = (f"Build complete, sir. It passed {report['checker']}"
+               + (" and ran successfully" if run.get("ok") else "")
+               + f" after {report['rounds']} round{'s' if report['rounds'] > 1 else ''}. Saved to {path}.")
+        if speak: speak(msg)
+        return f"{msg}\n\n{run.get('output', '')}".strip()
+    msg = f"I could not get it fully working, sir. {_report_line(report)} Last version saved to {path}."
     if speak: speak(msg)
-    return f"{msg}\n\nLast code saved to: {path}"
+    return f"{msg}\n\n{run.get('output', '')}".strip()
+
 
 def _write_action(description, language, output_path, player) -> str:
     if not description:
@@ -305,7 +259,8 @@ def _write_action(description, language, output_path, player) -> str:
     try:
         code, path = _write(description, language, output_path, player)
         print(f"[Code] ✅ Written: {path}")
-        return f"Code written. Saved to: {path}\n\nPreview:\n{_preview(code)}"
+        return (f"Code written. Saved to: {path}\n{_report_line(_LAST_REPORT)}\n\n"
+                f"Preview:\n{_preview(code)}")
     except Exception as e:
         return f"Could not generate code: {e}"
 
@@ -323,27 +278,28 @@ def _edit_action(file_path, instruction, player) -> str:
     if player:
         player.write_log("[Code] Editing file...")
 
-    model  = _get_gemini()
-    prompt = f"""You are an expert code editor.
-Apply the following change to the code below.
-Return ONLY the complete updated code — no explanation, no markdown, no backticks.
-
-Change: {instruction}
-
-Original code:
-{content}
-
-Updated code:"""
-
+    from core import code_quality as cq
+    path = Path(file_path)
+    lang = next((k for k, v in cq.EXT.items() if v == path.suffix.lower()), "text")
+    before = cq.static_check(lang, content)
+    log = (lambda m: (print(m), player.write_log(m))) if player else print
     try:
-        response = model.generate_content(prompt)
-        edited   = _clean_code(response.text)
+        edited, report = cq.generate(f"Apply this change to the file {path.name}: {instruction}", lang,
+                                     existing=content, log=log)
     except Exception as e:
         return f"Could not edit code: {e}"
-
-    status = _save_file(Path(file_path), edited)
+    if not report["ok"] and before["ok"]:
+        # Never replace a file that passed its checks with one that does not.
+        draft = path.with_name(path.stem + ".jarvis-draft" + path.suffix)
+        _save_file(draft, edited)
+        return (f"The edited version did not pass checks, so {path.name} was left unchanged. "
+                f"{_report_line(report)} Draft saved to {draft}.")
+    backup = path.with_name(path.name + ".bak")
+    _save_file(backup, content)
+    status = _save_file(path, edited)
     print(f"[Code] ✅ Edited: {file_path}")
-    return f"File edited. {status}\n\nPreview:\n{_preview(edited)}"
+    return (f"File edited. {status} Backup of the original: {backup}.\n{_report_line(report)}\n\n"
+            f"Preview:\n{_preview(edited)}")
 
 
 def _explain_action(file_path, code, player) -> str:
@@ -417,6 +373,8 @@ Optimized code:"""
     try:
         response  = model.generate_content(prompt)
         optimized = _clean_code(response.text)
+        from core import code_quality as cq
+        optimized, _ = cq.repair(optimized, lang, "Optimise this code without changing its behaviour.")
     except Exception as e:
         return f"Could not optimize code: {e}"
 
