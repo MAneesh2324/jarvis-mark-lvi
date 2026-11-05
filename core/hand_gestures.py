@@ -9,6 +9,50 @@ def distance(a,b):return math.sqrt(sum((float(a[i])-float(b[i]))**2 for i in ran
 def angle(a,b,c):
  u=[a[i]-b[i] for i in range(2)];v=[c[i]-b[i] for i in range(2)];norm=math.hypot(*u)*math.hypot(*v)
  return math.degrees(math.acos(max(-1,min(1,sum(x*y for x,y in zip(u,v))/norm)))) if norm>1e-8 else 0
+class LatestFrame:
+ """Reads the camera on its own thread and keeps only the newest frame.
+
+ OpenCV queues frames inside the camera driver; a loop that runs even slightly slower than
+ the camera then works on frames that are a quarter of a second old, which is what lag feels
+ like. Draining continuously and handing out only the latest frame removes that delay."""
+ def __init__(self,cap,stop):
+  self.cap,self.stop=cap,stop;self.frame=None;self.ok=False;self.seq=0;self.taken=0
+  self.cond=threading.Condition();self.closed=False
+  self.thread=threading.Thread(target=self._run,daemon=True,name='gesture-camera-reader');self.thread.start()
+ def _run(self):
+  while not self.stop.is_set() and not self.closed:
+   ok,frame=self.cap.read()
+   with self.cond:
+    self.ok,self.frame=ok,frame;self.seq+=1;self.cond.notify_all()
+   if not ok:time.sleep(.02)
+ def next(self,timeout=.5):
+  with self.cond:
+   if self.seq==self.taken:self.cond.wait(timeout)
+   self.taken=self.seq
+   return self.ok,(None if self.frame is None else self.frame.copy())
+ def close(self):
+  self.closed=True
+  with self.cond:self.cond.notify_all()
+  self.thread.join(timeout=1)
+
+
+class OneEuro:
+ """One-euro filter: steady when the hand is still, responsive when it moves (Casiez et al. 2012)."""
+ def __init__(self,min_cutoff=1.6,beta=8.0,d_cutoff=1.0):
+  self.min_cutoff,self.beta,self.d_cutoff=min_cutoff,beta,d_cutoff;self.x=None;self.dx=0.;self.t=None
+ @staticmethod
+ def _alpha(cutoff,dt):
+  tau=1/(2*math.pi*cutoff);return 1/(1+tau/dt)
+ def __call__(self,x,t):
+  if self.x is None or self.t is None or t-self.t>.5:
+   self.x,self.dx,self.t=x,0.,t;return x
+  dt=max(1e-3,t-self.t);self.t=t
+  dx=(x-self.x)/dt;a_d=self._alpha(self.d_cutoff,dt);self.dx=a_d*dx+(1-a_d)*self.dx
+  a=self._alpha(self.min_cutoff+self.beta*abs(self.dx),dt);self.x=a*x+(1-a)*self.x
+  return self.x
+ def reset(self):self.x=None;self.t=None;self.dx=0.
+
+
 class Interpreter:
  """Hand landmarks → gestures. Each frame returns one event dict with a 'kind' and a 'label'.
 
@@ -32,6 +76,7 @@ class Interpreter:
   self.trail=[];self.swiped_at=-9.;self.still_at=None;self.palm_latched=False
   self.fist_trail=[];self.was_fist=False;self.thrown_at=-9.
   self.pair=[];self.pair_event_at=-9.;self.depth=[];self.depth_at=-9.
+  self.fx=OneEuro();self.fy=OneEuro();self.mode=None
 
  def update(self,hands,now=None):
   now=time.monotonic() if now is None else now
@@ -74,7 +119,8 @@ class Interpreter:
    if moved>.04:self.fist_at=now;self.fist_latched=False         # a moving fist is a grab, not a reset
    if self.fist_at is None:self.fist_at=now
    if now-self.fist_at>=.8 and not self.fist_latched:self.fist_latched=True;return {'kind':'reset','label':'View reset'}
-   return {'kind':'idle','label':'Grab: fling and open to throw · hold still to reset'}
+   return {'kind':'idle','pose':'fist','progress':0 if self.fist_latched else round(min(1,(now-self.fist_at)/.8),2),
+           'label':'Fist: hold still to reset · fling and open to throw'}
   if self.was_fist and fingers>=3 and self.fist_trail and now-self.thrown_at>1.0:
    t0,x0,y0=self.fist_trail[0];t1,x1,y1=self.fist_trail[-1];dt=max(t1-t0,1e-3)
    vx,vy=(x1-x0)/dt,(y1-y0)/dt;speed=math.hypot(vx,vy)
@@ -90,15 +136,23 @@ class Interpreter:
   palm=max(.04,distance(h[0],h[9]));pinch=distance(h[4],h[8])/palm
   grabbing=pinch<(.45 if self.pinched else .30) and fingers>=2;self.pinched=grabbing
   if grabbing:
+   if self.mode!='pinch':self.fx.reset();self.fy.reset()
    current=((h[4][0]+h[8][0])/2,(h[4][1]+h[8][1])/2);old=self.anchor;self.anchor=current
+   # dx/dy stay raw (the face and Earth views rotate by them as before); x/y are smoothed for the board cursor
    dx=max(-.06,min(.06,current[0]-old[0])) if old else 0;dy=max(-.06,min(.06,current[1]-old[1])) if old else 0
-   return {'kind':'rotate','dx':dx,'dy':dy,'label':'Grab / rotate'}
+   self.mode='pinch'
+   return {'kind':'rotate','dx':dx,'dy':dy,'x':float(self.fx(current[0],now)),'y':float(self.fy(current[1],now)),'label':'Pinch: drag to scrub'}
   self.anchor=None
 
   # ── pointing ──
-  if fingers==1 and angle(h[5],h[6],h[8])>155 and distance(h[8],h[0])>distance(h[6],h[0])*1.1:
-   self.trail=[];self.still_at=None;self.palm_latched=False;self.depth=[]
-   return {'kind':'point','x':float(h[8][0]),'y':float(h[8][1]),'label':'Pointing'}
+  index_out=distance(h[8],h[0])>distance(h[6],h[0])*1.05
+  pointing=(fingers==1 and angle(h[5],h[6],h[8])>155 and distance(h[8],h[0])>distance(h[6],h[0])*1.1) or \
+           (self.mode=='point' and fingers<=2 and angle(h[5],h[6],h[8])>135 and index_out)       # hysteresis
+  if pointing:
+   if self.mode!='point' and self.mode!='pinch':self.fx.reset();self.fy.reset()
+   self.trail=[];self.still_at=None;self.palm_latched=False;self.depth=[];self.mode='point'
+   return {'kind':'point','x':float(self.fx(h[8][0],now)),'y':float(self.fy(h[8][1],now)),'label':'Pointing'}
+  self.mode=None
 
   # ── open palm: swipe in four directions, push / pull, hold still ──
   if fingers>=4:
@@ -125,7 +179,8 @@ class Interpreter:
    elif self.still_at is None:self.still_at=now
    elif now-self.still_at>=1.0 and not self.palm_latched:
     self.palm_latched=True;return {'kind':'palm_hold','label':'Open palm held: replay'}
-   return {'kind':'idle','label':'Open hand: swipe · push / pull · hold still to replay'}
+   return {'kind':'idle','pose':'open','progress':0 if (self.still_at is None or self.palm_latched) else round(min(1,(now-self.still_at)/1.0),2),
+           'x':float(h[9][0]),'y':float(h[9][1]),'label':'Open hand: swipe · push / pull · hold still to replay'}
   self.trail=[];self.still_at=None;self.palm_latched=False;self.depth=[]
   return {'kind':'idle','label':'Point · pinch + drag · open hand swipe/push · two hands zoom/twist/explode · fist throw/reset'}
 
@@ -226,11 +281,15 @@ class GestureController:
      from actions.screen_processor import _load_config,_cv2_backend
      index=int(_load_config().get('camera_index',0));cap=cv2.VideoCapture(index,_cv2_backend());resources.callback(cap.release)
      if not cap.isOpened():raise RuntimeError('Camera could not open for gestures. Close other camera apps and try again.')
-     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);interpreter=Interpreter();last_stamp=0;misses=0;last_preview=0
+     cap.set(cv2.CAP_PROP_FRAME_WIDTH,640);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480);cap.set(cv2.CAP_PROP_FPS,30)
+     try:cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+     except Exception:pass
+     interpreter=Interpreter();last_stamp=0;misses=0;last_preview=0
+     latest=LatestFrame(cap,stop);resources.callback(latest.close)
      with self._lock:
       if generation==self.generation:self.state='tracking'
      while not stop.is_set():
-      before=time.monotonic();ok,frame=cap.read()
+      before=time.monotonic();ok,frame=latest.next(timeout=.5)
       if not ok or frame is None:
        misses+=1
        if misses>=10:raise RuntimeError('Camera stopped returning frames.')
@@ -242,7 +301,7 @@ class GestureController:
        if generation!=self.generation:return
        self.frames+=1;self.label=event['label']
       if not stop.is_set():callback(event)
-      if time.monotonic()-last_preview>=.15 and not stop.is_set():
+      if time.monotonic()-last_preview>=.2 and not stop.is_set():
        last_preview=time.monotonic();preview=cv2.resize(frame,(320,240))
        edges=((0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),(13,17),(0,17),(17,18),(18,19),(19,20))
        for hand in hands:
@@ -251,7 +310,7 @@ class GestureController:
         for point in points:cv2.circle(preview,point,3,(0,255,120),-1)
        ok,encoded=cv2.imencode('.jpg',preview,[cv2.IMWRITE_JPEG_QUALITY,45])
        if ok and len(encoded)<=36000:callback({'kind':'preview','generation':generation,'jpeg':base64.b64encode(encoded).decode('ascii'),'label':event['label'],'hands':len(hands)})
-      stop.wait(max(0,.05-(time.monotonic()-before)))
+      # no fixed sleep: the next call waits for the next fresh frame (about 30 a second)
   except Exception as exc:
    with self._lock:
     if generation==self.generation:self.state='failed';self.error=str(exc);self.label='Tracking stopped'

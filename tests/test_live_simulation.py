@@ -325,5 +325,76 @@ class WorkshopGestures(unittest.TestCase):
         S.reset()
 
 
+class GestureResponsiveness(unittest.TestCase):
+    hand = staticmethod(lambda n, dx=0: [(x + dx, y) for x, y in WorkshopGestures._hand(n, (.5, .8), 1.0)])
+
+    def test_cursor_is_steady_and_keeps_up(self):
+        import random, statistics
+        from core.hand_gestures import Interpreter
+        random.seed(1)
+        i, raw, out = Interpreter(), [], []
+        for k in range(90):
+            pts = [(x + random.uniform(-.006, .006), y + random.uniform(-.006, .006)) for x, y in self.hand(1)]
+            raw.append(pts[8][0])
+            out.append(i.update([pts], k / 30)['x'])
+        self.assertLess(statistics.pstdev(out[10:]), statistics.pstdev(raw) * .6)   # jitter well below the raw tracker
+        i, xs = Interpreter(), []
+        for k in range(10):
+            xs.append(i.update([self.hand(1, k * .04)], k / 30)['x'])
+        self.assertLess(self.hand(1, 9 * .04)[8][0] - xs[-1], .03)               # a fast move is followed closely
+
+    def test_pointing_survives_a_one_frame_flicker_and_holds_show_progress(self):
+        from core.hand_gestures import Interpreter
+        i = Interpreter()
+        self.assertEqual([i.update([self.hand(n)], k / 30)['kind'] for k, n in enumerate((1, 2, 1))], ['point'] * 3)
+        i = Interpreter()
+        progress = [i.update([self.hand(0)], k / 10).get('progress') for k in range(8)]
+        self.assertEqual(progress[0], 0)
+        self.assertGreater(progress[6], .7)
+
+    def test_latest_frame_drops_stale_frames(self):
+        import threading
+        from core.hand_gestures import LatestFrame
+
+        class Cam:
+            n = 0
+            def read(self):
+                import time
+                time.sleep(.005)
+                Cam.n += 1
+                return True, __import__('numpy').full((2, 2), Cam.n)
+        stop = threading.Event()
+        lf = LatestFrame(Cam(), stop)
+        import time
+        time.sleep(.1)                                   # the camera ran ahead while we were busy
+        ok, frame = lf.next()
+        self.assertTrue(ok)
+        self.assertGreaterEqual(int(frame[0, 0]), Cam.n - 2)  # we get the newest, not the first queued
+        stop.set()
+        lf.close()
+
+    def test_board_maps_the_reach_zone_and_shows_feedback(self):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QPixmap
+        app = QApplication.instance() or QApplication([])
+        import core.sim_session as S
+        from core.simulation_view import SimulationHologram
+        S.start('process', APPLE)
+        w = SimulationHologram()
+        w.resize(1000, 600)
+        w.set_result(S.board(), animate=False)
+        w.grab()
+        w.apply_hand_gesture({'kind': 'point', 'x': .85, 'y': .15})
+        self.assertAlmostEqual(w._hover.x(), 1000)          # the edge of the reach zone is the edge of the board
+        w.apply_hand_gesture({'kind': 'rotate', 'dx': 0, 'dy': 0, 'x': .5, 'y': .5})
+        self.assertAlmostEqual(w._hover.x(), 500, delta=1)   # pinch is direct
+        w.set_tracker_preview(QPixmap(32, 24))
+        w.apply_hand_gesture({'kind': 'idle', 'pose': 'fist', 'progress': .5})
+        self.assertEqual(w._hold, ('fist', .5))
+        self.assertFalse(w.grab().isNull())
+        S.reset()
+
+
 if __name__ == '__main__':
     unittest.main()

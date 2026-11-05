@@ -5962,6 +5962,9 @@ class MainWindow(QMainWindow):
                 self._hand_preview.show()
                 self._hand_preview_status.setText(str(event.get('hands',0))+' hand(s) · '+str(event.get('label','Tracking'))[:100])
                 self._hand_preview_status.show()
+                board=getattr(self,'_sim_board',None)
+                if board is not None and self._hud_cam_stack.currentWidget() is board:
+                    board.set_tracker_preview(pixmap)   # see your hand on the board while you control it
             except (ValueError,TypeError):pass
             return
         board=getattr(self,'_sim_board',None)

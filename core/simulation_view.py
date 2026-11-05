@@ -763,15 +763,22 @@ class SimulationHologram(QWidget):
         now = time.monotonic()
         self._gesture_seen = now
         self._gesture_label = str(event.get('label', ''))[:80]
+        self._hold = (event.get('pose'), float(event.get('progress') or 0)) if kind == 'idle' else None
         chart = getattr(self, '_chart', QRectF(0, 0, self.width(), self.height()))
+        if kind == 'idle':
+            self.update()
+            return
         if kind == 'point':
-            # the camera frame spans the whole board, like reaching into the projection
-            self._hover = QPointF(float(event.get('x', .5)) * self.width(), float(event.get('y', .5)) * self.height())
+            self._hover = self._map_hand(event)              # the cursor goes where the fingertip is
             self._cursor_kind = 'point'
         elif kind == 'rotate':                               # pinch + drag
-            hover = getattr(self, '_hover', None) or QPointF(chart.center().x(), chart.center().y())
-            x = min(chart.right() - 1, max(chart.left() + 1, hover.x() + float(event.get('dx', 0)) * chart.width() * 2.4))
-            self._hover = QPointF(x, hover.y())
+            if 'x' in event:
+                at = self._map_hand(event)                   # direct: the pinch is the cursor
+                self._hover = QPointF(min(chart.right() - 1, max(chart.left() + 1, at.x())), at.y())
+            else:
+                hover = getattr(self, '_hover', None) or QPointF(chart.center().x(), chart.center().y())
+                x = min(chart.right() - 1, max(chart.left() + 1, hover.x() + float(event.get('dx', 0)) * chart.width() * 2.4))
+                self._hover = QPointF(x, hover.y())
             self._spin = getattr(self, '_spin', 0.0) + float(event.get('dy', 0)) * 6
             self._cursor_kind = 'grab'
         elif kind == 'zoom':
@@ -824,6 +831,19 @@ class SimulationHologram(QWidget):
             self._timer.start(50)
         self.update()
 
+    # the middle of the camera view is where a hand is comfortable and tracked best
+    REACH = (.15, .85)
+
+    def _map_hand(self, event) -> QPointF:
+        lo, hi = self.REACH
+        fx = min(1.0, max(0.0, (float(event.get('x', .5)) - lo) / (hi - lo)))
+        fy = min(1.0, max(0.0, (float(event.get('y', .5)) - lo) / (hi - lo)))
+        return QPointF(fx * self.width(), fy * self.height())
+
+    def set_tracker_preview(self, pixmap) -> None:
+        """The tracker's own view (camera frame with the hand skeleton), drawn small in a corner."""
+        self._preview, self._preview_at = pixmap, time.monotonic()
+
     def _step_attempt(self, step: int) -> None:
         session = self.result.get('session')
         if not session:
@@ -863,6 +883,34 @@ class SimulationHologram(QWidget):
                 if grab:
                     p.setBrush(self._c('acc2', 200))
                     p.drawEllipse(hover, 3, 3)
+        hold = getattr(self, '_hold', None)
+        if seen and hold and hold[1] > 0:                    # holding a fist or a palm: a ring fills up
+            at = getattr(self, '_hover', None) or QPointF(chart.center().x(), chart.center().y())
+            rad = 26
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(self._c('dim', 160), 3))
+            p.drawEllipse(at, rad, rad)
+            p.setPen(QPen(self._c('acc2' if hold[0] == 'open' else 'red', 255), 4))
+            p.drawArc(QRectF(at.x() - rad, at.y() - rad, 2 * rad, 2 * rad), 90 * 16, -int(360 * 16 * hold[1]))
+            p.setFont(QFont('Courier New', 8, QFont.Weight.Bold))
+            p.setPen(self._c('white'))
+            p.drawText(QRectF(at.x() - 50, at.y() + rad + 4, 100, 14), Qt.AlignmentFlag.AlignCenter,
+                       'REPLAY' if hold[0] == 'open' else 'RESET')
+        prev = getattr(self, '_preview', None)
+        if prev is not None and now - getattr(self, '_preview_at', -99) < 2 and not prev.isNull():
+            pw = min(176.0, chart.width() * .32)
+            ph = pw * prev.height() / max(1, prev.width())
+            box = QRectF(chart.left() + 6, chart.bottom() - ph - 6, pw, ph)
+            p.setOpacity(.92)
+            p.drawPixmap(box, prev, QRectF(prev.rect()))
+            p.setOpacity(1)
+            p.setPen(QPen(self._c('acc2', 200), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(box)
+            lo, hi = self.REACH                             # the comfortable reach zone, mapped to the whole board
+            p.setPen(QPen(self._c('acc2', 140), 1, Qt.PenStyle.DashLine))
+            p.drawRect(QRectF(box.left() + box.width() * lo, box.top() + box.height() * lo,
+                              box.width() * (hi - lo), box.height() * (hi - lo)))
         k = now - getattr(self, '_toast_at', -99)
         if k < 1.4:
             a = 1 if k < 1 else (1.4 - k) / .4
