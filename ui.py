@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import math
 import os
 import platform
@@ -7268,7 +7269,7 @@ class MainWindow(QMainWindow):
         txt = self._input.text().strip()
         if not txt: return
         self._input.clear()
-        shown = '/phonelink token ••••••' if txt.lower().startswith('/phonelink token') else txt   # never echo a secret
+        shown = re.sub(r'\b\d{6,12}:[A-Za-z0-9_-]{25,50}\b', '[telegram token ••••]', txt)   # never echo a secret
         self._log.append_log(f"You: {shown}")
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()

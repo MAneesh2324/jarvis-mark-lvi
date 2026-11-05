@@ -216,3 +216,29 @@ class Tools(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TokenHandling(unittest.TestCase):
+    TOKEN = '1234567890:AAHCQRmlXvExUF9KR-SzdsKs8rroo9IcvDE'
+
+    def test_redact_hides_bot_tokens(self):
+        import main
+        out = main._redact(f"{{'text': '{self.TOKEN}', 'action': 'configure'}}")
+        self.assertNotIn(self.TOKEN, out)
+        self.assertIn('[token-hidden]', out)
+
+    def test_pasted_token_in_any_wording_is_handled_locally(self):
+        import main
+        obj = main.JarvisLive.__new__(main.JarvisLive)
+        seen = []
+        obj._phonelink_command = lambda cmd: seen.append(cmd)
+        obj._send_typed_command = MagicMock()
+        obj._on_text_command(f'here is my telegram bot token {self.TOKEN} thanks')
+        self.assertEqual(seen, ['/phonelink token ' + self.TOKEN])
+        obj._send_typed_command.assert_not_called()
+
+    def test_tool_rejects_a_misheard_token_helpfully(self):
+        from actions import phone_link as tool
+        with patch('core.phone_link._call', side_effect=RuntimeError('Unauthorized')):
+            out = tool.phone_link({'action': 'set_token', 'token': self.TOKEN})
+        self.assertIn('paste', out)

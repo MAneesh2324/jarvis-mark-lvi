@@ -985,6 +985,11 @@ class JarvisLive:
         if text.startswith('/phonelink'):
             self._phonelink_command(text)
             return
+        token = _TELEGRAM_TOKEN.search(text or '')
+        if token:
+            # A bot token pasted in any form is handled here and never sent to the model or the journal.
+            self._phonelink_command('/phonelink token ' + token.group(0))
+            return
         from core import quota_failover
         provider=quota_failover.command_provider(text)
         if text.startswith('/provider '):provider=text.split(maxsplit=1)[1].strip().lower()
@@ -1144,6 +1149,7 @@ class JarvisLive:
 
     async def _record_conversation_turn(self, role: str, text: str):
         """Persist completed text independently of model-generated summaries."""
+        text = _redact(text)        # never keep a secret in history, memory or self-learning
         try:
             from core import self_learning
             if role == 'user':
@@ -1760,7 +1766,7 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        print(f"[JARVIS] 🔧 {name}  {_redact(str(args))}")
         self.ui.set_state("THINKING")
 
 
@@ -3381,6 +3387,14 @@ class JarvisLive:
             delay = getattr(self, "_conn_backoff", 3)
             print(f"[JARVIS] Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
+
+_TELEGRAM_TOKEN = re.compile(r'\b\d{6,12}:[A-Za-z0-9_-]{25,50}\b')
+
+
+def _redact(text: str) -> str:
+    """Hide secrets (bot tokens) before anything is printed to the log."""
+    return _TELEGRAM_TOKEN.sub('[token-hidden]', text)
+
 
 def main():
     import os
