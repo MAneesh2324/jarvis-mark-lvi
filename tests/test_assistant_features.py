@@ -189,7 +189,7 @@ class OwnerGuard(unittest.TestCase):
             g = og.VoiceGuard()
             g.owner = None
             g.start_enrolment(3)
-            speech = np.full(16000 * 2, 3000, dtype=np.int16)
+            speech = np.full(16000 * 3, 3000, dtype=np.int16)
             for i in range(3):
                 g.buf = [speech]
                 r = g.end_turn()
@@ -198,7 +198,46 @@ class OwnerGuard(unittest.TestCase):
             g.buf = [speech]
             self.assertEqual(g.end_turn()['result'], 'owner')
             g.buf = [speech]
-            self.assertEqual(g.end_turn()['result'], 'stranger')
+            first = g.end_turn()
+            self.assertEqual(first['result'], 'stranger')
+            self.assertTrue(first['alarm'])                     # clearly a different voice: alarm at once
+
+    def test_owner_is_not_turned_away_by_short_or_borderline_turns(self):
+        from core import owner_guard as og
+        rng = np.random.default_rng(0)
+        base = rng.normal(size=256)
+        profile = np.array([base + rng.normal(scale=0.9, size=256) for _ in range(6)])   # a loosely-agreeing profile
+        thr = og.owner_threshold(profile)
+        self.assertGreaterEqual(thr, og.VOICE_FLOOR)
+        self.assertLessEqual(thr, og.VOICE_MATCH)
+        g = og.VoiceGuard.__new__(og.VoiceGuard)
+        g.owner, g.threshold = profile, thr
+        self.assertEqual(g.verdict(base + rng.normal(scale=0.9, size=256), 3.0)['result'], 'owner')
+        other = rng.normal(size=256)
+        self.assertEqual(g.verdict(other, 1.5)['result'], 'uncertain')      # too short to call anyone a stranger
+        self.assertEqual(g.verdict(other, 3.0)['result'], 'stranger')
+
+    def test_profiles_keep_learning_without_duplicates(self):
+        from core import owner_guard as og
+        rng = np.random.default_rng(1)
+        prof = og._unit(rng.normal(size=(og.PROFILE_MAX, 16)))
+        self.assertIsNone(og._learn(prof, prof[0]))                         # a repeat adds nothing
+        new = rng.normal(size=16)
+        grown = og._learn(prof, new)
+        self.assertEqual(len(grown), og.PROFILE_MAX)                        # capped
+        self.assertGreater(float(grown[-1] @ og._unit(new)), 0.999)          # the newest sample stays
+
+    def test_speech_filter_drops_background_noise(self):
+        from core import owner_guard as og
+        g = og.VoiceGuard.__new__(og.VoiceGuard); g.noise = 0.004
+        rng = np.random.default_rng(2)
+        noise = rng.normal(0, 200, 16000).astype(np.int16)
+        t = np.arange(16000) / 16000
+        voice = (np.sin(2 * np.pi * 180 * t) * 6000 + rng.normal(0, 200, 16000)).astype(np.int16)
+        kept_noise = sum(g._speech(noise[i:i + 1024]).size for i in range(0, 16000, 1024))
+        kept_voice = sum(g._speech(voice[i:i + 1024]).size for i in range(0, 16000, 1024))
+        self.assertLess(kept_noise, 16000 * 0.1)
+        self.assertGreater(kept_voice, 16000 * 0.8)
 
     def test_face_check_reports_not_enrolled(self):
         from core import owner_guard as og

@@ -17,7 +17,7 @@ def owner_guard(parameters, **kwargs):
         elif action == 'check_face':
             data = og.check_face()
         elif action == 'enroll_voice':
-            data = og.voice().start_enrolment(int(p.get('sentences') or 5))
+            data = og.voice().start_enrolment(int(p.get('sentences') or 6))
             return outcome.started('owner_guard', **data)
         elif action == 'configure':
             data = og.configure(face_guard=p.get('face_guard'), voice_guard=p.get('voice_guard'),
@@ -37,8 +37,10 @@ TOOL = {
     'name': 'owner_guard',
     'description': (
         'Recognises the owner by face (webcam) and voice, locally. enroll_face: learn the owner\'s face now (ask them to '
-        'face the camera alone, ~5 seconds). check_face: who is at the computer (owner, stranger, uncertain, no_face). '
-        'enroll_voice: learn the owner\'s voice from their next spoken sentences (sentences, default 5). configure: '
+        'sit alone facing the camera in good light and slowly turn their head a little left, right, up and down for '
+        'about 8 seconds). check_face: who is at the computer (owner, stranger, uncertain, unclear = face not clear '
+        'enough to judge, no_face). enroll_voice: learn the owner\'s voice from their next spoken sentences (sentences, '
+        'default 6; ask for full natural sentences). Both profiles keep learning from confident matches.  configure: '
         'face_guard (periodic camera checks that warn if someone else is at the computer), check_minutes, voice_guard '
         '(treat unrecognised voices as guests: sensitive actions are blocked until the owner confirms), owner_name. '
         'forget: delete face, voice or all signatures. status: what is enrolled and the last voice check. Only numeric '

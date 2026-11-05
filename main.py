@@ -1340,7 +1340,7 @@ class JarvisLive:
                     self.ui.write_log('SYS: Voice learned. I will recognise you from now on.')
                 elif verdict.get('enrolling'):
                     self.ui.write_log(f"SYS: Learning your voice ({verdict['collected']}/{verdict['of']})...")
-                elif verdict.get('result') == 'stranger' and not self._guest_mode:
+                elif verdict.get('result') == 'stranger' and verdict.get('alarm', True) and not self._guest_mode:
                     self._guest_mode = True
                     notes.append(og.GUEST_NOTE)
                     from core import notify
@@ -1458,7 +1458,7 @@ class JarvisLive:
                         and time.monotonic() - last_face > cfg['check_minutes'] * 60:
                     last_face = time.monotonic()
                     try:
-                        verdict = await asyncio.to_thread(og.check_face, 3)
+                        verdict = await asyncio.to_thread(og.check_face, 5)
                     except RuntimeError as exc:
                         print(f"[OwnerGuard] face check skipped: {exc}")   # camera busy or unavailable
                         continue
