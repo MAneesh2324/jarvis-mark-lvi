@@ -29,6 +29,7 @@ varied by that much and shows the 5th–95th percentile band of the focus variab
 from __future__ import annotations
 
 import ast
+import difflib
 import math
 import re
 
@@ -59,28 +60,75 @@ _FUNCS = {
 # other spellings of the same thing
 _FUNCS.update({'int': _FUNCS['floor'], 'trunc': lambda x: float(int(x)), 'clip': _FUNCS['clamp'], 'power': _FUNCS['pow'],
                'ln': _FUNCS['log'], 'heaviside': _FUNCS['step'], 'smoothstep': lambda a, b, x: (lambda k: k * k * (3 - 2 * k))(
-                   max(0.0, min(1.0, (x - a) / (b - a) if b != a else 0.0))), 'minimum': min, 'maximum': max, 'fabs': abs})
+                   max(0.0, min(1.0, (x - a) / (b - a) if b != a else 0.0))), 'minimum': min, 'maximum': max, 'fabs': abs,
+               'where': lambda c, a, b: a if c else b, 'mean': lambda *a: sum(a) / len(a) if a else 0.0,
+               'average': lambda *a: sum(a) / len(a) if a else 0.0, 'square': lambda x: x * x,
+               'exp2': lambda x: 2.0 ** x if abs(x) <= 1000 else 0.0, 'cbrt': lambda x: math.copysign(abs(x) ** (1 / 3), x)})
 _CONST = {'pi': math.pi, 'e': math.e, 'true': 1.0, 'false': 0.0}
 _BIN = {ast.Add: lambda a, b: a + b, ast.Sub: lambda a, b: a - b, ast.Mult: lambda a, b: a * b,
         ast.Div: lambda a, b: a / b if b else 0.0, ast.Pow: lambda a, b: a ** b if abs(b) <= 10 else 0.0,
-        ast.Mod: lambda a, b: a % b if b else 0.0}
+        ast.Mod: lambda a, b: a % b if b else 0.0, ast.FloorDiv: lambda a, b: a // b if b else 0.0}
 _CMP = {ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b, ast.Gt: lambda a, b: a > b,
         ast.GtE: lambda a, b: a >= b, ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b}
 
 
-_CONTAINERS = r'(?:params|parameters|param|settings|variables|variable|vars|state|values)'
+_CONTAINERS = r'(?:params|parameters|param|settings|variables|variable|vars|state|values|self|p)'
+# Prefixes a model puts in front of a name or a function that mean nothing here: params.x, self.x, math.exp(…)
+_PREFIXES = {'params', 'parameters', 'param', 'settings', 'variables', 'variable', 'vars', 'state', 'values',
+             'self', 'p', 'math', 'np', 'numpy', 'cmath'}
 
 
 def normalise(text: str) -> str:
     """Accept the ways a model naturally writes a name and reduce them to the bare name:
-    params['x'], params["x"], params.x, variables.size, state['y'], math.exp(…), np.sqrt(…),
-    and C-style && / || / !."""
-    text = re.sub(_CONTAINERS + r"\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]", r'\1', text, flags=re.I)
+    params['x'], params["x"], params.x, params.get('x', 1), variables.size, state['y'], math.exp(…),
+    np.sqrt(…), and C-style && / || / !."""
+    text = re.sub(r"\b" + _CONTAINERS + r"\s*\.\s*get\s*\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*(?:,[^()]*)?\)",
+                  r'\1', text, flags=re.I)
+    text = re.sub(r"\b" + _CONTAINERS + r"\s*\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]", r'\1', text, flags=re.I)
     text = re.sub(r'\b' + _CONTAINERS + r'\.([A-Za-z_][A-Za-z0-9_]*)', r'\1', text, flags=re.I)
-    text = re.sub(r'\b(?:math|np|numpy)\.', '', text)
+    text = re.sub(r'\b(?:math|np|numpy|cmath)\.', '', text)
     text = text.replace('&&', ' and ').replace('||', ' or ')
     text = re.sub(r'!(?!=)', ' not ', text)
     return text
+
+
+def _part(node) -> str:
+    try:
+        return ast.unparse(node)[:80]
+    except Exception:
+        return type(node).__name__
+
+
+class _Strip(ast.NodeTransformer):
+    """What the regexes miss, on the parsed tree: prefix.name → name, prefix['name'] → name,
+    and a name written in another case than the spec's (Ripeness_Percent → ripeness_percent)."""
+
+    def __init__(self, names):
+        self.lower = {n.lower(): n for n in names}
+
+    def visit_Attribute(self, node):
+        node = self.generic_visit(node)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id.lower() in _PREFIXES:
+            return ast.copy_location(ast.Name(id=node.attr, ctx=ast.Load()), node)
+        return node
+
+    def visit_Subscript(self, node):
+        node = self.generic_visit(node)
+        key = node.slice
+        if (isinstance(node.value, ast.Name) and node.value.id.lower() in _PREFIXES and isinstance(key, ast.Constant)
+                and isinstance(key.value, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key.value)):
+            return ast.copy_location(ast.Name(id=key.value, ctx=ast.Load()), node)
+        return node
+
+    def visit_Name(self, node):
+        if node.id not in self.lower.values() and node.id.lower() in self.lower:
+            node.id = self.lower[node.id.lower()]
+        return node
+
+    def visit_Constant(self, node):
+        if isinstance(node.value, bool):
+            return ast.copy_location(ast.Constant(value=float(node.value)), node)
+        return node
 
 
 class Formula:
@@ -91,19 +139,22 @@ class Formula:
         if len(text) > 600:
             raise ValueError('A formula is limited to 600 characters.')
         try:
-            self.tree = ast.parse(text.replace('^', '**'), mode='eval').body
+            tree = ast.parse(text.replace('^', '**'), mode='eval').body
         except SyntaxError:
             raise ValueError(f'Could not read the formula: {text}') from None
         self.text = text
+        self.tree = _Strip(set(names) | {'t'}).visit(tree)
         self._check(self.tree, names)
 
     def _check(self, node, names):
         if isinstance(node, ast.Constant):
             if not isinstance(node.value, (int, float)) or isinstance(node.value, bool):
-                raise ValueError('Formulas use numbers only.')
+                raise ValueError(f'Formulas use numbers only, not "{_part(node)}": {self.text}')
         elif isinstance(node, ast.Name):
             if node.id not in names and node.id not in _CONST and node.id != 't':
-                raise ValueError(f'Unknown name "{node.id}" in formula: {self.text}')
+                near = difflib.get_close_matches(node.id, sorted(set(names) | {'t'}), n=1, cutoff=0.6)
+                hint = f' (did you mean {near[0]}?)' if near else (f' (known names: {", ".join(sorted(names)) or "none"}, t)')
+                raise ValueError(f'Unknown name "{node.id}"{hint} in formula: {self.text}')
         elif isinstance(node, ast.BinOp) and type(node.op) in _BIN:
             self._check(node.left, names); self._check(node.right, names)
         elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Not)):
@@ -118,15 +169,31 @@ class Formula:
         elif isinstance(node, ast.IfExp):
             for v in (node.test, node.body, node.orelse):
                 self._check(v, names)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+        elif isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError(f'"{_part(node.func)}()" is not allowed — use bare names and plain functions '
+                                 f'(e.g. exp(x), not obj.exp(x)): {self.text}')
+            if node.keywords or any(isinstance(a, ast.Starred) for a in node.args):
+                raise ValueError(f'"{_part(node)}" uses keyword or * arguments; pass plain values in order, '
+                                 f'e.g. round(x, 2): {self.text}')
             if node.func.id not in _FUNCS:
                 raise ValueError(f'Unknown function "{node.func.id}()" in formula: {self.text}. '
                                  f'Available: {", ".join(sorted(_FUNCS))}.')
             for a in node.args:
                 self._check(a, names)
+        elif isinstance(node, ast.Attribute):
+            raise ValueError(f'"{_part(node)}" is not allowed — formulas may only use bare names '
+                             f'(e.g. sunlight_hours, not params.sunlight_hours): {self.text}')
+        elif isinstance(node, ast.Subscript):
+            raise ValueError(f'"{_part(node)}" is not allowed — no indexing; use the bare name: {self.text}')
         else:
-            raise ValueError(f'Formulas may only use bare names (e.g. sunlight_hours, not params.sunlight_hours), arithmetic, '
-                             f'comparisons and {", ".join(sorted(_FUNCS))}: {self.text}')
+            what = {ast.Lambda: 'a lambda', ast.ListComp: 'a comprehension', ast.GeneratorExp: 'a comprehension',
+                    ast.SetComp: 'a comprehension', ast.DictComp: 'a comprehension', ast.List: 'a list',
+                    ast.Tuple: 'a tuple', ast.Dict: 'a dict', ast.Set: 'a set', ast.NamedExpr: 'an assignment',
+                    ast.JoinedStr: 'text'}.get(type(node), type(node).__name__)
+            raise ValueError(f'"{_part(node)}" is not allowed ({what}). Formulas may only use bare names '
+                             f'(e.g. sunlight_hours, not params.sunlight_hours), numbers, + - * / ** % //, '
+                             f'comparisons, and/or/not, x if c else y and functions like min, max, exp, clamp: {self.text}')
 
     def __call__(self, env: dict) -> float:
         try:
@@ -160,26 +227,80 @@ class Formula:
         return _FUNCS[n.func.id](*[self._eval(a, env) for a in n.args])
 
 
+_THOUSANDS = re.compile(r'(?<=\d),(?=\d{3}(?!\d))')
+_NUMBER = re.compile(r'[-+]?(?:\d+(?:[.,]\d+)?|\.\d+)(?:e[-+]?\d+)?', re.I)
+
+
 def _num(v, name):
+    """A number, also from text a model writes: "40", "1.5", "about 150", "300 steps"."""
+    if isinstance(v, bool):
+        raise ValueError(f'{name} must be a number.')
+    if isinstance(v, str):
+        v = _THOUSANDS.sub('', v)
     try:
         x = float(str(v).strip()) if isinstance(v, str) else float(v)
     except (TypeError, ValueError):
-        raise ValueError(f'{name} must be a number.') from None
+        m = _NUMBER.search(str(v)) if isinstance(v, str) else None
+        if not m:
+            raise ValueError(f'{name} must be a number.') from None
+        x = float(m.group().replace(',', '.'))
     if not math.isfinite(x):
         raise ValueError(f'{name} must be finite.')
     return x
 
 
+# Time units a duration may be written in, in seconds (a month is 365.25 / 12 days).
+_UNIT_SECONDS = {'second': 1, 'minute': 60, 'hour': 3600, 'day': 86400, 'week': 7 * 86400,
+                 'month': 365.25 / 12 * 86400, 'year': 365.25 * 86400, 'decade': 3652.5 * 86400}
+_UNIT_WORDS = {'s': 'second', 'sec': 'second', 'secs': 'second', 'm': 'minute', 'min': 'minute', 'mins': 'minute',
+               'h': 'hour', 'hr': 'hour', 'hrs': 'hour', 'd': 'day', 'wk': 'week', 'wks': 'week', 'w': 'week',
+               'mo': 'month', 'mos': 'month', 'mon': 'month', 'y': 'year', 'yr': 'year', 'yrs': 'year'}
+
+
+def _unit(word):
+    """'Days' → 'day', 'hrs' → 'hour'; None when it is not a time unit."""
+    w = str(word or '').strip().lower().rstrip('.')
+    if w in _UNIT_WORDS:
+        return _UNIT_WORDS[w]
+    w = w[:-1] if w.endswith('s') and w[:-1] in _UNIT_SECONDS else w
+    return w if w in _UNIT_SECONDS else None
+
+
+def parse_duration(value, time_unit=None):
+    """(duration in the spec's time unit, the time unit, a note when text was converted).
+
+    Accepts 150, "150", "1.5", "approx. 150 days", "10 years", "6 months", "2 hours". A duration written
+    in another unit than time_unit is converted ("10 years" with time_unit days → 3652.5); with no
+    time_unit the duration's own unit becomes the spec's unit. Fails only when no number is present."""
+    if not isinstance(value, str):
+        return _num(value, 'duration'), time_unit, None
+    value = _THOUSANDS.sub('', value)
+    m = re.search(r'([-+]?(?:\d+(?:[.,]\d+)?|\.\d+))\s*([A-Za-z]+)?', value)
+    if not m:
+        raise ValueError(f'duration must be a number (got {value!r}); e.g. 150 or "10 years".')
+    amount, said = float(m.group(1).replace(',', '.')), _unit(m.group(2))
+    plain = value.strip() in (str(amount), f'{amount:g}', m.group(1))
+    spec_unit = _unit(time_unit)
+    if said is None or said == spec_unit or (time_unit and spec_unit is None):
+        # no unit written, the same unit, or a spec unit we cannot convert to (e.g. "generations")
+        return amount, time_unit, None if plain else f'duration "{value}" read as {amount:g} {time_unit or "steps"}'
+    if spec_unit is None:                                    # no time_unit in the spec: take the duration's own
+        return amount, said + 's', f'duration "{value}" read as {amount:g} {said}s'
+    converted = amount * _UNIT_SECONDS[said] / _UNIT_SECONDS[spec_unit]
+    return round(converted, 6), time_unit, f'duration "{value}" converted to {converted:,.6g} {time_unit}'
+
+
 def compile_spec(spec: dict) -> dict:
     if not isinstance(spec, dict):
         raise ValueError('Describe the process as a spec object.')
-    duration = _num(spec.get('duration', 100), 'duration')
+    duration, time_unit, duration_note = parse_duration(spec.get('duration', 100), spec.get('time_unit'))
     if not 0 < duration <= 1e7:
         raise ValueError('duration must be above zero.')
     steps = int(_num(spec.get('steps', 300), 'steps'))
     steps = max(20, min(MAX_STEPS, steps))
     params = {}
     for k, v in (spec.get('params') or {}).items():
+        k = str(k).strip().lower().replace(' ', '_')
         if not _NAME.match(str(k)):
             raise ValueError(f'Setting names use lowercase letters, digits and _: {k}')
         params[str(k)] = _num(v, k)
@@ -211,7 +332,8 @@ def compile_spec(spec: dict) -> dict:
     if focus not in [v['name'] for v in variables]:
         raise ValueError(f'focus must be one of the variables: {", ".join(v["name"] for v in variables)}')
     unc = max(0.0, min(80.0, _num(spec.get('uncertainty_percent', 0), 'uncertainty_percent')))
-    return {'title': str(spec.get('title') or 'Process')[:60], 'unit': str(spec.get('time_unit') or 'steps')[:12],
+    return {'title': str(spec.get('title') or 'Process')[:60], 'unit': str(time_unit or 'steps')[:12],
+            'duration_note': duration_note,
             'duration': duration, 'steps': steps, 'params': params, 'variables': variables, 'events': events,
             'stages': stages, 'focus': focus, 'uncertainty': unc, 'paths': int(spec.get('paths', 60)),
             'seed': int(_num(spec.get('seed', 42), 'seed')), 'scene': spec.get('scene') if isinstance(spec.get('scene'), dict) else None}
@@ -293,6 +415,7 @@ def simulate(spec: dict) -> dict:
                             'uncertainty_percent': c['uncertainty'], 'paths': len(paths) or None, 'seed': c['seed']},
             'formulas': {v['name']: (v['kind'], v['f'].text) for v in c['variables']},
             'model_warnings': warnings,
+            'notes': [n for n in (c.get('duration_note'),) if n],
             'method': 'Step-by-step model JARVIS wrote from your description: rate formulas are integrated, value formulas computed each step.',
             'limits': 'An illustrative model built from general knowledge, not measured data or a scientific prediction.'}
 

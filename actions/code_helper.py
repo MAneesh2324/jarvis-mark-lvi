@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import json
@@ -57,7 +58,7 @@ def _resolve_save_path(output_path: str, language: str, description: str = "") -
         "sql": ".sql", "json": ".json", "rust": ".rs", "go": ".go",
     }
     if output_path:
-        p = Path(output_path)
+        p = Path(output_path).expanduser()
         return p if p.is_absolute() else DESKTOP / p
     from core import code_quality as cq
     ext = ext_map.get((language or "python").lower()) or cq.EXT.get(cq.norm_lang(language), ".txt")
@@ -249,6 +250,34 @@ def _build(description, language, output_path, args, timeout, speak=None, player
     msg = f"I could not get it fully working, sir. {_report_line(report)} Last version saved to {path}."
     if speak: speak(msg)
     return f"{msg}\n\n{run.get('output', '')}".strip()
+
+
+def _expand(path) -> str:
+    """'~/Desktop/x.py' → '/Users/<you>/Desktop/x.py'. Without this a folder literally named '~' was created."""
+    path = str(path or "").strip().strip('"').strip("'")
+    return os.path.expandvars(os.path.expanduser(path)) if path else ""
+
+
+def _save_code_action(code, language, output_path, description, player) -> str:
+    """The model already wrote the code: save it as given, check it, and say where it is."""
+    from core import code_quality as cq
+    code = cq.extract_code(code) or code
+    path = _resolve_save_path(output_path, language, description or "jarvis code")
+    saved = _save_file(path, code)
+    if saved.startswith("Could not save"):
+        return saved
+    print(f"[Code] ✅ Saved: {path}")
+    if player:
+        player.write_log(f"[Code] Saved: {path}")
+    try:
+        report = cq.static_check(language, code)
+    except Exception:
+        report = {}
+    problems = (report.get("errors") or []) + [f"not installed: {m}" for m in report.get("missing_modules") or []]
+    note = (f"Problems found: {'; '.join(problems[:3])}." if problems
+            else f"Checked: {report.get('checker')}, clean." if report.get("checker") not in (None, "-", "none available")
+            else "")
+    return f"Code saved to: {path}\n{note}".strip()
 
 
 def _write_action(description, language, output_path, player) -> str:
@@ -504,8 +533,11 @@ def code_helper(
     action      = p.get("action", "auto").lower().strip()
     description = p.get("description", "").strip()
     language    = p.get("language", "python").strip()
-    output_path = p.get("output_path", "").strip()
-    file_path   = p.get("file_path", "").strip()
+    output_path = _expand(p.get("output_path", ""))
+    file_path   = _expand(p.get("file_path", ""))
+    if file_path and not Path(file_path).exists():
+        from core import paths
+        file_path = str(paths.resolve(p.get("file_path", "")))   # "solve.py", "Desktop/x.py": find it
     code        = p.get("code", "").strip()
     args        = p.get("args", [])
     timeout     = int(p.get("timeout", 30))
@@ -515,6 +547,8 @@ def code_helper(
         print(f"[Code] 🤖 Auto-detected: {action}")
 
     if action == "write":
+        if code:
+            return _save_code_action(code, language, output_path, description, player)
         return _write_action(description, language, output_path, player)
 
     elif action == "edit":
@@ -572,7 +606,7 @@ TOOL = {
             },
             "code": {
                 "type": "STRING",
-                "description": "Raw code string for explain"
+                "description": "Raw code: for explain/optimize, or with write to save code you already wrote as-is (no description needed)"
             },
             "args": {
                 "type": "STRING",

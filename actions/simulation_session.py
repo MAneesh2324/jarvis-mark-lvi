@@ -48,6 +48,12 @@ def _summary(board, extra=None):
             'verdict': {'success': 'MODEL SUCCESSFUL', 'failed': 'MODEL FAILED'}.get(sess.get('status'), 'no goal set'),
             'this_attempt': {k: last.get(k) for k in ('change', 'value', 'passed')},
             'headline': headline(board)['verdict'], 'current_settings': S.status().get('current_settings')}
+    if board.get('facts'):                                   # switched interval, reused symbol, matched names…
+        data.update(board['facts'])
+        data['say_facts'] = 'Tell the user briefly about any switched interval, reused symbol or matched setting.'
+    for key in ('notes', 'renamed_parameters', 'defaults_used'):
+        if board.get(key):
+            data[key] = board[key]
     if board.get('model_warnings'):
         data['model_warnings'] = board['model_warnings']
         data['say'] = ('The result looks unrealistic. Tell the user in one line, then start again with a corrected spec '
@@ -63,6 +69,7 @@ def _summary(board, extra=None):
 
 def session(parameters, player=None, **kwargs):
     from core import sim_session as S
+    from core.scenario_simulator import NeedInput
     p = dict(parameters or {})
     action = p.get('action') or ('start' if p.get('parameters_json') else 'change' if p.get('changes_json')
                                  else 'search' if p.get('param') else 'status')
@@ -80,6 +87,11 @@ def session(parameters, player=None, **kwargs):
         if action == 'start':
             kind = p.get('kind', '')
             spec = json.loads(p.get('parameters_json') or '{}')
+            if kind == 'backtest' and not spec.get('symbol') and not spec.get('csv_path'):
+                from actions.trading_lab import reuse_last
+                if not reuse_last(spec, backtest=True)[0].get('symbol'):
+                    return outcome.ask('simulation_session', 'Which symbol should the backtest use, for example '
+                                       'XAUUSD, EURUSD or NAS100?', kind='backtest', missing='symbol')
             board = S.start(kind, spec, criterion(), p.get('label', ''))
             _montage(player, [board])
             return outcome.untrusted('live-simulation', json.dumps(_summary(board), ensure_ascii=False, default=str))
@@ -118,6 +130,8 @@ def session(parameters, player=None, **kwargs):
                 player.show_simulation(None)
             return outcome.done('simulation_session', reset=True)
         raise ValueError('Unknown simulation_session action.')
+    except NeedInput as need:
+        return outcome.ask('simulation_session', need.question(), kind=need.kind, missing=','.join(need.missing))
     except Exception as exc:
         return outcome.failed('simulation_session', str(exc)[:400])
 

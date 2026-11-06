@@ -167,20 +167,75 @@ def headline(result):
   return {'title':'OUTAGE RECOVERY','metrics':m,'verdict':('Recovery is stable.' if result.get('stable_recovery') else 'Recovery never catches up: capacity is below normal traffic.')}
  return {'title':'SIMULATION','metrics':[],'verdict':''}
 
+class NeedInput(ValueError):
+ """A required number is missing and has no sensible default: the tool should ask, not fail."""
+ def __init__(self,kind,missing):
+  self.kind,self.missing=kind,list(missing)
+  super().__init__(f'{kind} needs: '+', '.join(self.missing)+'.')
+ def question(self):
+  return f"What {', '.join(m.replace('_',' ') for m in self.missing)} should the {self.kind.replace('_',' ')} simulation use?"
+
+# Other names a model writes for a parameter (seen live: move_percent for pair_move_percent)
+ALIASES={
+ 'trade_stress':{'move_percent':'pair_move_percent','move':'pair_move_percent','price_move_percent':'pair_move_percent','percent_move':'pair_move_percent','pair_move':'pair_move_percent','rate_move_percent':'pair_move_percent',
+  'start_price':'pair_start','entry_price':'pair_start','entry':'pair_start','price':'pair_start','pair_price':'pair_start','start_rate':'pair_start','rate':'pair_start','starting_rate':'pair_start',
+  'balance':'equity','account_balance':'equity','account_equity':'equity','capital':'equity','account_size':'equity',
+  'position_size':'units','size':'units','quantity':'units','base_units':'units','qty':'units',
+  'conversion':'quote_to_account','quote_to_account_rate':'quote_to_account','fx_conversion':'quote_to_account','conversion_rate':'quote_to_account',
+  'side':'direction','spread':'spread_cost','slippage':'slippage_cost'},
+ 'goal':{'hours':'total_hours','hours_needed':'total_hours','total':'total_hours','hours_required':'total_hours','daily_hours':'hours_per_day','hours_a_day':'hours_per_day','per_day':'hours_per_day',
+  'consistency':'consistency_percent','done':'hours_done','completed_hours':'hours_done','deadline':'deadline_days','days':'deadline_days','variation_percent':'daily_variation_percent'},
+ 'savings':{'monthly':'monthly_contribution','contribution':'monthly_contribution','monthly_saving':'monthly_contribution','monthly_savings':'monthly_contribution','monthly_deposit':'monthly_contribution',
+  'duration_months':'months','period_months':'months','initial_balance':'start_balance','starting_balance':'start_balance','balance':'start_balance','initial':'start_balance',
+  'return_percent':'annual_return_percent','volatility_percent':'annual_volatility_percent','goal':'target','target_balance':'target'},
+ 'forex':{'rate':'start_rate','start':'start_rate','price':'start_rate','starting_rate':'start_rate','return_percent':'annual_return_percent','drift_percent':'annual_return_percent',
+  'volatility_percent':'annual_volatility_percent','volatility':'annual_volatility_percent','shock':'shock_percent','trading_days':'days'},
+ 'outage':{'rpm':'requests_per_minute','duration_minutes':'outage_minutes','minutes':'outage_minutes','affected':'affected_percent','capacity':'capacity_per_minute','retry':'retry_percent','backlog':'backlog_before'}}
+# Required inputs with one honest default, and what the default assumes
+DEFAULTS={'trade_stress':{'quote_to_account':(1.0,'account currency is the quote currency')}}
+_FUNCTIONS=lambda:{'forex':forex,'trade_stress':trade_stress,'outage':outage,'goal':goal,'savings':savings}
+
+def accepted_keys(kind):
+ import inspect
+ f=_FUNCTIONS().get(kind)
+ return list(inspect.signature(f).parameters) if f else []
+
+def canonical(kind,parameters):
+ """(parameters with known other names renamed to the real ones, {given: real})."""
+ import difflib
+ accepted=accepted_keys(kind);out,renamed={},{}
+ for k,v in parameters.items():
+  if k in accepted:out[k]=v
+ for k,v in parameters.items():
+  if k in accepted:continue
+  key=str(k).strip().lower().replace(' ','_').replace('-','_')
+  real=key if key in accepted else ALIASES.get(kind,{}).get(key) or next(iter(difflib.get_close_matches(key,accepted,n=1,cutoff=.8)),None)
+  if real and real not in out:out[real]=v;renamed[k]=real
+  else:out[k]=v
+ if kind=='trade_stress' and isinstance(out.get('direction'),str):
+  out['direction']={'buy':'long','sell':'short','bullish':'long','bearish':'short'}.get(out['direction'].strip().lower(),out['direction'].strip().lower())
+ return out,renamed
+
 def run(kind,parameters):
  if not isinstance(parameters,dict):raise ValueError('Provide a parameter object.')
  if kind=='process':
   from core.process_sim import simulate
   result=simulate(parameters);result['created']=datetime.now(timezone.utc).isoformat();return result
- functions={'forex':forex,'trade_stress':trade_stress,'outage':outage,'goal':goal,'savings':savings}
+ functions=_FUNCTIONS()
  if kind not in functions:raise ValueError('Choose forex, trade_stress, outage, goal, savings or process.')
  import inspect
+ parameters,renamed=canonical(kind,parameters)
  accepted=inspect.signature(functions[kind]).parameters
  ignored=sorted(k for k in parameters if k not in accepted)
  missing=[k for k,v in accepted.items() if v.default is inspect.Parameter.empty and k not in parameters]
- if missing:raise ValueError(f'{kind} needs: '+', '.join(missing)+'.')
+ defaults={}
+ for k in [m for m in missing if m in DEFAULTS.get(kind,{})]:
+  value,why=DEFAULTS[kind][k];parameters[k]=value;defaults[k]=f'{value:g} ({why})';missing.remove(k)
+ if missing:raise NeedInput(kind,missing)
  result=functions[kind](**{k:v for k,v in parameters.items() if k in accepted})
  if ignored:result['ignored_parameters']=ignored     # a stray model key must not cancel the whole run
+ if renamed:result['renamed_parameters']=renamed
+ if defaults:result['defaults_used']=defaults
  result['created']=datetime.now(timezone.utc).isoformat();return result
 
 def save(result):
@@ -189,7 +244,11 @@ def save(result):
  write_file(path,json.dumps(result,ensure_ascii=False,allow_nan=False,indent=2));return str(path)
 
 def compare(kind,baseline,alternative):
+    renamed={}
+    if kind!='process':                                  # rename first, so an alternative's other spelling still wins
+        (baseline,r1),(alternative,r2)=canonical(kind,baseline),canonical(kind,alternative);renamed={**r1,**r2}
     a=run(kind,baseline);b=run(kind,{**baseline,**alternative})
+    if renamed:a['renamed_parameters']={**renamed,**a.get('renamed_parameters',{})}
     changed={k:{'baseline':baseline.get(k),'alternative':v} for k,v in alternative.items() if baseline.get(k)!=v}
     metrics={k:{'baseline':a[k],'alternative':b[k],'difference':b[k]-a[k]} for k in a if isinstance(a[k],(int,float)) and not isinstance(a[k],bool) and isinstance(b.get(k),(int,float)) and not isinstance(b[k],bool)}
     return {'kind':'comparison','scenario_kind':kind,'changed_assumptions':changed,'metrics':metrics,'baseline':a,'alternative':b,'limits':'Both runs are hypothetical and conditional on their assumptions. Using the same random seed improves controlled comparison; it does not establish real-world probabilities.'}

@@ -150,11 +150,16 @@ class Face:
         light = float(grey.mean())
         return 45 <= light <= 215 and float(self.cv2.Laplacian(grey, self.cv2.CV_64F).var()) >= 25
 
-    def frames(self, count=6, gap=0.25):
+    def frames(self, count=6, gap=0.25, _borrowed=False):
         """Grab frames from the webcam, holding the shared camera lock for the shortest time."""
         from core import camera_access
         from actions.screen_processor import _load_config, _cv2_backend
         out = []
+        busy_with_gestures = 'gesture' in (camera_access._owner or '')
+        if busy_with_gestures and not _borrowed:  # hand tracking holds the camera: borrow it, then give it back
+            from core.hand_gestures import controller
+            with controller.paused():
+                return self.frames(count, gap, _borrowed=True)
         with camera_access.claim('owner recognition'):
             cap = self.cv2.VideoCapture(int(_load_config().get('camera_index', 0)), _cv2_backend())
             try:
@@ -421,6 +426,7 @@ class VoiceGuard:
         if self.owner is None or not settings()['voice_guard']:
             return None
         v = self.verdict(emb, seconds)
+        self.last_emb, self.last_score = emb, float(v.get('score', 0))
         if v['result'] == 'stranger':
             self.strangers += 1
         elif v['result'] == 'owner':
@@ -436,6 +442,27 @@ class VoiceGuard:
         self.last = dict(v, at=time.time())
         return dict(self.last, consecutive_strangers=self.strangers, alarm=alarm)
 
+
+def _owner_confirmed(self, people: int = 1) -> bool:
+    """The camera showed the owner, alone, while their voice was judged a stranger: the voice check was wrong.
+
+    Clear the stranger streak and learn this sample, so the same room, mic or mood is recognised next time.
+    A clearly different voice (below VOICE_ALARM) or more than one face is never learned: that could be a guest."""
+    emb, score = getattr(self, 'last_emb', None), float(getattr(self, 'last_score', 0.0))
+    self.strangers = 0
+    self.last_emb = None
+    if emb is None or self.owner is None or people != 1 or score < VOICE_ALARM:
+        return False
+    grown = _learn(self.owner, emb)
+    if grown is None:
+        return False
+    _save_vec('voice.npy', grown)
+    self.owner = grown
+    self.threshold = owner_threshold(grown)
+    return True
+
+
+VoiceGuard.owner_confirmed = _owner_confirmed
 
 _voice: VoiceGuard | None = None
 

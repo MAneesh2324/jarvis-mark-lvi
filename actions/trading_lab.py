@@ -1,29 +1,83 @@
 """Voice tool for the trading lab: chart pattern analysis, playbook, backtests and code writing."""
+import difflib
 import json
+import threading
 
 from core import outcome
 
 
-def run_backtest(p):
-    """A backtest from tool parameters: the window, history range, money and strategy settings. Raw stats."""
+# What the last analysis or backtest in this process used, so "now check it for one week" works without
+# repeating the symbol. Only filled from calls that succeeded.
+_LAST: dict = {}
+_LAST_LOCK = threading.Lock()
+_REUSE_SYMBOL = ('symbol', 'interval')
+_REUSE_SETTINGS = ('strategy', 'rr', 'side', 'account_balance', 'risk_percent', 'risk_amount', 'spread', 'commission',
+                   'compound', 'stop_at', 'sweep_window', 'retest_window', 'max_hold', 'fast', 'slow', 'length',
+                   'atr_stop', 'oversold', 'overbought', 'swing_length')
+
+
+def remember(p: dict, backtest: bool = False):
+    """Keep the symbol (and, for a backtest, its strategy and money settings) of a call that worked."""
+    if not p.get('symbol') or p.get('csv_path'):
+        return
+    with _LAST_LOCK:
+        if str(p['symbol']).upper() != str(_LAST.get('symbol', '')).upper():
+            _LAST.clear()                                   # settings belong to the old symbol's test
+        _LAST.update({k: p[k] for k in _REUSE_SYMBOL if p.get(k) is not None})
+        if backtest:
+            _LAST.update({k: p[k] for k in _REUSE_SETTINGS if p.get(k) is not None})
+
+
+def reuse_last(p: dict, backtest: bool = False) -> tuple[dict, dict]:
+    """When a call names no symbol (and no CSV), fill it from the last one. Returns (params, facts)."""
     p = dict(p)
+    if p.get('symbol') or p.get('csv_path'):
+        return p, {}
+    with _LAST_LOCK:
+        last = dict(_LAST)
+    if not last.get('symbol'):
+        return p, {}
+    p['symbol'] = last['symbol']
+    filled = [k for k in ('interval',) + (_REUSE_SETTINGS if backtest else ()) if p.get(k) is None and k in last]
+    p.update({k: last[k] for k in filled})
+    return p, {'symbol_reused': last['symbol'], 'settings_reused': {k: last[k] for k in filled} or None}
+
+
+def run_backtest(p):
+    """A backtest from tool parameters: the window, history range, money and strategy settings. Raw stats.
+
+    A window the requested interval cannot cover (Yahoo keeps 1m for ~7 days, 5m-30m for ~60, 1h for ~2
+    years, and a test holds at most MAX_CANDLES candles) runs on the finest interval that covers it, and
+    says so in interval_requested / interval_used."""
+    p, facts = reuse_last(p, backtest=True)
     import time as _time
+    from core import trading_lab as lab
     hours = float(p.get('past_days') or 0) * 24 or float(p.get('past_hours') or 0)
     from_time = int(_time.time() - hours * 3600) if hours else None
+    if hours and not p.get('csv_path'):
+        given = p.get('interval') is not None
+        asked = str(p.get('interval') or '1h').lower().replace('60m', '1h')
+        used = lab.interval_for_window(asked, hours / 24)
+        if used != asked:
+            p['interval'] = used
+            p.pop('range', None)                          # a range picked for the old interval no longer fits
+            facts.update(interval_requested=asked + ('' if given else ' (default)'),
+                         interval_used=used,
+                         interval_note=f'{asked} candles cannot cover {hours / 24:g} days from this data source; '
+                                       f'tested on {used}, the finest interval that does.')
     if hours and not p.get('range') and not p.get('csv_path'):
         # enough history for the window plus room for swings to form before it
         need = hours / 24 + 3
         p['range'] = next(r for r, d in (('5d', 5), ('1mo', 30), ('3mo', 90), ('6mo', 180), ('1y', 365),
                                          ('2y', 730), ('5y', 1825), ('max', 1e9)) if d >= need)
         interval = p.get('interval', '1h')
-        if interval == '1m' and need > 7:
-            raise ValueError('1-minute data only goes back about 7 days; use 5m or higher for longer tests.')
-        # Yahoo serves intraday candles below 1h for about 60 days, 1h/4h for about 2 years
-        if interval in ('2m', '5m', '15m', '30m') and p['range'] not in ('5d', '1mo'):
+        # Yahoo serves 1m for about 7 days, intraday candles below 1h for about 60 days, 1h/4h for about 2 years
+        if interval == '1m':
+            p['range'] = '5d'
+        elif interval in ('2m', '5m', '15m', '30m') and p['range'] not in ('5d', '1mo'):
             p['range'] = '1mo'
         elif interval in ('1h', '4h') and p['range'] in ('5y', 'max'):
             p['range'] = '2y'
-    from core import trading_lab as lab
     data = lab.load(p)
     clipped = None
     if from_time and data['candles'] and data['candles'][0]['t'] > from_time + 86400:
@@ -33,7 +87,10 @@ def run_backtest(p):
     stats = _backtest(lab, data, p, from_time)
     if clipped:
         stats['window_note'] = clipped
-    return stats
+    if data.get('range_note'):
+        stats['range_note'] = data['range_note']
+    remember(p, backtest=True)
+    return {**{k: v for k, v in facts.items() if v is not None}, **stats}
 
 
 def _backtest(lab, data, p, from_time):
@@ -87,9 +144,52 @@ def _trade_table(data, player):
         print(f'[TradingLab] trade table failed: {exc}')
 
 
+ACTIONS = ('analyse', 'backtest', 'compare', 'playbook', 'save_strategy', 'delete_strategy', 'write_code',
+           'learning', 'watch', 'unwatch', 'scan', 'calendar')
+# Other words a model uses for an action ("analyze" was sent in the live app and refused)
+ACTION_ALIASES = {
+    'analyze': 'analyse', 'analysis': 'analyse', 'analyse_chart': 'analyse', 'analyze_chart': 'analyse',
+    'chart': 'analyse', 'check': 'analyse', 'review': 'analyse', 'look': 'analyse', 'structure': 'analyse',
+    'setups': 'analyse', 'zones': 'analyse', 'patterns': 'analyse', 'detect': 'analyse',
+    'test': 'backtest', 'back_test': 'backtest', 'backtesting': 'backtest', 'run_backtest': 'backtest',
+    'simulate': 'backtest', 'simulation': 'backtest', 'test_strategy': 'backtest',
+    'compare_strategies': 'compare', 'comparison': 'compare',
+    'scanner': 'scan', 'screen': 'scan', 'screener': 'scan', 'scan_pairs': 'scan', 'scan_markets': 'scan',
+    'news': 'calendar', 'events': 'calendar', 'economic_calendar': 'calendar', 'econ_calendar': 'calendar',
+    'stats': 'learning', 'record': 'learning', 'learning_stats': 'learning', 'track_record': 'learning',
+    'code': 'write_code', 'generate_code': 'write_code', 'pine': 'write_code', 'pinescript': 'write_code',
+    'write': 'write_code', 'save': 'save_strategy', 'add_strategy': 'save_strategy',
+    'remove_strategy': 'delete_strategy', 'explain': 'playbook', 'define': 'playbook', 'lookup': 'playbook',
+    'follow': 'watch', 'track': 'watch', 'stop_watching': 'unwatch', 'untrack': 'unwatch',
+}
+
+
+def resolve_action(name) -> str | None:
+    """The trading_lab action meant by `name`, or None."""
+    key = str(name or 'analyse').strip().lower().replace('-', '_').replace(' ', '_')
+    if key in ACTIONS:
+        return key
+    if key in ACTION_ALIASES:
+        return ACTION_ALIASES[key]
+    near = difflib.get_close_matches(key, list(ACTIONS) + list(ACTION_ALIASES), n=1, cutoff=0.8)
+    return (ACTION_ALIASES.get(near[0], near[0])) if near else None
+
+
 def trading_lab(parameters, player=None, **kwargs):
     p = dict(parameters or {})
-    action = p.get('action', 'analyse')
+    asked = p.get('action', 'analyse')
+    action = resolve_action(asked)
+    if action is None:
+        return outcome.failed('trading_lab', f'Unknown trading_lab action "{asked}". Use one of: ' + ', '.join(ACTIONS) + '.')
+    facts = {'action_requested': asked, 'action_used': action} if action != asked else {}
+    if action in ('analyse', 'backtest', 'compare') and not p.get('symbol') and not p.get('csv_path'):
+        filled, reused = reuse_last(p, backtest=action == 'backtest')
+        if not filled.get('symbol'):
+            return outcome.ask('trading_lab', 'Which symbol should I use, for example XAUUSD, EURUSD or NAS100?',
+                               missing='symbol', **facts)
+        if action != 'backtest':                       # run_backtest fills and reports its own reuse
+            p = filled
+            facts.update({k: v for k, v in reused.items() if v is not None})
     try:
         from core import trading_lab as lab
         if action == 'analyse':
@@ -105,6 +205,7 @@ def trading_lab(parameters, player=None, **kwargs):
                         setup_tracker.record(p['symbol'], interval, data['setups_ranked'], candles['candles'][-1]['t'])
                 except Exception as exc:
                     print(f'[TradingLab] learning log skipped: {exc}')
+            remember(p)
         elif action == 'scan':
             data = lab.scan(p.get('pairs'), p.get('interval', '1h'), p.get('bias', 'both'))
         elif action == 'calendar':
@@ -149,12 +250,14 @@ def trading_lab(parameters, player=None, **kwargs):
                                   p.get('name', ''), p.get('output_dir', ''),
                                   **{k: p.get(k) for k in ('rr', 'side', 'fast', 'slow', 'atr_stop', 'oversold',
                                                            'overbought', 'length', 'swing_length')})
-            return outcome.done('trading_lab', **data)
+            return outcome.done('trading_lab', **facts, **data)
         else:
             raise ValueError('Unknown trading_lab action.')
+        if facts and isinstance(data, dict):
+            data = {**facts, **data}
         return outcome.untrusted('trading-lab', json.dumps(data, ensure_ascii=False, default=str))
     except Exception as exc:
-        return outcome.failed('trading_lab', str(exc)[:500])
+        return outcome.failed('trading_lab', str(exc)[:500], **facts)
 
 
 TOOL = {
@@ -174,7 +277,8 @@ TOOL = {
         'sweep_mss_breaker (THE USER\'S OWN SETUP: liquidity sweep of a high/low → market structure shift → breaker '
         'retest entry; stop_at sweep (default) or breaker; sweep_window, retest_window candles). Use sweep_mss_breaker '
         'whenever the user says "my setup", "my strategy", sweep/MSS/breaker. past_hours or past_days limits the test '
-        'to that recent window (the right history range is fetched). For P&L in money pass account_balance and '
+        'to that recent window (the right history range is fetched; a window the interval cannot cover runs on the '
+        'finest interval that can, reported as interval_used — tell the user). With no symbol the last one is reused. For P&L in money pass account_balance and '
         'risk_percent (or risk_amount); spread (price units, e.g. 0.3 on gold) and commission per trade make it '
         'realistic. Results are drawn on the holographic board and every win/loss trade is listed under it; say '
         'wins, losses, win rate, R and net P&L. '

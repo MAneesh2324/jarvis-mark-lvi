@@ -1,9 +1,11 @@
 import json
+import re
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 from core import outcome
 from core.lazyimport import LazyModule, installed
@@ -177,53 +179,170 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
         platform=app_name, to=receiver,
     )
 
-def _send_whatsapp(receiver: str, message: str) -> str:
-    """WhatsApp goes through the verified driver when there is one.
+def _phone_digits(receiver: str, phone: str = "") -> str:
+    """International digits when the recipient is a phone number, else ''.
 
-    _desktop_send below is a sequence of keystrokes with sleeps between them:
-    it presses Win, types the app name, presses Ctrl+F, types the contact,
-    presses Enter twice and reports success — without ever reading back which
-    window received any of that. When the machine is a second slower than the
-    sleeps assume, the whole sequence lands somewhere else and the user is
-    still told the message was sent.
+    "+91 62823 21289", "(916) 282-321289" and "916282321289" all qualify; a
+    contact name never does, even one with a digit in it ("Noble 2").
+    """
+    for raw in (phone, receiver):
+        raw = str(raw or "").strip()
+        if raw and re.fullmatch(r"\+?[\d\s().\-]{7,24}", raw):
+            digits = re.sub(r"\D", "", raw)
+            if 7 <= len(digits) <= 15:
+                return digits
+    return ""
 
-    plugins/_whatsapp_core.py already drives WhatsApp properly for the calling
-    plugins: it finds the real window, opens the conversation, checks the
-    conversation is the right person's, types, and confirms the box emptied
-    before it says "sent". Using it here costs nothing and removes the one
-    failure that matters — a message reported as delivered that never left.
 
-    The blind path stays as the fallback for a machine where the driver cannot
-    run at all (the plugin file removed, a missing dependency, no WhatsApp).
-    But once the driver HAS run, its answer stands: falling back after it
-    refused to send is how a message ends up typed into the wrong
-    conversation, which is worse than not sending it.
+def _frontmost_app() -> str:
+    """Name of the app in front (macOS), or '' when it cannot be read.
+
+    lsappinfo first: it needs no Automation permission. System Events second.
     """
     try:
-        from plugins import _whatsapp_core as wa
-    except Exception as e:
-        print(f"[SendMessage] WhatsApp driver unavailable ({e}) — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
-
+        asn = subprocess.run(["lsappinfo", "front"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=2).stdout.strip()
+        if asn:
+            info = subprocess.run(["lsappinfo", "info", "-only", "name", asn], capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace", timeout=2).stdout
+            m = (re.search(r'"(?:LSDisplayName|name)"\s*=\s*"([^"]+)"', info)
+                 or re.match(r'\s*"([^"]+)"', info))
+            if m:
+                return m.group(1).strip()
+    except Exception:
+        pass
     try:
-        transport, why = wa.get()
+        p = subprocess.run(
+            ["osascript", "-e", 'tell application "System Events" to get name of '
+                                'first application process whose frontmost is true'],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2)
+        return (p.stdout or "").strip() if p.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _wait_front(app: str, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if _frontmost_app().lower() == app.lower():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.3)
+
+
+def _open_url_scheme(url: str) -> bool:
+    try:
+        if _get_os() == "mac":
+            return subprocess.run(["open", url], capture_output=True, timeout=10).returncode == 0
+        if _get_os() == "windows":
+            import os
+            os.startfile(url)                         # noqa: S606 — a whatsapp:// link
+            return True
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     except Exception as e:
-        print(f"[SendMessage] WhatsApp driver failed to start ({e}) — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
+        print(f"[SendMessage] could not hand the WhatsApp link over: {e}")
+        return False
 
-    if transport is None:
-        print(f"[SendMessage] {why} — typing blind.")
-        return _desktop_send("WhatsApp", receiver, message)
 
-    sent, failure = transport.send_message_to(receiver, message)
-    if sent:
-        # The one platform that can say `done`: the driver opened the
-        # conversation, proved it was the right person's, typed, and confirmed
-        # the box emptied.
-        return outcome.done("send_message", platform="WhatsApp",
-                            to=receiver, verified=True)
-    return outcome.failed("send_message", failure,
-                          platform="WhatsApp", to=receiver)
+def _whatsapp_by_number(digits: str, receiver: str, message: str) -> str:
+    """WhatsApp desktop's own link: opens THAT number's chat with the text filled in.
+
+    No searching by name, so it cannot land in the wrong conversation. Enter is
+    pressed only once WhatsApp is confirmed to be the app in front, so the
+    keystroke cannot go anywhere else.
+    """
+    url = f"whatsapp://send?phone={digits}&text={quote(message, safe='')}"
+    if not _open_url_scheme(url):
+        return outcome.failed(
+            "send_message", "WhatsApp could not be opened with that number - is the "
+            "WhatsApp desktop app installed?", platform="WhatsApp", to=receiver)
+    if _get_os() != "mac":
+        return outcome.unverified(
+            "send_message", "WhatsApp was opened on that number's chat with the message "
+            "filled in, but it was NOT sent - press Enter in WhatsApp to send it",
+            platform="WhatsApp", to=receiver)
+    if not _wait_front("WhatsApp", 8.0):
+        return outcome.unverified(
+            "send_message", "WhatsApp was asked to open that number's chat with the "
+            "message filled in, but it never came to the front, so Enter was NOT "
+            "pressed - the message is not sent", platform="WhatsApp", to=receiver)
+    time.sleep(1.5)                                   # the chat and its compose box load
+    if _frontmost_app().lower() != "whatsapp":
+        return outcome.unverified(
+            "send_message", "WhatsApp lost focus before sending, so Enter was NOT "
+            "pressed - the message is filled in but not sent",
+            platform="WhatsApp", to=receiver)
+    pyautogui.press("enter")
+    time.sleep(0.3)
+    return outcome.unverified(
+        "send_message", "WhatsApp opened that number's chat with the message filled "
+        "in and Enter was pressed, but WhatsApp does not report delivery - check "
+        "the chat", platform="WhatsApp", to=receiver, phone=digits)
+
+
+def _whatsapp_by_name(receiver: str, message: str) -> str:
+    """Search WhatsApp desktop for a contact name and type — but never blind.
+
+    The old flow pressed keys with sleeps between them and never looked where
+    they landed. On a Mac this now checks WhatsApp is the app in front before
+    searching, before pasting and before pressing Enter, and stops instead of
+    typing into whatever else is open.
+    """
+    if _get_os() != "mac":
+        return _desktop_send("WhatsApp", receiver, message)
+    if not _open_app("WhatsApp"):
+        return outcome.failed(
+            "send_message", "WhatsApp could not be opened, so nothing was typed and "
+            "no message was sent", platform="WhatsApp", to=receiver)
+
+    def _in_front(step: str):
+        if _wait_front("WhatsApp", 4.0):
+            return None
+        return outcome.failed(
+            "send_message", f"WhatsApp was not the app in front {step}, so typing "
+            f"stopped and no message was sent", platform="WhatsApp", to=receiver)
+
+    problem = _in_front("before searching for the contact")
+    if problem:
+        return problem
+    _search_in_app(receiver)
+    pyautogui.press("enter")
+    time.sleep(0.8)
+    problem = _in_front("after opening the chat")
+    if problem:
+        return problem
+    _paste_text(message)
+    time.sleep(0.2)
+    problem = _in_front("before sending")
+    if problem:
+        return problem
+    pyautogui.press("enter")
+    time.sleep(0.3)
+    return outcome.unverified(
+        "send_message", f"the message was typed into WhatsApp after searching for "
+        f"'{receiver}' and Enter was pressed, but the chat that opened could not be "
+        f"read back - it is NOT confirmed sent, or sent to the right person. A phone "
+        f"number with country code opens the exact chat", platform="WhatsApp", to=receiver)
+
+
+def _send_whatsapp(receiver: str, message: str, phone: str = "") -> str:
+    """WhatsApp without a separate driver module.
+
+    This used to import plugins/_whatsapp_core.py, which does not exist in this
+    project, so every send printed an ImportError and fell back to blind
+    keystrokes. Now:
+      * a phone number (in `phone`, or as the receiver) goes through WhatsApp's
+        own whatsapp://send link, which opens exactly that chat;
+      * a contact name goes through WhatsApp desktop's search, with a check that
+        WhatsApp is in front before every keystroke.
+    Neither can read back delivery, so neither ever says `done`.
+    """
+    digits = _phone_digits(receiver, phone)
+    if digits:
+        return _whatsapp_by_number(digits, receiver, message)
+    return _whatsapp_by_name(receiver, message)
 
 def _send_telegram(receiver: str, message: str) -> str:
     return _desktop_send("Telegram", receiver, message)
@@ -346,7 +465,7 @@ def send_message(
 
     threading.Thread(
         target=_send_and_report,
-        args=(player, platform, receiver, message_text),
+        args=(player, platform, receiver, message_text, str(params.get("phone", "") or "")),
         daemon=True, name="send-message",
     ).start()
 
@@ -358,7 +477,7 @@ def send_message(
 
 
 def _send_and_report(player, platform: str, receiver: str,
-                     message_text: str) -> None:
+                     message_text: str, phone: str = "") -> None:
     """Do the sending, then say what actually happened — including when it did
     not happen, and including when nobody can tell.
 
@@ -367,7 +486,11 @@ def _send_and_report(player, platform: str, receiver: str,
     thing this rewrite exists to stop.
     """
     try:
-        result = _resolve_platform(platform)(receiver, message_text)
+        handler = _resolve_platform(platform)
+        if handler is _PLATFORM_MAP[0][1]:            # WhatsApp: the number, if given, picks the chat
+            result = _send_whatsapp(receiver, message_text, phone)
+        else:
+            result = handler(receiver, message_text)
     except Exception as exc:
         print(f"[SendMessage] {type(exc).__name__}: {exc}")
         result = outcome.failed("send_message", f"it failed: {exc}",
@@ -419,7 +542,14 @@ TOOL = {
         "confirmed delivered to the conversation, status=unverified means the "
         "keystrokes went out and NOBODY can confirm it arrived - say exactly "
         "that - and status=failed means it did not go. Never tell the user a "
-        "message was sent unless the result said status=done."
+        "message was sent unless the result said status=done. "
+        "WHATSAPP: what works is the WhatsApp desktop app. With a phone number "
+        "(digits with country code, e.g. +916282321289, in 'phone' or as the "
+        "receiver) it opens exactly that chat through WhatsApp's own link and "
+        "sends - the reliable way. With a contact NAME it searches WhatsApp for "
+        "the name as saved in the user's contacts and types only while WhatsApp "
+        "is in front; the chat that opened cannot be read back. WhatsApp never "
+        "reports delivery, so WhatsApp results are unverified at best."
     ),
     "tier": "core",
     "parameters": {
@@ -436,6 +566,10 @@ TOOL = {
             "platform": {
                 "type": "STRING",
                 "description": "Platform: WhatsApp, Telegram, etc."
+            },
+            "phone": {
+                "type": "STRING",
+                "description": "Optional phone number with country code (WhatsApp) - opens that exact chat"
             }
         },
         "required": [

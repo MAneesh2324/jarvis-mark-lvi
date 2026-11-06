@@ -12,6 +12,7 @@ shape changes with each attempt. All local; backtests use the same engine as tra
 from __future__ import annotations
 
 import copy
+import difflib
 import threading
 
 _lock = threading.RLock()
@@ -58,14 +59,66 @@ def _criterion_text(c):
     return f"{c['metric'].replace('_', ' ')} {c['op']} {c['value']:g}" if c else 'no success condition yet'
 
 
+# What a backtest reports about itself that the model must pass on (switched interval, reused symbol…)
+BACKTEST_FACTS = ('interval_requested', 'interval_used', 'interval_note', 'symbol_reused', 'settings_reused',
+                  'window_note', 'range_note')
+PROCESS_SPEC_KEYS = ('focus', 'duration', 'steps', 'uncertainty_percent', 'seed', 'title', 'time_unit')
+
+
 def _run(kind: str, params: dict) -> dict:
     """One model run as a board result."""
     if kind == 'backtest':
         from actions.trading_lab import run_backtest
         from core.scenario_simulator import from_backtest
-        return from_backtest(run_backtest(params))
+        stats = run_backtest(params)
+        board = from_backtest(stats)
+        facts = {k: stats[k] for k in BACKTEST_FACTS if stats.get(k)}
+        if facts:
+            board['facts'] = facts
+        return board
     from core.scenario_simulator import run
     return run(kind, params)
+
+
+def known_settings(kind: str, params: dict) -> list[str]:
+    """Every setting name a change may use for this kind of model."""
+    if isinstance(params.get('variables'), list):
+        return sorted(params.get('params') or {}) + list(PROCESS_SPEC_KEYS)
+    if kind == 'backtest':
+        from actions.trading_lab import TOOL
+        names = set(TOOL['parameters']['properties']) - {'action', 'pairs', 'currencies', 'impact', 'hours_ahead',
+                                                          'query', 'name', 'rules', 'aliases', 'notes', 'language',
+                                                          'description', 'output_dir'}
+        return sorted(names | set(params))
+    from core.scenario_simulator import accepted_keys
+    return sorted(set(accepted_keys(kind)) | set(params))
+
+
+def match_changes(kind: str, params: dict, changes: dict) -> tuple[dict, dict]:
+    """Map each changed name onto a real setting: exact, a known other spelling, or a close match
+    (sunlight → sunlight_hours). Returns (changes by real name, {said: matched}). Unknown names raise."""
+    known = known_settings(kind, params)
+    out, matched = {}, {}
+    aliases = {}
+    if kind not in ('process', 'backtest'):
+        from core.scenario_simulator import ALIASES
+        aliases = ALIASES.get(kind, {})
+    for k, v in (changes or {}).items():
+        key = str(k).strip()
+        for prefix in ('params.', 'parameters.', 'settings.'):
+            key = key.removeprefix(prefix)
+        if key in known:
+            out[key] = v
+            continue
+        low = key.lower().replace(' ', '_').replace('-', '_')
+        real = (low if low in known else aliases.get(low)
+                or next(iter(difflib.get_close_matches(low, known, n=1, cutoff=0.75)), None)
+                or next((n for n in known if low and (n.startswith(low + '_') or n.endswith('_' + low))), None))
+        if real is None:
+            raise ValueError(f'"{key}" is not a setting of this {kind} model; settings: {", ".join(known)}.')
+        out[real] = v
+        matched[str(k)] = real
+    return out, matched
 
 
 def _apply(params: dict, changes: dict) -> tuple[dict, list[str]]:
@@ -76,7 +129,7 @@ def _apply(params: dict, changes: dict) -> tuple[dict, list[str]]:
         inner = new.setdefault('params', {})
         for k, v in (changes or {}).items():
             k = str(k).removeprefix('params.')
-            target = inner if k in inner or k not in ('focus', 'duration', 'steps', 'uncertainty_percent', 'seed', 'title') else new
+            target = inner if k in inner or k not in PROCESS_SPEC_KEYS else new
             old = target.get(k)
             if old != v:
                 target[k] = v
@@ -106,8 +159,10 @@ def _judge(result, criterion):
     return value, OPS[criterion['op']](value, criterion['value'])
 
 
-def _attempt(kind, params, change_text, criterion):
+def _attempt(kind, params, change_text, criterion, facts=None):
     result = _run(kind, params)
+    if facts:
+        result['facts'] = {**(result.get('facts') or {}), **facts}
     value, passed = _judge(result, criterion)
     from core.scenario_simulator import headline
     head = headline(result)
@@ -146,6 +201,11 @@ def _record(result, info, params):
 
 # ── public ──────────────────────────────────────────────────────────────────
 def start(kind: str, params: dict, criterion: dict | None = None, label: str = '') -> dict:
+    facts = {}
+    if kind == 'backtest':                                  # "same test for a week": the last symbol and settings
+        from actions.trading_lab import reuse_last
+        params, facts = reuse_last(params, backtest=True)
+        facts = {k: v for k, v in facts.items() if v is not None}
     with _lock:
         _state.clear()
         _state.update(kind=kind, params=copy.deepcopy(params), criterion=None, attempts=[], label=label, best=None)
@@ -155,7 +215,12 @@ def start(kind: str, params: dict, criterion: dict | None = None, label: str = '
             _state.clear()
             raise
         _state['criterion'] = criterion
-    result, info = _attempt(kind, copy.deepcopy(params), 'baseline', criterion)
+    try:
+        result, info = _attempt(kind, copy.deepcopy(params), 'baseline', criterion, facts)
+    except Exception:
+        with _lock:
+            _state.clear()                                  # a model that never ran is not a live session
+        raise
     return _record(result, info, copy.deepcopy(params))
 
 
@@ -180,10 +245,17 @@ def set_goal(criterion: dict) -> dict:
 
 def change(changes: dict) -> dict:
     _need()
+    if not changes:
+        raise ValueError('That changes nothing; name a setting and a new value.')
+    changes, matched = match_changes(_state['kind'], _state['params'], changes)
     params, said = _apply(_state['params'], changes)
     if not said:
-        raise ValueError('That changes nothing; name a setting and a new value.')
-    result, info = _attempt(_state['kind'], params, ', '.join(said), _state.get('criterion'))
+        cur = _state['params'].get('params', _state['params']) if isinstance(_state['params'].get('variables'), list) \
+            else _state['params']
+        same = ', '.join(f"{k} is already {cur.get(k, _state['params'].get(k))}" for k in changes)
+        raise ValueError(f'That changes nothing: {same}. Name a different value, or use show to see the current run.')
+    result, info = _attempt(_state['kind'], params, ', '.join(said), _state.get('criterion'),
+                            {'matched_settings': matched} if matched else None)
     return _record(result, info, params)
 
 
@@ -194,6 +266,7 @@ def search(param: str, values: list) -> list[dict]:
     if not param or not values:
         raise ValueError('Name one setting and at least one value to try.')
     base, boards, found = dict(_state['params']), [], False
+    param = next(iter(match_changes(_state['kind'], base, {param: None})[0]))
     for v in values:
         params, said = _apply(base, {param: v})              # every try starts from the same base
         if not said:

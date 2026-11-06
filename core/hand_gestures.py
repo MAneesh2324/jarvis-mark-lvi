@@ -119,8 +119,28 @@ class GestureController:
   with self._lock:
    if self._thread and self._thread.is_alive():raise RuntimeError('A gesture worker is already running or stopping.')
    self.generation+=1;generation=self.generation;self._stop=threading.Event();self.state='loading';self.error='';self.frames=0;self.label='Loading local tracker'
+   self._callback=callback
    self._thread=threading.Thread(target=self._supervise,args=(generation,self._stop,callback),daemon=True,name='local-hologram-gestures');self._thread.start()
   return self.status()
+ def running(self):
+  with self._lock:return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
+ def paused(self,wait=3.0):
+  """Context manager: hand the camera to someone else (a face check) for a moment, then resume tracking."""
+  from contextlib import contextmanager
+  @contextmanager
+  def _pause():
+   was=self.running();cb=getattr(self,'_callback',None)
+   if was:
+    self.stop()
+    from core import camera_access
+    end=time.monotonic()+wait
+    while camera_access._owner and time.monotonic()<end:time.sleep(0.05)
+   try:yield was
+   finally:
+    if was and cb is not None:
+     try:self.start(cb)
+     except Exception as exc:print('[Gestures] could not resume after a face check:',exc)
+  return _pause()
  def stop(self):
   with self._lock:self.generation+=1;self._stop.set();self.state='off';self.label='Off';thread=self._thread
   if thread and thread is not threading.current_thread():thread.join(timeout=2)

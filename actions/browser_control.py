@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import functools
 import importlib.util
 import os
 import json
@@ -11,9 +12,11 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import unquote, urlparse
 
 from core import appidentity, outcome
 
@@ -152,6 +155,7 @@ def _real_profile_dir(browser: str) -> str:
             "opera":    [lib / "com.operasoftware.Opera"],
             "operagx":  [lib / "com.operasoftware.OperaGX"],
             "ulaa":     [lib / "Zoho" / "Ulaa"],
+            "arc":      [lib / "Arc" / "User Data"],
         }
         candidates = m.get(browser, [])
 
@@ -299,6 +303,7 @@ _BROWSER_SPECS: dict[str, dict] = {
         "brave":    {"engine": "chromium", "channel": None,      "bins": ["brave browser", "brave"]},
         "vivaldi":  {"engine": "chromium", "channel": None,      "bins": ["vivaldi"]},
         "ulaa":     {"engine": "chromium", "channel": None,      "bins": []},   # Zoho Ulaa, Chromium-based
+        "arc":      {"engine": "chromium", "channel": None,      "bins": []},
         "safari":   {"engine": "webkit",   "channel": None,      "bins": []},
     },
     "Linux": {
@@ -325,6 +330,12 @@ _ALIASES: dict[str, str] = {
     "opera gx":        "operagx",
     "opera_gx":        "operagx",
     "zoho ulaa":       "ulaa",
+    # Speech recognition hears the user's main browser, Ulaa, as "Ola" or "Ulla".
+    "ola":             "ulaa",
+    "ulla":            "ulaa",
+    "zoho":            "ulaa",
+    "brave browser":   "brave",
+    "arc browser":     "arc",
 }
 
 
@@ -361,6 +372,7 @@ def _resolve_browser(name: str) -> dict | None:
             "brave":   ["Brave Browser.app"],
             "vivaldi": ["Vivaldi.app"],
             "ulaa":    ["Ulaa.app"],
+            "arc":     ["Arc.app"],
         }
         for app in app_names.get(name, []):
             app_dir = Path("/Applications") / app / "Contents" / "MacOS"
@@ -462,6 +474,8 @@ def _detect_default_browser() -> str:
             handler = m.group(1) if m else out
             if "primeum" in handler or "ulaa" in handler:
                 return "ulaa"
+            if "thebrowser" in handler:              # Arc: company.thebrowser.browser
+                return "arc"
             for kw in ("firefox", "opera", "brave", "vivaldi", "safari", "chrome", "edge"):
                 if kw in handler:
                     return kw
@@ -500,11 +514,255 @@ _MAC_APP_NAMES: dict[str, str] = {
     "brave":   "Brave Browser",
     "vivaldi": "Vivaldi",
     "ulaa":    "Ulaa",
+    "arc":     "Arc",
     "safari":  "Safari",
 }
 
 # Windows registry lookup names for browsers whose spec has no explicit binary
 _WIN_EXE_HINTS: dict[str, str] = {"chrome": "chrome", "edge": "msedge"}
+
+
+# ── Reading back what the user's own browser is showing (macOS) ──────────────
+#
+# WHY THIS EXISTS
+#     Handing an address to `open` proves only that LaunchServices accepted it.
+#     Every "open Flipkart" / "search MacBooks" used to come back unverified,
+#     and the user heard "I can't confirm it opened" a dozen times in a row
+#     while looking at the very page they asked for. These browsers will tell
+#     us the address of their front tab over AppleScript, which is a real
+#     read-back: if it shows the requested site, the open is confirmed.
+#
+#     Only browsers that are RUNNING are asked. `tell application "X"` on an
+#     app that is not running would launch it, and on one that is not installed
+#     macOS can put up a "Where is X?" dialog.
+_CHROMIUM_SCRIPTABLE = ("Google Chrome", "Ulaa", "Brave Browser", "Microsoft Edge",
+                        "Arc", "Vivaldi", "Opera")
+_SCRIPTABLE_BROWSERS = ("Safari",) + _CHROMIUM_SCRIPTABLE
+_VERIFY_SECONDS = 3.0
+_VERIFY_STEP    = 0.25
+_DEFAULT_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _osascript(script: str, timeout: float = 1.5) -> tuple[int, str, str]:
+    """(returncode, stdout, stderr) of one AppleScript; never raises."""
+    try:
+        p = subprocess.run(["osascript", "-e", script], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return -1, "", "timed out"
+    except Exception as e:                       # osascript missing, sandbox, …
+        return -1, "", str(e)
+
+
+def _running_mac_browsers() -> list[str]:
+    """Scriptable browsers whose MAIN executable is running, from the process table.
+
+    Matched on the full `/<App>.app/Contents/MacOS/<App>` path on purpose: a
+    looser name match counted every Chromium/Electron `chrome_crashpad_handler`
+    as Google Chrome being open, on a Mac that does not have Chrome at all.
+    """
+    try:
+        out = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=2).stdout or ""
+    except Exception:
+        return []
+    return [app for app in _SCRIPTABLE_BROWSERS if f"/{app}.app/Contents/MacOS/{app}" in out]
+
+
+def _default_browser_cached() -> str:
+    """_detect_default_browser, remembered for a minute (it spawns `defaults`)."""
+    now = time.monotonic()
+    hit = _DEFAULT_CACHE.get("v")
+    if hit and now - hit[0] < 60:
+        return hit[1]
+    name = _detect_default_browser()
+    _DEFAULT_CACHE["v"] = (now, name)
+    return name
+
+
+def _tab_url_script(app: str) -> str:
+    prop = ("URL of current tab of front window" if app == "Safari"
+            else "URL of active tab of front window")
+    return (f'if application "{app}" is running then\n'
+            f'  tell application "{app}"\n'
+            f'    if (count of windows) > 0 then return {prop}\n'
+            f'  end tell\n'
+            f'end if\n'
+            f'return ""')
+
+
+def _read_tab_url(app: str) -> tuple[str, str]:
+    """(url of the front tab, problem). Exactly one of them is non-empty."""
+    if app not in _SCRIPTABLE_BROWSERS:
+        return "", f"{app} cannot report which page it is showing"
+    rc, out, err = _osascript(_tab_url_script(app))
+    if rc == 0:
+        return (out, "") if out else ("", f"{app} has no window open")
+    low = err.lower()
+    if "-1743" in err or "not authori" in low or "not allowed" in low:
+        return "", (f"macOS refused permission to read {app}'s address bar (allow it in "
+                    f"System Settings > Privacy & Security > Automation)")
+    return "", f"{app} did not answer ({err[:80] or 'no reply'})"
+
+
+def _host(url: str) -> str:
+    try:
+        h = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+    return h[4:] if h.startswith("www.") else h
+
+
+def _same_site(requested: str, seen: str) -> bool:
+    """Is `seen` (read back from the browser) the site that was asked for?"""
+    try:
+        r, s = urlparse(requested), urlparse(seen)
+    except Exception:
+        return False
+    if r.scheme == "file":
+        return s.scheme == "file" and unquote(r.path).rstrip("/") == unquote(s.path).rstrip("/")
+    rh, sh = _host(requested), _host(seen)
+    if not rh or not sh:
+        return False
+    return rh == sh or sh.endswith("." + rh) or rh.endswith("." + sh)
+
+
+def _same_url(a: str, b: str) -> bool:
+    return unquote(a or "").rstrip("/").lower() == unquote(b or "").rstrip("/").lower()
+
+
+def _verify_candidates(preferred: Optional[str]) -> list[str]:
+    """Browsers to read back from, the one the page should be in first."""
+    running = _running_mac_browsers()
+    first = _MAC_APP_NAMES.get(preferred or "") if preferred else None
+    if not first:
+        first = _MAC_APP_NAMES.get(_default_browser_cached())
+    order = ([first] if first in running else []) + [a for a in running if a != first]
+    return order
+
+
+def _tab_snapshot(apps: list[str]) -> dict[str, str]:
+    """What each browser shows BEFORE the open, so an old tab on the same site
+    is not mistaken for the page we just asked for."""
+    snap = {}
+    for app in apps:
+        url, _ = _read_tab_url(app)
+        snap[app] = url
+    return snap
+
+
+def _confirm_mac_open(url: str, preferred: Optional[str], before: dict[str, str]) -> str:
+    """Outcome line for an address handed to a macOS browser, read back from the tab.
+
+    `done` only when a browser's own front tab reports the requested site (and
+    it changed, or is exactly the address asked for). Anything else stays
+    `unverified` and says why: permission refused, a different site showing,
+    or nothing that could be read.
+    """
+    deadline = time.monotonic() + _VERIFY_SECONDS
+    refused: set[str] = set()
+    problems: dict[str, str] = {}
+    other: dict[str, str] = {}
+    preferred_app = _MAC_APP_NAMES.get(preferred or "") if preferred else None
+    while True:
+        apps = [a for a in _verify_candidates(preferred) if a not in refused]
+        for app in apps:
+            seen, problem = _read_tab_url(app)
+            if problem:
+                problems[app] = problem
+                if "permission" in problem:
+                    refused.add(app)
+                continue
+            problems.pop(app, None)
+            if _same_site(url, seen) and (seen != before.get(app) or _same_url(seen, url)):
+                return outcome.done("browser_control", opened=seen, browser=app, verified=True)
+            other[app] = seen
+        if time.monotonic() >= deadline or (refused and not [a for a in apps if a not in refused]):
+            break
+        time.sleep(_VERIFY_STEP)
+
+    if refused:
+        app = next(iter(refused))
+        return outcome.unverified(
+            "browser_control",
+            f"the address was handed to {app}, but {problems.get(app, 'permission was refused')} "
+            f"- the page is not confirmed open",
+            url=url, browser=app)
+    if other:
+        app, seen = next(iter(other.items()))
+        return outcome.unverified(
+            "browser_control",
+            f"the address was handed to the browser, but after {_VERIFY_SECONDS:g} s "
+            f"{app}'s front tab is on a different site - the requested page is not "
+            f"confirmed open",
+            url=url, browser=app, showing_host=_host(seen) or "blank")
+    why = (problems.get(preferred_app) if preferred_app else None) or \
+        (next(iter(problems.values())) if problems else
+         "no browser that can report its address was running")
+    return outcome.unverified(
+        "browser_control",
+        f"the address was handed to the browser, but it could not be read back "
+        f"({why}) - the page is not confirmed open",
+        url=url)
+
+
+def _confirm_mac_app_running(name: str) -> str:
+    """Outcome for opening a browser with no address: is its process there?"""
+    app = _MAC_APP_NAMES.get(name, name)
+    deadline = time.monotonic() + _VERIFY_SECONDS
+    while True:
+        try:
+            out = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=2).stdout or ""
+        except Exception:
+            out = ""
+        if f"/{app}.app/Contents/MacOS/" in out:
+            return outcome.done("browser_control", opened_app=app, running=True)
+        if time.monotonic() >= deadline:
+            return outcome.unverified("browser_control",
+                                      f"{app} was asked to open but its process did not appear",
+                                      browser=app)
+        time.sleep(_VERIFY_STEP)
+
+
+def _mac_app_installed(name: str) -> bool:
+    """Is this browser's .app on the Mac? Unknown names answer True (not our call)."""
+    if name == "safari":
+        return True
+    app = _MAC_APP_NAMES.get(name)
+    if not app:
+        return True
+    apps = [app] + (["Opera GX"] if name == "opera" else [])
+    return any((d / f"{a}.app").exists()
+               for d in (Path("/Applications"), Path.home() / "Applications") for a in apps)
+
+
+def _installed_substitute(name: str) -> Optional[str]:
+    """A Chromium browser that IS installed, for when `name` is not.
+
+    Seen in the log as "Could not launch chrome: BrowserType.launch_persistent_
+    context: Chromium distribution 'chrome' is not found": the session was for
+    Google Chrome on a Mac where only Ulaa (Chromium), Safari and Firefox exist.
+    The default browser is tried first, because that is where the user lives.
+    """
+    default = _default_browser_cached()
+    order = [default] + ["ulaa", "chrome", "brave", "edge", "vivaldi", "opera", "arc"]
+    for cand in order:
+        spec = _BROWSER_SPECS.get(_OS, {}).get(cand)
+        if cand != name and spec and spec.get("engine") == "chromium" and _mac_app_installed(cand):
+            return cand
+    return None
+
+
+def _browser_running(name: str) -> bool:
+    """Is the user's own copy of this browser already running (its profile locked)?"""
+    if _OS == "Darwin":
+        app = _MAC_APP_NAMES.get(name)
+        if app:
+            return app in _running_mac_browsers() or (
+                app not in _SCRIPTABLE_BROWSERS and bool(appidentity.running(name)))
+    return bool(appidentity.running(name))
 
 
 def _open_native(url: str, browser_name: Optional[str]) -> str:
@@ -534,10 +792,26 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
             if app:
                 cmd = ["open", "-a", app] + ([url] if url else [])
                 try:
+                    before = _tab_snapshot(_verify_candidates(name)) if url else {}
+                except Exception:
+                    before = {}
+                try:
                     subprocess.run(cmd, check=True, timeout=10)
-                    return f"Opened in {name}: {url}" if url else f"Opened {name}."
+                    opened = True
                 except Exception as e:
+                    opened = False
                     print(f"[Browser] 'open -a {app}' failed ({e}), trying binary…")
+                if opened:
+                    # `open -a` returning 0 means LaunchServices took the request,
+                    # not that the page is up — read the tab back to find out.
+                    try:
+                        return (_confirm_mac_open(url, name, before) if url
+                                else _confirm_mac_app_running(name))
+                    except Exception as e:
+                        return outcome.unverified(
+                            "browser_control",
+                            f"{app} was asked to open it; reading it back failed ({e})",
+                            url=url or None, browser=app)
 
         spec = _resolve_browser(name)
         exe  = spec.get("exe") if spec else None
@@ -552,7 +826,12 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
                     [exe, url] if url else [exe],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
-                return f"Opened in {name}: {url}" if url else f"Opened {name}."
+                # A process was started; nothing here reads back what it shows.
+                return outcome.unverified(
+                    "browser_control",
+                    f"{name} was started" + (" with the address" if url else "")
+                    + " but does not report back - not confirmed",
+                    url=url or None, browser=name)
             except Exception as e:
                 print(f"[Browser] Native launch failed for {name}: {e}")
         print(f"[Browser] '{name}' not found — falling back to default browser.")
@@ -567,7 +846,18 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
         if _OS == "Windows":
             os.startfile(url)                       # ShellExecute → default browser
         elif _OS == "Darwin":
+            before = _tab_snapshot(_verify_candidates(None))
             subprocess.run(["open", url], check=True, timeout=10)
+            # Handed over; now read the front tab back (≤ 3 s) instead of
+            # always answering "not confirmed". A crash in the check must not
+            # fall through to the except below, which would open it twice.
+            try:
+                return _confirm_mac_open(url, None, before)
+            except Exception as e:
+                return outcome.unverified(
+                    "browser_control",
+                    f"the address was handed to the default browser; reading it "
+                    f"back failed ({e}) - the page is not confirmed open", url=url)
         else:
             subprocess.Popen(
                 ["xdg-open", url],
@@ -599,6 +889,41 @@ def _open_native(url: str, browser_name: Optional[str]) -> str:
         return outcome.failed(
             "browser_control",
             "no browser on this system could be opened", url=url)
+
+
+def _is_closed_error(exc: BaseException) -> bool:
+    """Playwright's way of saying the tab, window or whole browser went away."""
+    text = str(exc).lower()
+    return ("has been closed" in text or "target closed" in text
+            or "browser has disconnected" in text or "connection closed" in text)
+
+
+def _is_profile_in_use(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(k in text for k in ("processsingleton", "singletonlock", "already in use",
+                                   "profile in use", "profile is in use", "user data directory is already"))
+
+
+def _recovering(method):
+    """Run a page action; if the page/browser was closed under it, recover once.
+
+    The log had "Click error: Locator.click: Target page, context or browser
+    has been closed" straight after a launch, and scroll failing the same way
+    after the user closed the window. Every page action now goes back through
+    `_get_page` — which opens a fresh tab, or relaunches a browser that is gone
+    — and is tried exactly one more time.
+    """
+    @functools.wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        try:
+            return await method(self, *args, **kwargs)
+        except Exception as exc:
+            if not _is_closed_error(exc):
+                raise
+            print(f"[Browser] {method.__name__}: page was closed — reopening and retrying once")
+            self._page = None
+            return await method(self, *args, **kwargs)
+    return wrapper
 
 
 class _BrowserSession:
@@ -782,11 +1107,13 @@ class _BrowserSession:
         # answers in milliseconds, and core/appidentity was already built to
         # ask it. Knowing up front turns a long silence into an immediate,
         # explainable outcome.
-        already = appidentity.running(self.browser_name)
+        # Matched on the browser's own main executable: appidentity's looser
+        # name match counted every `chrome_crashpad_handler` (Ulaa's, Electron
+        # apps') as Google Chrome running on a Mac without Chrome.
+        already = _browser_running(self.browser_name)
         if already:
-            print(f"[Browser] {self.browser_name} is already running "
-                  f"({len(already)} processes) — its profile is locked, so the "
-                  f"separate automation profile will be used.")
+            print(f"[Browser] {self.browser_name} is already running — its profile "
+                  f"is locked, so the separate automation profile will be used.")
         else:
             try:
                 self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
@@ -807,22 +1134,54 @@ class _BrowserSession:
 
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
-            self._page = await self._adopt_page()
-            self.profile_kind = "separate"
-            print(f"[Browser] ✅ Launched [{label}] with JARVIS profile "
-                  f"(sign-ins persist across sessions)")
         except Exception as e2:
-            raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
+            if not _is_profile_in_use(e2):
+                raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
+            # The JARVIS profile is itself held — normally by a browser an
+            # earlier JARVIS run left open. A second automation profile beats
+            # failing the user's request.
+            spare = jarvis_profile + "-2"
+            Path(spare).mkdir(parents=True, exist_ok=True)
+            print(f"[Browser] JARVIS profile is in use — retrying with {spare}")
+            try:
+                self._context = await engine_obj.launch_persistent_context(spare, **kwargs)
+            except Exception as e3:
+                raise RuntimeError(f"Could not launch {self.browser_name}: {e3}") from e3
+        self._page = await self._adopt_page()
+        self.profile_kind = "separate"
+        print(f"[Browser] ✅ Launched [{label}] with JARVIS profile "
+              f"(sign-ins persist across sessions)")
 
 
     async def _get_page(self) -> Page:
         await self._launch()
         # If somehow page got closed, open a fresh one
         if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+            try:
+                self._page = await self._context.new_page()
+            except Exception as exc:
+                # The user closed the browser window: the old context is dead and every call
+                # used to fail with "Target page, context or browser has been closed".
+                # Forget it and launch the browser again.
+                if "closed" not in str(exc).lower():
+                    raise
+                print(f"[Browser] {self.browser_name} was closed — relaunching")
+                await self._async_close_context()
+                await self._launch()
+                self._page = await self._adopt_page()
             await asyncio.sleep(0.2)
         return self._page
 
+    async def _async_close_context(self):
+        """Drop a context whose browser has gone away, keeping Playwright itself running."""
+        ctx, self._context, self._page = self._context, None, None
+        if ctx is not None:
+            try:
+                await ctx.close()
+            except Exception:
+                pass
+
+    @_recovering
     async def go_to(self, url: str) -> str:
 
         url      = _normalize_url(url)
@@ -837,6 +1196,8 @@ class _BrowserSession:
             except PlaywrightTimeout:
                 pass   # page may have partially loaded — check URL below
             except Exception as e:
+                if _is_closed_error(e):
+                    raise          # the browser went away: recover and retry
                 print(f"[Browser] goto exception (non-fatal): {e}")
             return p.url
 
@@ -884,6 +1245,7 @@ class _BrowserSession:
         base = _SEARCH_ENGINES.get(engine.lower(), _SEARCH_ENGINES["google"])
         return await self.go_to(base + query.replace(" ", "+"))
 
+    @_recovering
     async def click(self, selector: str = None, text: str = None) -> str:
         page = await self._get_page()
         try:
@@ -901,8 +1263,12 @@ class _BrowserSession:
                 "no element matching that appeared on the page in time",
                 selector=selector or text)
         except Exception as e:
-            return f"Click error: {e}"
+            if _is_closed_error(e):
+                raise
+            return outcome.failed("browser_control", f"the click did not go through: {str(e)[:200]}",
+                                  selector=selector or text)
 
+    @_recovering
     async def type_text(self, selector: str = None, text: str = "",
                         clear_first: bool = True) -> str:
         page = await self._get_page()
@@ -923,8 +1289,12 @@ class _BrowserSession:
             if actual==expected:return outcome.done("browser_control",typed=True,verified=True,characters=len(text))
             return outcome.unverified("browser_control","field content did not match the requested text",typed=True,verified=False)
         except Exception as e:
-            return f"Type error: {e}"
+            if _is_closed_error(e):
+                raise
+            return outcome.failed("browser_control", f"typing did not go through: {str(e)[:200]}",
+                                  selector=selector)
 
+    @_recovering
     async def scroll(self, direction: str = "down", amount: int = 500) -> str:
         page = await self._get_page()
         try:
@@ -932,28 +1302,38 @@ class _BrowserSession:
             await page.mouse.wheel(0, y)
             return f"Scrolled {direction}."
         except Exception as e:
+            if _is_closed_error(e):
+                raise
             return f"Scroll error: {e}"
 
+    @_recovering
     async def press(self, key: str) -> str:
         page = await self._get_page()
         try:
             await page.keyboard.press(key)
             return f"Pressed: {key}"
         except Exception as e:
+            if _is_closed_error(e):
+                raise
             return f"Key error: {e}"
 
+    @_recovering
     async def get_text(self) -> str:
         page = await self._get_page()
         try:
             text = await page.inner_text("body")
             return text[:4_000]
         except Exception as e:
+            if _is_closed_error(e):
+                raise
             return f"Could not get page text: {e}"
 
+    @_recovering
     async def get_url(self) -> str:
         page = await self._get_page()
         return page.url
 
+    @_recovering
     async def fill_form(self, fields: dict) -> str:
         page    = await self._get_page()
         results = []
@@ -964,9 +1344,12 @@ class _BrowserSession:
                 await el.type(str(value), delay=40)
                 results.append(f"✓ {selector}")
             except Exception as e:
+                if _is_closed_error(e):
+                    raise
                 results.append(f"✗ {selector}: {e}")
         return "Form filled: " + ", ".join(results)
 
+    @_recovering
     async def smart_click(self, description: str) -> str:
         page = await self._get_page()
         for role in ("button", "link", "searchbox", "textbox", "menuitem", "tab"):
@@ -975,8 +1358,9 @@ class _BrowserSession:
                 if await loc.count() > 0:
                     await loc.first.click(timeout=5_000)
                     return f"Clicked ({role}): '{description}'"
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_closed_error(e):
+                    raise
         for attempt in (
             lambda: page.get_by_text(description, exact=False).first.click(timeout=5_000),
             lambda: page.get_by_placeholder(description, exact=False).first.click(timeout=5_000),
@@ -988,10 +1372,12 @@ class _BrowserSession:
             try:
                 await attempt()
                 return f"Clicked: '{description}'"
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_closed_error(e):
+                    raise
         return f"Could not find element: '{description}'"
 
+    @_recovering
     async def smart_type(self, description: str, text: str) -> str:
         page = await self._get_page()
         candidates = [
@@ -1009,10 +1395,13 @@ class _BrowserSession:
                 await el.clear()
                 await el.type(text, delay=50)
                 return f"Typed into ({method}): '{description}'"
-            except Exception:
+            except Exception as e:
+                if _is_closed_error(e):
+                    raise
                 continue
         return f"Could not find input: '{description}'"
 
+    @_recovering
     async def new_tab(self, url: str = "") -> str:
         page = await self._get_page()
         ctx  = page.context
@@ -1032,6 +1421,7 @@ class _BrowserSession:
             return "Tab closed."
         return "No active tab to close."
 
+    @_recovering
     async def screenshot(self, path: str = None) -> str:
         page = await self._get_page()
         try:
@@ -1039,30 +1429,41 @@ class _BrowserSession:
             await page.screenshot(path=save_path, full_page=False)
             return f"Screenshot saved: {save_path}"
         except Exception as e:
+            if _is_closed_error(e):
+                raise
             return f"Screenshot error: {e}"
 
+    @_recovering
     async def back(self) -> str:
         page = await self._get_page()
         try:
             await page.go_back(timeout=10_000)
             return f"Navigated back: {page.url}"
         except Exception as e:
+            if _is_closed_error(e):
+                raise
             return f"Back error: {e}"
 
+    @_recovering
     async def forward(self) -> str:
         page = await self._get_page()
         try:
             await page.go_forward(timeout=10_000)
             return f"Navigated forward: {page.url}"
         except Exception as e:
+            if _is_closed_error(e):
+                raise
             return f"Forward error: {e}"
 
+    @_recovering
     async def reload(self) -> str:
         page = await self._get_page()
         try:
             await page.reload(timeout=15_000)
             return f"Page reloaded: {page.url}"
         except Exception as e:
+            if _is_closed_error(e):
+                raise
             return f"Reload error: {e}"
 
     async def close_browser(self) -> str:
@@ -1107,6 +1508,11 @@ class _SessionRegistry:
         if not browser_name:
             browser_name = self._active_browser or _detect_default_browser()
         browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+        if _OS == "Darwin" and not _mac_app_installed(browser_name):
+            sub = _installed_substitute(browser_name)
+            if sub:
+                print(f"[Browser] {browser_name} is not installed — using {sub} instead")
+                browser_name = sub
         sess = self._get_or_create(browser_name)
         self._active_browser = browser_name
         return sess
@@ -1153,16 +1559,84 @@ class _SessionRegistry:
 
 _registry = _SessionRegistry()
 
+_ACTIONS = {
+    "go_to", "search", "click", "type", "scroll", "fill_form", "smart_click", "smart_type",
+    "get_text", "get_url", "press", "new_tab", "close_tab", "screenshot", "back", "forward",
+    "reload", "switch", "list_browsers", "close", "close_all",
+}
+
+# What models and speech actually send. "open" alone was rejected three times
+# in one session ("Unknown browser action: 'open'") — after a browser session
+# had already been started for it.
+_ACTION_ALIASES: dict[str, str] = {
+    **{a: "go_to" for a in ("open", "goto", "go", "navigate", "navigate_to", "visit", "load",
+                            "open_url", "open_link", "open_website", "open_site", "open_page",
+                            "browse", "launch", "go_to_url", "open_browser")},
+    **{a: "search" for a in ("google", "web_search", "search_web", "find", "look_up", "lookup",
+                             "search_for", "query")},
+    **{a: "new_tab" for a in ("open_tab", "newtab", "open_new_tab")},
+    **{a: "click" for a in ("tap", "click_on", "press_button", "select")},
+    **{a: "type" for a in ("type_text", "write", "enter_text", "input", "fill")},
+    **{a: "scroll" for a in ("scroll_down", "scroll_up", "page_down", "page_up")},
+    **{a: "get_text" for a in ("read", "read_page", "get_page_text", "page_text", "text",
+                               "get_content", "extract_text", "read_text")},
+    **{a: "get_url" for a in ("current_url", "get_current_url", "url")},
+    **{a: "press" for a in ("key", "press_key", "keypress", "hotkey")},
+    **{a: "reload" for a in ("refresh", "reload_page")},
+    **{a: "back" for a in ("go_back", "previous", "previous_page")},
+    **{a: "forward" for a in ("go_forward",)},
+    **{a: "screenshot" for a in ("take_screenshot", "capture")},
+    **{a: "close_tab" for a in ("close_current_tab",)},
+    **{a: "close" for a in ("close_browser", "quit", "exit")},
+    **{a: "list_browsers" for a in ("list", "sessions", "list_sessions")},
+    **{a: "switch" for a in ("switch_browser", "use_browser")},
+}
+
+
+def _normalize_action(params: dict) -> dict:
+    """The parameters with `action` mapped to one this tool knows, and the
+    obvious mismatches between action and arguments straightened out."""
+    p = dict(params or {})
+    raw = re.sub(r"[\s\-]+", "_", str(p.get("action", "") or "").lower().strip())
+    action = _ACTION_ALIASES.get(raw, raw)
+    if raw in ("scroll_up", "page_up") and not p.get("direction"):
+        p["direction"] = "up"
+    if raw == "enter":                              # type the text, or just press Enter
+        action = "type" if p.get("text") else "press"
+        p.setdefault("key", "Enter")
+    url = str(p.get("url", "") or "").strip()
+    query = str(p.get("query", "") or "").strip()
+    if action == "go_to":
+        if not url and query:
+            action = "search"                       # "open MacBooks on Flipkart"
+        elif url and "://" not in url and " " in url:
+            action, p["query"] = "search", url      # words, not an address
+    elif action == "search" and not query and url:
+        action = "go_to"
+    p["action"] = action
+    return p
+
+
 def browser_control(
     parameters:    dict = None,
     response=None,
     player=None,
     session_memory=None,
 ) -> str:
-    params  = parameters or {}
-    action  = params.get("action", "").lower().strip()
-    browser = params.get("browser", "").lower().strip() or None
+    params  = _normalize_action(parameters or {})
+    action  = params.get("action", "")
+    browser = (params.get("browser") or "").lower().strip() or None
     result  = "Unknown action."
+
+    # Rejected before anything is started: an unknown action used to create a
+    # browser session first and only then say it did not know the word.
+    if action not in _ACTIONS:
+        result = outcome.failed(
+            "browser_control",
+            f"'{action or '(none)'}' is not something this tool can do - use one of: "
+            + ", ".join(sorted(_ACTIONS)))
+        _log(player, result)
+        return result
 
     if action == "switch":
         target = browser or params.get("target", "").lower().strip()
@@ -1204,9 +1678,12 @@ def browser_control(
                 else:
                     result = sess.run(sess.go_to(params.get("url", "")))
             except concurrent.futures.TimeoutError:
-                result = f"Browser action '{action}' timed out (60s)."
+                result = outcome.failed("browser_control", "the browser did not finish within 60 s",
+                                        wanted=action)
             except Exception as e:
-                result = f"Browser error ({action}): {e}"
+                result = outcome.failed("browser_control",
+                                        f"the browser could not be driven: {str(e)[:240]}",
+                                        wanted=action)
             _log(player, result)
             return result
 
@@ -1219,9 +1696,10 @@ def browser_control(
             else:
                 base    = _SEARCH_ENGINES.get(params.get("engine", "google").lower(),
                                               _SEARCH_ENGINES["google"])
-                nav_url = base + query.replace(" ", "+")
+                from urllib.parse import quote_plus
+                nav_url = base + quote_plus(query.strip())
         else:
-            nav_url = params.get("url", "").strip()
+            nav_url = (params.get("url") or "").strip()
 
         # Open it for the user AND look at it ourselves at the same time, so the answer can be spoken
         # straight away instead of taking screenshots of the browser to find out what it shows.
@@ -1233,7 +1711,10 @@ def browser_control(
                 seen = peek.result(timeout=6)
             except Exception:
                 seen = None
-        if result.startswith("Opened") and nav_url:
+        # Remembered so a click/type that follows continues on this page. It
+        # used to test for the old "Opened …" sentence, which the status lines
+        # never start with, so the follow-up always began on a blank tab.
+        if nav_url and not result.startswith(f"status={outcome.FAILED} "):
             _registry.note_native_url(_normalize_url(nav_url))
         if seen:
             result = result.rstrip() + "\n" + json.dumps(seen, ensure_ascii=False)[:3500]
@@ -1247,7 +1728,8 @@ def browser_control(
     try:
         sess = _registry.get(browser)
     except Exception as e:
-        result = f"Could not start browser session: {e}"
+        result = outcome.failed("browser_control", f"no browser session could be started: {str(e)[:240]}",
+                                wanted=action)
         _log(player, result)
         return result
 
@@ -1289,22 +1771,24 @@ def browser_control(
         elif action == "reload":
             result = sess.run(sess.reload())
         else:
-            result = f"Unknown browser action: '{action}'"
+            result = outcome.failed("browser_control", f"'{action}' is not a page action", wanted=action)
 
     except concurrent.futures.TimeoutError:
-        result = f"Browser action '{action}' timed out (60s)."
+        result = outcome.failed("browser_control", "the browser did not finish within 60 s",
+                                wanted=action)
     except Exception as e:
-        result = f"Browser error ({action}): {e}"
+        result = outcome.failed("browser_control",
+                                f"the browser could not be driven: {str(e)[:240]}", wanted=action)
 
     _log(player, result)
     return result
 
 
 def _log(player, text: str):
-    short = str(text)[:80]
-    print(f"[Browser] {short}")
-    if player:
-        print(f"[Browser] {short[:80]}")          # terminal, not the HUD
+    # Terminal only, not the HUD. 300 characters, not 80: the 80-character cut
+    # left "Could not launch chrome: BrowserType.launch_persistent_c" in the
+    # log with the actual cause — Chrome not installed — cut off.
+    print(f"[Browser] {str(text)[:300]}")
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
@@ -1318,12 +1802,14 @@ TOOL = {
         "different profile with none of the user's sign-ins. 'Open Chrome and "
         "go to YouTube' is ONE call to this tool. "
         "Read the status it returns. 'done' means it was confirmed - for an "
-        "open, the url reported back is the page's OWN address, so if it "
-        "differs from what was asked for the site redirected and the user "
-        "should be told. 'unverified' means the address was handed to the "
-        "system's default browser, which never reports back: say it was opened "
-        "but not confirmed, never that the page is up. 'failed' means nothing "
-        "happened."
+        "open or search, the user's own browser was asked which page its front "
+        "tab shows and it reported the requested site (opened= is that address; "
+        "if it differs from what was asked for, the site redirected). "
+        "'unverified' means it was handed to the browser but could not be read "
+        "back - the reason says why (e.g. macOS automation permission refused, "
+        "or a different site in front): say it was asked for but not confirmed, "
+        "never that the page is up. 'failed' means nothing happened. "
+        "'open', 'visit', 'navigate' and similar words all mean go_to."
     ),
     "brief": (
         "Controls the web browser: open a URL, navigate, click, read the page."
@@ -1337,7 +1823,7 @@ TOOL = {
             },
             "browser": {
                 "type": "STRING",
-                "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."
+                "description": "Target browser: ulaa | chrome | edge | firefox | opera | operagx | brave | vivaldi | arc | safari ('Ola' is Ulaa). Omit to use the user's default browser."
             },
             "url": {
                 "type": "STRING",

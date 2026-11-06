@@ -125,7 +125,8 @@ def open_item(target: str, app: str = '') -> dict:
     if not target:
         raise ValueError('Say what to open.')
     if not target.startswith(('http://', 'https://')):
-        p = Path(os.path.expanduser(target))
+        from core import paths
+        p = paths.resolve(target)
         if not p.exists():
             raise ValueError(f'Not found: {p}')
         target = str(p)
@@ -134,7 +135,8 @@ def open_item(target: str, app: str = '') -> dict:
 
 
 def reveal(path: str) -> dict:
-    p = Path(os.path.expanduser(str(path or '')))
+    from core import paths
+    p = paths.resolve(path)
     if not p.exists():
         raise ValueError(f'Not found: {p}')
     _run(['open', '-R', str(p)])

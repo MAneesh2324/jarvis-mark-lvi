@@ -40,24 +40,90 @@ SYMBOLS = {
     'NIFTY': '^NSEI', 'NIFTY50': '^NSEI', 'BANKNIFTY': '^NSEBANK', 'SENSEX': '^BSESN',
     'DXY': 'DX-Y.NYB',
 }
+# Futures roots (CME/COMEX/NYMEX, incl. micro contracts) → the Yahoo continuous contract
+FUTURES = {'GC': 'GC=F', 'MGC': 'GC=F', 'SI': 'SI=F', 'SIL': 'SI=F', 'HG': 'HG=F', 'PL': 'PL=F',
+           'NQ': 'NQ=F', 'MNQ': 'NQ=F', 'ES': 'ES=F', 'MES': 'ES=F', 'YM': 'YM=F', 'MYM': 'YM=F',
+           'RTY': 'RTY=F', 'M2K': 'RTY=F', 'CL': 'CL=F', 'MCL': 'CL=F', 'NG': 'NG=F', 'BZ': 'BZ=F',
+           'ZB': 'ZB=F', 'ZN': 'ZN=F', 'ZC': 'ZC=F', 'ZW': 'ZW=F', 'ZS': 'ZS=F', '6E': '6E=F', '6B': '6B=F',
+           '6J': '6J=F', 'BTC': 'BTC=F', 'MBT': 'BTC=F'}
+# Roots that mean the future even when said bare ("backtest MNQ"); the rest need =F, 1! or "futures",
+# because bare they are also stock or ETF tickers (SIL, PL, HG…) or crypto (BTC).
+FUTURES_BARE = ('GC', 'MGC', 'NQ', 'MNQ', 'ES', 'MES', 'YM', 'MYM', 'RTY', 'M2K', 'MCL')
+# "gold futures", "nasdaq futures", "XAUUSD=F": the market named, then "futures"
+FUTURE_WORDS = {'GOLD': 'GC=F', 'XAUUSD': 'GC=F', 'XAU': 'GC=F', 'SILVER': 'SI=F', 'XAGUSD': 'SI=F',
+                'COPPER': 'HG=F', 'PLATINUM': 'PL=F',
+                'NASDAQ': 'NQ=F', 'NASDAQ100': 'NQ=F', 'NAS100': 'NQ=F', 'US100': 'NQ=F', 'NDX': 'NQ=F',
+                'MICRONASDAQ': 'NQ=F', 'SP500': 'ES=F', 'SPX': 'ES=F', 'SPX500': 'ES=F', 'US500': 'ES=F',
+                'SANDP': 'ES=F', 'SNP': 'ES=F', 'EMINI': 'ES=F', 'DOW': 'YM=F', 'US30': 'YM=F', 'DJ30': 'YM=F',
+                'DOWJONES': 'YM=F', 'RUSSELL': 'RTY=F', 'RUSSELL2000': 'RTY=F', 'US2000': 'RTY=F',
+                'OIL': 'CL=F', 'CRUDE': 'CL=F', 'CRUDEOIL': 'CL=F', 'WTI': 'CL=F', 'USOIL': 'CL=F',
+                'BRENT': 'BZ=F', 'UKOIL': 'BZ=F', 'NATGAS': 'NG=F', 'NATURALGAS': 'NG=F', 'GAS': 'NG=F'}
 PROXY_NOTES = {
     'GC=F': 'Gold futures (COMEX), a proxy for spot XAUUSD; levels differ slightly from broker spot.',
     'SI=F': 'Silver futures, a proxy for spot XAGUSD.',
     'CL=F': 'WTI crude futures.', 'BZ=F': 'Brent crude futures.',
+    'NQ=F': 'E-mini Nasdaq-100 futures (CME, front month); micro MNQ moves the same in points.',
+    'ES=F': 'E-mini S&P 500 futures (CME, front month); micro MES moves the same in points.',
+    'YM=F': 'E-mini Dow futures (CBOT, front month).', 'RTY=F': 'E-mini Russell 2000 futures (CME, front month).',
 }
 INTERVALS = ('1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk', '1mo')
 DEFAULT_RANGE = {'1m': '5d', '2m': '1mo', '5m': '1mo', '15m': '1mo', '30m': '1mo',
                  '1h': '3mo', '4h': '6mo', '1d': '2y', '1wk': '5y', '1mo': '10y'}
 RANGES = ('1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', '10y', 'ytd', 'max')
+RANGE_DAYS = {'1d': 1, '5d': 5, '1mo': 31, '3mo': 92, '6mo': 183, '1y': 366, '2y': 731, '5y': 1827,
+              '10y': 3653, 'ytd': 366, 'max': 1e9}
+# How far back Yahoo serves each interval (days), and the longest range that stays inside it
+SOURCE_LIMIT_DAYS = {'1m': 7, '2m': 59, '5m': 59, '15m': 59, '30m': 59, '1h': 729, '4h': 729}
+SAFE_RANGE = {'1m': '5d', '2m': '1mo', '5m': '1mo', '15m': '1mo', '30m': '1mo', '1h': '2y', '4h': '2y'}
+CANDLES_PER_DAY = {'1m': 1440, '2m': 720, '5m': 288, '15m': 96, '30m': 48, '1h': 24, '4h': 6, '1d': 1,
+                   '1wk': 1 / 7, '1mo': 1 / 30}
+
+
+def coverage_days(interval: str) -> float:
+    """How many days of history one fetch at this interval can cover: the source's limit and MAX_CANDLES."""
+    return min(SOURCE_LIMIT_DAYS.get(interval, 1e9), MAX_CANDLES / CANDLES_PER_DAY.get(interval, 1))
+
+
+def interval_for_window(interval: str, days: float) -> str:
+    """The requested interval when it covers `days`, else the finest coarser one that does."""
+    interval = str(interval or '1h').lower().replace('60m', '1h')
+    if interval not in INTERVALS or coverage_days(interval) >= days:
+        return interval
+    ladder = ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk')
+    start = INTERVALS.index(interval)
+    for iv in ladder:
+        if INTERVALS.index(iv) > start and coverage_days(iv) >= days:
+            return iv
+    return '1wk'
 
 
 def normalize_symbol(symbol: str) -> str:
     raw = str(symbol or '').strip().upper()
-    compact = re.sub(r'[\s/_]', '', raw)
+    if ':' in raw:                                      # TradingView style: OANDA:XAUUSD, CME_MINI:NQ1!
+        raw = raw.rsplit(':', 1)[1]
+    compact = re.sub(r'[\s/_&]', '', raw)
     if not compact:
         raise ValueError('Name a symbol, such as EURUSD, XAUUSD, BTCUSD or AAPL.')
+    future = None                                       # the market named in a futures context, if any
+    if re.search(r'[A-Z0-9]\d?!$', compact):            # continuous contract: NQ1!, MNQ1!, GC!
+        future = re.sub(r'\d?!$', '', compact)
+    elif re.search(r'.(?:FUTURES?|FUTS?)$', compact):    # "gold futures", "MNQ futures"
+        future = re.sub(r'(?:FUTURES?|FUTS?)$', '', compact)
+    elif compact.endswith('=F'):                        # a futures code, maybe with a spot name: XAUUSD=F
+        future = compact[:-2]
+    if future is not None:
+        if future in FUTURES:
+            return FUTURES[future]
+        if future in FUTURE_WORDS:
+            return FUTURE_WORDS[future]
+        compact = future + '=F' if re.fullmatch(r'[A-Z0-9]{1,6}', future) else compact
+        if not re.fullmatch(r'[A-Z0-9^=.\-]{1,20}', compact):
+            raise ValueError('That symbol has characters a market data symbol cannot contain.')
+        return compact
     if compact in SYMBOLS:
         return SYMBOLS[compact]
+    if compact in FUTURES_BARE:
+        return FUTURES[compact]
     if len(compact) == 6 and compact[:3] in FX and compact[3:] in FX and compact[:3] != compact[3:]:
         return compact + '=X'
     for quote_ccy in ('USDT', 'USD'):
@@ -70,9 +136,28 @@ def normalize_symbol(symbol: str) -> str:
     return compact
 
 
-def _yahoo_url(symbol: str, interval: str, range_: str) -> str:
-    return ('https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='=^.-')
+def _yahoo_url(symbol: str, interval: str, range_: str, host: str = 'query1') -> str:
+    return ('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='=^.-')
             + '?interval=' + interval + '&range=' + range_ + '&includePrePost=false')
+
+
+def _direct_fetch(url: str) -> dict:
+    """One uncached request to the fallback host. Returns cache-shaped data or raises with Yahoo's own reason."""
+    import requests
+    from datetime import datetime as _dt
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Macintosh) MarkLVI-Research/1.0'}, timeout=(5, 18))
+    except requests.RequestException as exc:
+        raise RuntimeError(f'no answer ({type(exc).__name__})') from None
+    if r.status_code != 200:
+        why = ''
+        try:
+            why = ((r.json().get('chart') or {}).get('error') or {}).get('description') or ''
+        except ValueError:
+            pass
+        raise RuntimeError(f'HTTP {r.status_code}' + (f': {why}' if why else ''))
+    return {'url': url, 'fetched_at': _dt.now(timezone.utc).isoformat(), 'text': r.text,
+            'offline_fallback': False, 'cache_hit': False}
 
 
 def parse_yahoo(text: str) -> tuple[list[dict], dict]:
@@ -124,17 +209,39 @@ def fetch_candles(symbol: str, interval: str = '1h', range_: str = '', refresh: 
     range_ = str(range_ or DEFAULT_RANGE[interval]).lower()
     if range_ not in RANGES:
         raise ValueError('Choose a range from ' + ', '.join(RANGES) + '.')
+    range_note = None
+    if interval in SOURCE_LIMIT_DAYS and RANGE_DAYS[range_] > SOURCE_LIMIT_DAYS[interval]:
+        # Yahoo refuses (HTTP 422) ranges past what it keeps for that interval; ask for what it has
+        range_note = (f'{interval} candles only go back about {SOURCE_LIMIT_DAYS[interval]} days; '
+                      f'range {range_} was shortened to {SAFE_RANGE[interval]}.')
+        range_ = SAFE_RANGE[interval]
     sym = normalize_symbol(symbol)
     source_interval = '60m' if interval in ('1h', '4h') else interval
     intraday = interval not in ('1d', '1wk', '1mo')
-    data = cache.fetch(_yahoo_url(sym, source_interval, range_), ttl=60 if intraday else 1800, force=refresh)
-    candles, meta = parse_yahoo(data['text'])
+    try:
+        data = cache.fetch(_yahoo_url(sym, source_interval, range_), ttl=60 if intraday else 1800, force=refresh)
+    except RuntimeError as first:
+        # The cached feed failed and nothing is cached: one direct try on Yahoo's second host, which also
+        # tells us Yahoo's own reason (rate limit, unknown symbol, range) for the error message.
+        try:
+            data = _direct_fetch(_yahoo_url(sym, source_interval, range_, host='query2'))
+        except RuntimeError as second:
+            label = str(symbol) if str(symbol).upper() == sym else f'{symbol} (Yahoo symbol {sym})'
+            raise ValueError(f'No market data for {label}, {interval} candles, range {range_}: Yahoo Finance '
+                             f'chart API failed ({second}; {first}).') from None
+    try:
+        candles, meta = parse_yahoo(data['text'])
+    except ValueError as exc:
+        raise ValueError(f'{exc} (symbol {symbol} → {sym}, {interval}, range {range_}, Yahoo Finance)') from None
     if interval == '4h':
         candles = resample(candles, 4 * 3600)
     candles = candles[-MAX_CANDLES:]
-    return {'symbol': sym, 'requested': str(symbol), 'interval': interval, 'range': range_,
-            'source': 'Yahoo Finance chart data (delayed or indicative; not your broker feed)',
-            'proxy_note': PROXY_NOTES.get(sym, ''), **meta, **cache.metadata(data), 'candles': candles}
+    out = {'symbol': sym, 'requested': str(symbol), 'interval': interval, 'range': range_,
+           'source': 'Yahoo Finance chart data (delayed or indicative; not your broker feed)',
+           'proxy_note': PROXY_NOTES.get(sym, ''), **meta, **cache.metadata(data), 'candles': candles}
+    if range_note:
+        out['range_note'] = range_note
+    return out
 
 
 _TIME_FORMATS = ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y.%m.%d %H:%M', '%Y.%m.%d %H:%M:%S',

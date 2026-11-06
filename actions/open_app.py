@@ -290,6 +290,7 @@ def _launch_and_verify(player, spoken: str, launcher_name: str,
 def open_app(parameters=None, response=None, player=None,
              session_memory=None) -> str:
     spoken = ((parameters or {}).get("app_name") or "").strip()
+    spoken = appidentity.heard_as(spoken)          # "Ola" is how the ear hears "Ulaa"
     if not spoken:
         return outcome.failed("open_app", "no application name was given")
 

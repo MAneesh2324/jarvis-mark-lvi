@@ -36,9 +36,15 @@ def first_audio():
         started, _pending_typed = _pending_typed, None
         heard, _pending_voice = _pending_voice, None
     if started is not None:
-        record('response', 'typed_request_to_first_audio_received', monotonic() - started)
+        _log_reply('typed', monotonic() - started)
     elif heard is not None:
-        record('response', 'speech_to_first_audio_received', monotonic() - heard)
+        _log_reply('voice', monotonic() - heard)
+
+
+def _log_reply(kind: str, seconds: float) -> None:
+    record('response', 'typed_request_to_first_audio_received' if kind == 'typed' else 'speech_to_first_audio_received', seconds)
+    # One line in the app log per reply, so slow moments can be found afterwards (timings only, never words).
+    print(f"[Speed] {kind} reply began {seconds:.2f}s after the request" + ('  ⚠️ slow' if seconds > 3 else ''), flush=True)
 
 
 def cancel_response():

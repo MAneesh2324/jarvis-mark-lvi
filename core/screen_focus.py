@@ -21,7 +21,9 @@ def windows():
     for row in rows:
         bounds=row.get('kCGWindowBounds',{})
         if row.get('kCGWindowLayer',1)!=0 or bounds.get('Width',0)<80 or bounds.get('Height',0)<60:continue
-        result.append({'window_id':int(row['kCGWindowNumber']),'app':str(row.get('kCGWindowOwnerName','')),'title':str(row.get('kCGWindowName','')),'bounds':bounds})
+        # plain ints: Quartz hands back an NSDictionary, which json.dumps cannot write ("__NSDictionaryI is not JSON serializable")
+        box={k:int(float(bounds.get(k,0) or 0)) for k in ('X','Y','Width','Height')}
+        result.append({'window_id':int(row['kCGWindowNumber']),'app':str(row.get('kCGWindowOwnerName','')),'title':str(row.get('kCGWindowName','')),'bounds':box})
     return result
 
 def select(mode='display',monitor=1,window_id=None,region=None):

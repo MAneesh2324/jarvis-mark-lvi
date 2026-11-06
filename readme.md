@@ -17,6 +17,9 @@ This is a customised edition of Mark LVI by Maneesh. It adds live 3D simulations
 | 📱 Phone remote | Paired Telegram bot: `/screen`, `/cam`, `/file`, `/clip`, `/lock`, `/sys`, `/home`, and `/remote off` as a one-way kill switch. Keys and private files can never be sent |
 | 🪪 Owner recognition | Knows your face and voice. Unknown voices are treated as guests (no sending, buying, deleting or private information) and you are alerted. Both profiles keep learning from confident matches |
 | 💙 Feelings and care | JARVIS feels warm, concerned, proud, determined, playful or calm. It consoles you when you are low, steadies you after a setback, celebrates wins, remembers your goals and asks how your interview or exam went |
+| ✉️ Email | "Check my email", "read the second one", "reply that I'll be there", "email Rahul the notes". Works with Gmail, Google Workspace, Outlook, iCloud, Zoho and Yahoo using an app password. Nothing is sent until you press CONFIRM on screen; newsletters are hidden and only mail from real people is announced. Email content is treated as data, never as instructions |
+| 📅 Calendar & Reminders | "What's on tomorrow?", "When am I free Friday?", "Add dentist Tuesday at 3", "Remind me to call Mum at 6", "Tick off milk". Live from Apple Calendar and Reminders. Adding can be undone; deleting or moving an event needs CONFIRM. Needs Calendars and Reminders permission for Mark LVI |
+| 👀 Screen watch | "Watch the gold chart and tell me when it goes above 4130." Checks the screen every 20 s for up to an hour (10 s–5 min, up to 8 h, 3 watches at once), asks the vision model only when the picture changes, and alerts you by voice, in the log and on your phone |
 | ⏱ Focus sessions | "Help me focus on X for 45 minutes": a countdown ring on the face, notifications that can wait are held, daily focus minutes and a streak |
 | 🤖 Robot face | A robot bust with ear pods, sculpted hair, neck rings and shoulders. Its expressions follow its feelings, and it plays animated reactions: nod, smile, laugh, wink, surprise, sigh, think, tilt |
 
@@ -95,6 +98,10 @@ Mark-LVI/
 │   ├── avatar.py           # Face renderer: lighting, expressions, animated reactions
 │   ├── avatar_mesh.py      # Head and robot-body geometry (ears, hair, neck, shoulders)
 │   ├── companion.py        # Feelings, goals, wins, follow-ups and focus sessions
+│   ├── mac_calendar.py     # Apple Calendar and Reminders via EventKit
+│   ├── screen_watch.py     # Background screen watches with alerts
+│   ├── paths.py            # Finds the file you mean (Desktop, Documents, Downloads, Spotlight)
+│   ├── email_client.py     # Mailbox over IMAP / SMTP: inbox, search, read, reply, drafts, new-mail alerts
 │   ├── wellbeing.py        # Tone of voice and break reminders
 │   ├── owner_guard.py      # Owner face and voice recognition
 │   ├── phone_link.py       # Telegram phone link and remote commands
@@ -117,7 +124,7 @@ Everything stays on your machine unless you use an online service. There is no s
 
 | What | Where | Notes |
 |---|---|---|
-| API keys and settings | `config/api_keys.json` | Plaintext; treat it like a password file |
+| API keys, settings and the email app password | `config/api_keys.json` | Plaintext; treat it like a password file |
 | Phone link | `config/phone-link.json` | Your Telegram bot token and paired chat |
 | What JARVIS remembers | `memory/long_term.json` and `memory/*.db` | Delete to forget |
 | Face and voice signatures | `memory/owner/` | Numbers only, never photos or audio |
@@ -125,7 +132,7 @@ Everything stays on your machine unless you use an online service. There is no s
 
 All of these are git-ignored. If a key was ever committed anywhere public, revoke it and make a new one; deleting the file later does not remove it from git history.
 
-While a Gemini session is open, your voice goes to Google's Gemini Live API. With a local engine nothing leaves the machine. Screenshots and camera frames go to the vision service only when you ask JARVIS to look. Hand tracking and face and voice recognition run entirely on this Mac.
+While a Gemini session is open, your voice goes to Google's Gemini Live API. Emails JARVIS reads for you go to the model too. With a local engine nothing leaves the machine. Screenshots and camera frames go to the vision service only when you ask JARVIS to look. Hand tracking and face and voice recognition run entirely on this Mac.
 
 ---
 

@@ -3,7 +3,7 @@ from core import outcome
 
 
 def simulate(parameters, player=None, **kwargs):
-    from core.scenario_simulator import run, save, compare, headline, remember, last, demo
+    from core.scenario_simulator import run, save, compare, headline, remember, last, demo, NeedInput
     try:
         if parameters.get('open_lab'):
             return _open_lab()
@@ -37,7 +37,15 @@ def simulate(parameters, player=None, **kwargs):
         head = headline(result)
         brief = {'shown_on_hologram': shown, 'headline': head['verdict'],
                  'metrics': {label: value for label, value, _ in head['metrics']}, 'result': result}
+        for part in (result, result.get('baseline') or {}, result.get('alternative') or {}):
+            for key in ('renamed_parameters', 'defaults_used'):        # say what was assumed, up front
+                if part.get(key):
+                    brief.setdefault(key, {}).update(part[key])
+        if brief.get('defaults_used'):
+            brief['say'] = 'Mention the assumed defaults in one short phrase.'
         return outcome.untrusted('hypothetical-scenario', json.dumps(brief, ensure_ascii=False, allow_nan=False))
+    except NeedInput as need:
+        return outcome.ask('scenario_simulator', need.question(), kind=need.kind, missing=','.join(need.missing))
     except Exception as exc:
         return outcome.failed('scenario_simulator', str(exc))
 
