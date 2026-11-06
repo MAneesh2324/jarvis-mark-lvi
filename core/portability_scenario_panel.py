@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QFormLayout,QHBoxLayout,QLineEdit,QPlainTextEdit,QCh
 
 class ScenarioChart(QWidget):
  def __init__(self):super().__init__();self.rows=[];self.setMinimumHeight(200);self.setMaximumHeight(260)
- def set_result(self,result):self.rows=result.get('fan_chart',[]);self.update()
+ def set_result(self,result):self.rows=result.get('fan_chart',[]);self.unit=result.get('x_unit','trading days');self.update()
  def paintEvent(self,event):
   painter=QPainter(self);painter.setRenderHint(QPainter.RenderHint.Antialiasing);painter.fillRect(self.rect(),QColor('#081b27'));painter.setPen(QColor('#c9eaf3'))
   if not self.rows:painter.drawText(self.rect(),Qt.AlignmentFlag.AlignCenter,'Run a forex scenario to show its conditional percentile band.');return
@@ -15,7 +15,7 @@ class ScenarioChart(QWidget):
   def point(row,key):return QPointF(left+width*row['day']/max(1,self.rows[-1]['day']),top+height*(hi-row[key])/(hi-lo))
   polygon=QPolygonF([point(r,'p05') for r in self.rows]+[point(r,'p95') for r in reversed(self.rows)]);painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor(0,190,220,65));painter.drawPolygon(polygon)
   painter.setBrush(Qt.BrushStyle.NoBrush);painter.setPen(QPen(QColor('#18d3ed'),2));painter.drawPolyline(QPolygonF([point(r,'median') for r in self.rows]))
-  painter.setPen(QColor('#c9eaf3'));painter.drawText(10,25,f'{hi:.5g}');painter.drawText(10,top+height,f'{lo:.5g}');painter.drawText(left,top+height+25,'0');painter.drawText(left+width-100,top+height+25,str(self.rows[-1]['day'])+' trading days');painter.drawText(left,18,'Conditional 5th–95th percentile band / median. Not a forecast.')
+  painter.setPen(QColor('#c9eaf3'));painter.drawText(10,25,f'{hi:.5g}');painter.drawText(10,top+height,f'{lo:.5g}');painter.drawText(left,top+height+25,'0');painter.drawText(left+width-100,top+height+25,str(self.rows[-1]['day'])+' '+getattr(self,'unit','trading days'));painter.drawText(left,18,'Conditional 5th–95th percentile band / median. Not a forecast.')
 
 def memory_view(panel,box):
  from core import portable_memory as vault
@@ -52,9 +52,11 @@ def memory_view(panel,box):
 def scenario_view(panel,box):
  from core import scenario_simulator as simulation
  panel.info(box,'Change explicit assumptions, run a local hypothetical scenario, compare results, and optionally save a private report. These calculations never trade, scan systems or alter your services.')
- kind=QComboBox();kind.addItems(['forex','trade_stress','outage']);box.addWidget(kind)
+ kind=QComboBox();kind.addItems(['goal','savings','forex','trade_stress','outage']);box.addWidget(kind)
  parameters=QPlainTextEdit();parameters.setMaximumHeight(210);box.addWidget(parameters);chart=ScenarioChart();box.addWidget(chart);output=QPlainTextEdit();output.setReadOnly(True);box.addWidget(output);latest=[None];baseline=[None]
  examples={
+ 'goal':{'total_hours':300,'hours_per_day':3,'consistency_percent':80,'hours_done':0,'deadline_days':150,'daily_variation_percent':25},
+ 'savings':{'start_balance':0,'monthly_contribution':10000,'months':36,'annual_return_percent':0,'annual_volatility_percent':0,'target':400000},
  'forex':{'start_rate':1.1,'annual_return_percent':0,'annual_volatility_percent':10,'days':90,'paths':1000,'shock_percent':0,'seed':42},
  'trade_stress':{'equity':10000,'units':10000,'pair_start':1.1,'pair_move_percent':-2,'quote_to_account':1,'spread_cost':2,'slippage_cost':5,'direction':'long'},
  'outage':{'requests_per_minute':100,'outage_minutes':30,'affected_percent':100,'capacity_per_minute':200,'retry_percent':50,'backlog_before':0}}

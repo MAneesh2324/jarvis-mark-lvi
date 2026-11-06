@@ -110,3 +110,7 @@ memory/owner/
 memory/agents/
 memory/voice-baseline.json
 memory/last-diagnostic.md
+
+# 3D scene build tools; the bundled vendor/sim3d.bundle.js is the runtime asset
+web/sim3d/node_modules/
+memory/companion.json

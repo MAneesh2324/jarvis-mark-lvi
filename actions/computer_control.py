@@ -362,7 +362,7 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
         * It then checks whether the process is gone, and answers `done` only
           if it is.
     """
-    app_name = (app_name or "").strip()
+    app_name = appidentity.heard_as((app_name or "").strip())   # "Ola" → "Ulaa"
     if not app_name:
         return outcome.failed("close_app", "no application name was given")
 
@@ -389,11 +389,18 @@ def _close_app(app_name: str, confirmed_index: int | None = None) -> str:
                 "assistant closed they should close its window themselves",
                 app=app_name,
             )
+        near = [n for n in appidentity.closest_running(app_name) if n.lower() not in ("mark lvi", "marklvi")]
+        if near:
+            return outcome.ask(
+                "close_app",
+                f"nothing is running under that exact name; the closest running app is {near[0]} "
+                f"- ask the user if they meant {near[0]}, then call again with that name",
+                app=app_name, closest=", ".join(near))
         return outcome.failed(
             "close_app",
             "no running application matches that name - it may already be "
             "closed, or be running under a different name",
-            app=app_name,
+            app=app_name, running=", ".join(appidentity.running_app_names()[:15]),
         )
 
     # Group by process NAME, because twenty `opera.exe` are one application
@@ -661,7 +668,12 @@ def computer_control(
                 print(f"[ComputerControl] ⚠️ No '{field}' in memory, using random: {value}")
             return value
 
-        return f"Unknown action: '{action}'"
+        valid = ("type smart_type press hotkey click double_click right_click move drag scroll copy paste "
+                 "screenshot screen_find screen_click wait clear_field focus_window close_app random_data user_data")
+        if "," in action or " " in action.strip():
+            return outcome.failed("computer_control", "one action per call - call it again once for each step",
+                                  wanted=action, valid=valid)
+        return outcome.failed("computer_control", f"unknown action '{action}'", valid=valid)
 
     except Exception as e:
         print(f"[ComputerControl] ❌ {action}: {e}")

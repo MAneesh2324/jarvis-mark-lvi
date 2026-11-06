@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import re
 import threading
-import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -198,20 +197,36 @@ def _guard(step: dict, snap: dict) -> str | None:
     return None
 
 
+_ACTIVE = ('running', 'waiting_for_user')
+_threads: dict[str, threading.Thread] = {}
+# A reply that only answers a question ("yes", "ok") is not a task to start.
+_BARE_ANSWER = re.compile(r"\s*(yes|yeah|yep|no|nope|ok|okay|sure|go ahead|continue|proceed|stop|cancel|"
+                          r"approve|approved|do it|fine)\W*\s*", re.I)
+
+
 def start(goal: str) -> dict:
+    """Start a browser task. The user's NEWEST request wins.
+
+    A task that is still running or waiting is cancelled first (it stops before
+    its next action, says nothing more, and is reported as replaced_task), so a
+    changed mind never gets "a browser task is already running" back.
+    """
     goal = re.sub(r'\s+', ' ', str(goal or '')).strip()
     if len(goal) < 6:
         raise ValueError('Describe what to do in the browser.')
-    replaced = [j['id'] for j in _jobs.values() if j['state'] in ('running', 'waiting_for_user')]
-    if replaced:
-        stop()                                   # a new request replaces the old one, as a person would
-        time.sleep(0.3)
+    replaced = stop(reason='replaced')['stopping']
+    for jid in replaced:                         # give the old worker a moment to notice and step aside
+        t = _threads.get(jid)
+        if t is not None and t.is_alive():
+            t.join(timeout=0.5)
     job = {'id': uuid.uuid4().hex[:8], 'goal': goal, 'state': 'running', 'steps': [], 'created': _now(),
            'answer': None, 'question': None, 'pending': None}
     _jobs[job['id']] = job
     _events[job['id']] = threading.Event()
-    threading.Thread(target=_run, args=(job,), daemon=True, name='jarvis-browser-agent').start()
-    return {'id': job['id'], 'state': 'running', 'replaced_previous_task': bool(replaced),
+    t = threading.Thread(target=_run, args=(job,), daemon=True, name='jarvis-browser-agent')
+    _threads[job['id']] = t
+    t.start()
+    return {'id': job['id'], 'state': 'running', 'replaced_task': ','.join(replaced) or None,
             'note': 'Working in the browser; progress shows in the activity log and I will report when done or if I need you.'}
 
 
@@ -236,6 +251,8 @@ def _run(job):
                                    elements='\n'.join(_el_line(e) for e in snap.get('elements', []))[:7000],
                                    text=snap.get('text', '')[:3500])
             step = _ask_model(prompt)
+            if job.get('stop'):
+                return                            # cancelled or replaced while the model was thinking
             batch = None
             if isinstance(step, dict) and isinstance(step.get('actions'), list) and step['actions']:
                 batch = [a for a in step['actions'][:3] if isinstance(a, dict) and 'action' in a]
@@ -275,6 +292,8 @@ def _run(job):
                 job['pending'] = None
             queue = [step] + ([dict(a) for a in batch[1:]] if batch else [])
             for i, act in enumerate(queue):
+                if job.get('stop'):
+                    return
                 if i and (_guard(act, snap) or act['action'] in ('done', 'ask_user')):
                     break                         # later batch items get the full check on the next step
                 try:
@@ -284,9 +303,13 @@ def _run(job):
                 job['steps'].append({'action': act['action'], 'thought': act.get('thought', '')[:160], 'result': result})
                 if result.startswith('FAILED') or act['action'] in ('goto', 'search', 'back', 'download'):
                     break                         # page changed or something broke: look again before going on
+        if job.get('stop'):
+            return
         job.update(state='done', answer=f'Stopped after {MAX_STEPS} steps without finishing. Last: {job.get("progress", "")}')
         notify.send('browser', job['answer'], speak=True)
     except Exception as exc:
+        if job.get('stop'):
+            return                                # a cancelled task does not report its own errors
         job.update(state='failed', answer=str(exc)[:300])
         notify.send('browser', f'Browser task failed: {str(exc)[:200]}')
 
@@ -301,10 +324,21 @@ def _progress(job, n, step):
 
 
 def reply(job_id: str, approve: bool = False, text: str = '') -> dict:
-    job = _jobs.get(job_id) or next((j for j in reversed(list(_jobs.values()))
-                                     if j['state'] in ('waiting_for_user', 'running')), None)
-    if not job or job['state'] not in ('waiting_for_user', 'running'):
-        raise ValueError('No browser task is running.')
+    job = _jobs.get(job_id)
+    if not job or job['state'] not in _ACTIVE:
+        job = next((j for j in reversed(list(_jobs.values())) if j['state'] in _ACTIVE), None)
+    if not job:
+        # Nothing is waiting. "No browser task is waiting for you" left the user's
+        # instruction on the floor; if it says what to do, it IS the next task.
+        text = str(text or '').strip()
+        if len(text) < 6 or _BARE_ANSWER.fullmatch(text):
+            raise ValueError('No browser task is running or waiting, and the reply does not say what to do.')
+        earlier = _jobs.get(job_id) or (list(_jobs.values())[-1] if _jobs else None)
+        goal = text + (f" (follow-up to the earlier browser task: {earlier['goal']})" if earlier else '')
+        out = start(goal)
+        out.update(started_new_task=True,
+                   note='Nothing was waiting, so this was started as a new browser task. It is under way, not finished.')
+        return out
     if job['state'] == 'running':
         # A change of plan mid-task ("actually, laptops instead"): picked up at the next step.
         if not text:
@@ -316,11 +350,19 @@ def reply(job_id: str, approve: bool = False, text: str = '') -> dict:
     return {'id': job['id'], 'state': 'continuing', 'approved': bool(approve)}
 
 
-def stop(job_id: str = '') -> dict:
-    jobs = [_jobs[job_id]] if job_id in _jobs else [j for j in _jobs.values() if j['state'] in ('running', 'waiting_for_user')]
+def stop(job_id: str = '', reason: str = '') -> dict:
+    """Cancel a task (or every active one). It is marked stopped at once — its
+    worker finishes at most the single browser action already in flight, then
+    exits without touching the browser again or announcing anything."""
+    jobs = [_jobs[job_id]] if job_id in _jobs else [j for j in _jobs.values() if j['state'] in _ACTIVE]
     for j in jobs:
         j['stop'] = True
-        _events[j['id']].set()
+        if j['state'] in _ACTIVE:
+            j['state'] = 'stopped'
+            j['answer'] = 'Replaced by a newer request.' if reason == 'replaced' else 'Stopped by the user.'
+        ev = _events.get(j['id'])
+        if ev is not None:
+            ev.set()
     return {'stopping': [j['id'] for j in jobs]}
 
 

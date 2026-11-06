@@ -1,0 +1,11 @@
+{"title": "Apple growing on the tree", "time_unit": "days", "duration": 160, "steps": 320,
+ "params": {"sunlight_hours": 8, "water": 1.0, "temperature": 20},
+ "variables": [
+  {"name": "diameter_mm", "unit": "mm", "start": 0, "rate": "between(t, 14, 145) * 0.035 * (80 - diameter_mm) * min(1, sunlight_hours / 8) * min(1.2, water) * clamp(1 - abs(temperature - 21) / 20, 0, 1) + between(t, 10, 14) * 1.5"},
+  {"name": "sugar_percent", "unit": "%", "start": 1, "rate": "between(t, 95, 160) * 0.06 * (16 - sugar_percent) * min(1, sunlight_hours / 7)"},
+  {"name": "red_percent", "unit": "%", "value": "clamp((t - 115) * 2.2, 0, 100) * min(1, sunlight_hours / 6)"}
+ ],
+ "stages": [{"name": "bloom", "start": 0, "end": 10}, {"name": "fruit set", "start": 10, "end": 30}, {"name": "cell division", "start": 30, "end": 60}, {"name": "expansion", "start": 60, "end": 120}, {"name": "ripening", "start": 120, "end": 160}],
+ "events": [{"label": "ripe", "when": "sugar_percent >= 12 and red_percent >= 60"}, {"label": "harvest size", "when": "diameter_mm >= 70"}],
+ "focus": "diameter_mm", "uncertainty_percent": 12,
+ "scene": {"type": "grow", "size": "diameter_mm", "max": 80, "color": "red_percent", "color_max": 100, "from": "#7cc242", "to": "#d62828", "label": "apple"}}

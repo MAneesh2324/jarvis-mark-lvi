@@ -40,24 +40,90 @@ SYMBOLS = {
     'NIFTY': '^NSEI', 'NIFTY50': '^NSEI', 'BANKNIFTY': '^NSEBANK', 'SENSEX': '^BSESN',
     'DXY': 'DX-Y.NYB',
 }
+# Futures roots (CME/COMEX/NYMEX, incl. micro contracts) → the Yahoo continuous contract
+FUTURES = {'GC': 'GC=F', 'MGC': 'GC=F', 'SI': 'SI=F', 'SIL': 'SI=F', 'HG': 'HG=F', 'PL': 'PL=F',
+           'NQ': 'NQ=F', 'MNQ': 'NQ=F', 'ES': 'ES=F', 'MES': 'ES=F', 'YM': 'YM=F', 'MYM': 'YM=F',
+           'RTY': 'RTY=F', 'M2K': 'RTY=F', 'CL': 'CL=F', 'MCL': 'CL=F', 'NG': 'NG=F', 'BZ': 'BZ=F',
+           'ZB': 'ZB=F', 'ZN': 'ZN=F', 'ZC': 'ZC=F', 'ZW': 'ZW=F', 'ZS': 'ZS=F', '6E': '6E=F', '6B': '6B=F',
+           '6J': '6J=F', 'BTC': 'BTC=F', 'MBT': 'BTC=F'}
+# Roots that mean the future even when said bare ("backtest MNQ"); the rest need =F, 1! or "futures",
+# because bare they are also stock or ETF tickers (SIL, PL, HG…) or crypto (BTC).
+FUTURES_BARE = ('GC', 'MGC', 'NQ', 'MNQ', 'ES', 'MES', 'YM', 'MYM', 'RTY', 'M2K', 'MCL')
+# "gold futures", "nasdaq futures", "XAUUSD=F": the market named, then "futures"
+FUTURE_WORDS = {'GOLD': 'GC=F', 'XAUUSD': 'GC=F', 'XAU': 'GC=F', 'SILVER': 'SI=F', 'XAGUSD': 'SI=F',
+                'COPPER': 'HG=F', 'PLATINUM': 'PL=F',
+                'NASDAQ': 'NQ=F', 'NASDAQ100': 'NQ=F', 'NAS100': 'NQ=F', 'US100': 'NQ=F', 'NDX': 'NQ=F',
+                'MICRONASDAQ': 'NQ=F', 'SP500': 'ES=F', 'SPX': 'ES=F', 'SPX500': 'ES=F', 'US500': 'ES=F',
+                'SANDP': 'ES=F', 'SNP': 'ES=F', 'EMINI': 'ES=F', 'DOW': 'YM=F', 'US30': 'YM=F', 'DJ30': 'YM=F',
+                'DOWJONES': 'YM=F', 'RUSSELL': 'RTY=F', 'RUSSELL2000': 'RTY=F', 'US2000': 'RTY=F',
+                'OIL': 'CL=F', 'CRUDE': 'CL=F', 'CRUDEOIL': 'CL=F', 'WTI': 'CL=F', 'USOIL': 'CL=F',
+                'BRENT': 'BZ=F', 'UKOIL': 'BZ=F', 'NATGAS': 'NG=F', 'NATURALGAS': 'NG=F', 'GAS': 'NG=F'}
 PROXY_NOTES = {
     'GC=F': 'Gold futures (COMEX), a proxy for spot XAUUSD; levels differ slightly from broker spot.',
     'SI=F': 'Silver futures, a proxy for spot XAGUSD.',
     'CL=F': 'WTI crude futures.', 'BZ=F': 'Brent crude futures.',
+    'NQ=F': 'E-mini Nasdaq-100 futures (CME, front month); micro MNQ moves the same in points.',
+    'ES=F': 'E-mini S&P 500 futures (CME, front month); micro MES moves the same in points.',
+    'YM=F': 'E-mini Dow futures (CBOT, front month).', 'RTY=F': 'E-mini Russell 2000 futures (CME, front month).',
 }
 INTERVALS = ('1m', '2m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk', '1mo')
 DEFAULT_RANGE = {'1m': '5d', '2m': '1mo', '5m': '1mo', '15m': '1mo', '30m': '1mo',
                  '1h': '3mo', '4h': '6mo', '1d': '2y', '1wk': '5y', '1mo': '10y'}
 RANGES = ('1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', '10y', 'ytd', 'max')
+RANGE_DAYS = {'1d': 1, '5d': 5, '1mo': 31, '3mo': 92, '6mo': 183, '1y': 366, '2y': 731, '5y': 1827,
+              '10y': 3653, 'ytd': 366, 'max': 1e9}
+# How far back Yahoo serves each interval (days), and the longest range that stays inside it
+SOURCE_LIMIT_DAYS = {'1m': 7, '2m': 59, '5m': 59, '15m': 59, '30m': 59, '1h': 729, '4h': 729}
+SAFE_RANGE = {'1m': '5d', '2m': '1mo', '5m': '1mo', '15m': '1mo', '30m': '1mo', '1h': '2y', '4h': '2y'}
+CANDLES_PER_DAY = {'1m': 1440, '2m': 720, '5m': 288, '15m': 96, '30m': 48, '1h': 24, '4h': 6, '1d': 1,
+                   '1wk': 1 / 7, '1mo': 1 / 30}
+
+
+def coverage_days(interval: str) -> float:
+    """How many days of history one fetch at this interval can cover: the source's limit and MAX_CANDLES."""
+    return min(SOURCE_LIMIT_DAYS.get(interval, 1e9), MAX_CANDLES / CANDLES_PER_DAY.get(interval, 1))
+
+
+def interval_for_window(interval: str, days: float) -> str:
+    """The requested interval when it covers `days`, else the finest coarser one that does."""
+    interval = str(interval or '1h').lower().replace('60m', '1h')
+    if interval not in INTERVALS or coverage_days(interval) >= days:
+        return interval
+    ladder = ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk')
+    start = INTERVALS.index(interval)
+    for iv in ladder:
+        if INTERVALS.index(iv) > start and coverage_days(iv) >= days:
+            return iv
+    return '1wk'
 
 
 def normalize_symbol(symbol: str) -> str:
     raw = str(symbol or '').strip().upper()
-    compact = re.sub(r'[\s/_]', '', raw)
+    if ':' in raw:                                      # TradingView style: OANDA:XAUUSD, CME_MINI:NQ1!
+        raw = raw.rsplit(':', 1)[1]
+    compact = re.sub(r'[\s/_&]', '', raw)
     if not compact:
         raise ValueError('Name a symbol, such as EURUSD, XAUUSD, BTCUSD or AAPL.')
+    future = None                                       # the market named in a futures context, if any
+    if re.search(r'[A-Z0-9]\d?!$', compact):            # continuous contract: NQ1!, MNQ1!, GC!
+        future = re.sub(r'\d?!$', '', compact)
+    elif re.search(r'.(?:FUTURES?|FUTS?)$', compact):    # "gold futures", "MNQ futures"
+        future = re.sub(r'(?:FUTURES?|FUTS?)$', '', compact)
+    elif compact.endswith('=F'):                        # a futures code, maybe with a spot name: XAUUSD=F
+        future = compact[:-2]
+    if future is not None:
+        if future in FUTURES:
+            return FUTURES[future]
+        if future in FUTURE_WORDS:
+            return FUTURE_WORDS[future]
+        compact = future + '=F' if re.fullmatch(r'[A-Z0-9]{1,6}', future) else compact
+        if not re.fullmatch(r'[A-Z0-9^=.\-]{1,20}', compact):
+            raise ValueError('That symbol has characters a market data symbol cannot contain.')
+        return compact
     if compact in SYMBOLS:
         return SYMBOLS[compact]
+    if compact in FUTURES_BARE:
+        return FUTURES[compact]
     if len(compact) == 6 and compact[:3] in FX and compact[3:] in FX and compact[:3] != compact[3:]:
         return compact + '=X'
     for quote_ccy in ('USDT', 'USD'):
@@ -70,9 +136,28 @@ def normalize_symbol(symbol: str) -> str:
     return compact
 
 
-def _yahoo_url(symbol: str, interval: str, range_: str) -> str:
-    return ('https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='=^.-')
+def _yahoo_url(symbol: str, interval: str, range_: str, host: str = 'query1') -> str:
+    return ('https://' + host + '.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='=^.-')
             + '?interval=' + interval + '&range=' + range_ + '&includePrePost=false')
+
+
+def _direct_fetch(url: str) -> dict:
+    """One uncached request to the fallback host. Returns cache-shaped data or raises with Yahoo's own reason."""
+    import requests
+    from datetime import datetime as _dt
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Macintosh) MarkLVI-Research/1.0'}, timeout=(5, 18))
+    except requests.RequestException as exc:
+        raise RuntimeError(f'no answer ({type(exc).__name__})') from None
+    if r.status_code != 200:
+        why = ''
+        try:
+            why = ((r.json().get('chart') or {}).get('error') or {}).get('description') or ''
+        except ValueError:
+            pass
+        raise RuntimeError(f'HTTP {r.status_code}' + (f': {why}' if why else ''))
+    return {'url': url, 'fetched_at': _dt.now(timezone.utc).isoformat(), 'text': r.text,
+            'offline_fallback': False, 'cache_hit': False}
 
 
 def parse_yahoo(text: str) -> tuple[list[dict], dict]:
@@ -124,17 +209,39 @@ def fetch_candles(symbol: str, interval: str = '1h', range_: str = '', refresh: 
     range_ = str(range_ or DEFAULT_RANGE[interval]).lower()
     if range_ not in RANGES:
         raise ValueError('Choose a range from ' + ', '.join(RANGES) + '.')
+    range_note = None
+    if interval in SOURCE_LIMIT_DAYS and RANGE_DAYS[range_] > SOURCE_LIMIT_DAYS[interval]:
+        # Yahoo refuses (HTTP 422) ranges past what it keeps for that interval; ask for what it has
+        range_note = (f'{interval} candles only go back about {SOURCE_LIMIT_DAYS[interval]} days; '
+                      f'range {range_} was shortened to {SAFE_RANGE[interval]}.')
+        range_ = SAFE_RANGE[interval]
     sym = normalize_symbol(symbol)
     source_interval = '60m' if interval in ('1h', '4h') else interval
     intraday = interval not in ('1d', '1wk', '1mo')
-    data = cache.fetch(_yahoo_url(sym, source_interval, range_), ttl=60 if intraday else 1800, force=refresh)
-    candles, meta = parse_yahoo(data['text'])
+    try:
+        data = cache.fetch(_yahoo_url(sym, source_interval, range_), ttl=60 if intraday else 1800, force=refresh)
+    except RuntimeError as first:
+        # The cached feed failed and nothing is cached: one direct try on Yahoo's second host, which also
+        # tells us Yahoo's own reason (rate limit, unknown symbol, range) for the error message.
+        try:
+            data = _direct_fetch(_yahoo_url(sym, source_interval, range_, host='query2'))
+        except RuntimeError as second:
+            label = str(symbol) if str(symbol).upper() == sym else f'{symbol} (Yahoo symbol {sym})'
+            raise ValueError(f'No market data for {label}, {interval} candles, range {range_}: Yahoo Finance '
+                             f'chart API failed ({second}; {first}).') from None
+    try:
+        candles, meta = parse_yahoo(data['text'])
+    except ValueError as exc:
+        raise ValueError(f'{exc} (symbol {symbol} → {sym}, {interval}, range {range_}, Yahoo Finance)') from None
     if interval == '4h':
         candles = resample(candles, 4 * 3600)
     candles = candles[-MAX_CANDLES:]
-    return {'symbol': sym, 'requested': str(symbol), 'interval': interval, 'range': range_,
-            'source': 'Yahoo Finance chart data (delayed or indicative; not your broker feed)',
-            'proxy_note': PROXY_NOTES.get(sym, ''), **meta, **cache.metadata(data), 'candles': candles}
+    out = {'symbol': sym, 'requested': str(symbol), 'interval': interval, 'range': range_,
+           'source': 'Yahoo Finance chart data (delayed or indicative; not your broker feed)',
+           'proxy_note': PROXY_NOTES.get(sym, ''), **meta, **cache.metadata(data), 'candles': candles}
+    if range_note:
+        out['range_note'] = range_note
+    return out
 
 
 _TIME_FORMATS = ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y.%m.%d %H:%M', '%Y.%m.%d %H:%M:%S',
@@ -895,7 +1002,7 @@ def scan(pairs=None, interval='1h', bias='both', top=8) -> dict:
 
 # ── backtesting ─────────────────────────────────────────────────────────────
 
-STRATEGIES = ('ema_cross', 'rsi_reversion', 'breakout', 'breaker_retest')
+STRATEGIES = ('ema_cross', 'rsi_reversion', 'breakout', 'breaker_retest', 'sweep_mss_breaker')
 
 
 def _signals(candles, strategy, p):
@@ -963,14 +1070,113 @@ def _signals(candles, strategy, p):
                 stop = br['low'] - buffer
                 if entry > stop:
                     out.append({'i': x, 'direction': 'long', 'entry': entry, 'stop': stop, 'limit': entry != c[x]['o']})
+    elif strategy == 'sweep_mss_breaker':
+        out += _sweep_mss_breaker(s, swings(s), p)
     else:
         raise ValueError('Strategy must be one of ' + ', '.join(STRATEGIES) + '.')
     return sorted(out, key=lambda e: e['i'])
 
 
-def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **params) -> dict:
+def _sweep_mss_breaker(s: Series, sw, p):
+    """Liquidity sweep → market structure shift → breaker retest (the user's setup).
+
+    Bearish (mirror for bullish):
+      1. sweep   a candle wicks above a confirmed swing high and closes back below it
+      2. MSS     within sweep_window candles, a candle CLOSES below the swing low that started the
+                 leg up into the sweep, before price trades above the sweep high again
+      3. breaker the bullish order block at that low (last down-close candle at/just before it)
+                 has now failed: it is the bearish breaker zone
+      4. entry   sell limit at the zone's low edge on the first return into it, within
+                 retest_window candles of the shift; cancelled if price first goes above the sweep high
+      5. stop    above the sweep high (stop_at=sweep, default) or above the zone (stop_at=breaker)
+    Only information available at each candle is used: swings count once confirmed.
+    """
+    c, n = s.c, s.n
+    sweep_window = int(p.get('sweep_window', 30))
+    retest_window = int(p.get('retest_window', 40))
+    stop_at = str(p.get('stop_at', 'sweep')).lower()
+    if stop_at not in ('sweep', 'breaker'):
+        raise ValueError('stop_at must be sweep or breaker.')
+    out, used = [], set()
+    for ev in sweeps(s, sw):
+        x = ev['i']
+        bearish = ev['direction'] == 'bearish'
+        extreme = c[x]['h'] if bearish else c[x]['l']
+        want = 'low' if bearish else 'high'
+        base = max((q for q in sw if q['kind'] == want and q['confirmed'] <= x and q['i'] < x),
+                   key=lambda q: q['i'], default=None)
+        if base is None:
+            continue
+        # a shift needs price to have held the base from the base to the sweep; already broken is not a shift
+        held = all((c[k]['c'] > base['price']) if bearish else (c[k]['c'] < base['price']) for k in range(base['i'] + 1, x + 1))
+        if not held:
+            continue
+        mss = None
+        for j in range(x + 1, min(n, x + 1 + sweep_window)):
+            if (c[j]['h'] > extreme) if bearish else (c[j]['l'] < extreme):
+                break                                        # the sweep extreme was taken: no shift
+            if (c[j]['c'] < base['price']) if bearish else (c[j]['c'] > base['price']):
+                mss = j
+                break
+        if mss is None:
+            continue
+        b = base['i']                                        # order block: last opposite candle at the base
+        ob = next((k for k in range(b, max(b - 6, -1), -1)
+                   if (c[k]['c'] < c[k]['o'] if bearish else c[k]['c'] > c[k]['o'])), b)
+        if ob in used:
+            continue
+        lo, hi = c[ob]['l'], c[ob]['h']
+        buffer = 0.1 * s.a(mss)
+        for y in range(mss + 1, min(n, mss + 1 + retest_window)):
+            bar = c[y]
+            if (bar['h'] > extreme) if bearish else (bar['l'] < extreme):
+                break                                        # invalidated before a retest
+            if (bar['h'] >= lo) if bearish else (bar['l'] <= hi):
+                if bearish:
+                    entry = lo if bar['o'] < lo else bar['o']
+                    stop = (extreme if stop_at == 'sweep' else hi) + buffer
+                    ok = entry < stop
+                else:
+                    entry = hi if bar['o'] > hi else bar['o']
+                    stop = (extreme if stop_at == 'sweep' else lo) - buffer
+                    ok = entry > stop
+                if ok:
+                    used.add(ob)
+                    out.append({'i': y, 'direction': 'short' if bearish else 'long', 'entry': entry, 'stop': stop,
+                                'limit': entry != bar['o'], 'setup': {'sweep_i': x, 'swept_level': ev['level'],
+                                'mss_i': mss, 'zone': [lo, hi]}})
+                break
+    return out
+
+
+def _curve(rs, limit=300):
+    """[[trade number, cumulative R], …] starting at 0, thinned evenly so it stays small."""
+    pts, total = [[0, 0.0]], 0.0
+    for i, r in enumerate(rs, 1):
+        total += r
+        pts.append([i, round(total, 3)])
+    if len(pts) > limit:
+        step = (len(pts) - 1) / (limit - 1)
+        pts = [pts[round(k * step)] for k in range(limit)]
+    return pts
+
+
+def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, from_time=None, account_balance=None,
+             risk_percent=1.0, risk_amount=None, spread=0.0, commission=0.0, compound=False, **params) -> dict:
+    """Trades on the candles. Structure uses all the data; only entries at or after from_time are traded.
+
+    Money: each trade risks risk_amount, or risk_percent of the balance (of the start balance unless
+    compound). spread (price units) is paid once per trade and lowers its R; commission is money per trade.
+    """
     candles = data['candles']
     rr = float(rr)
+    spread, commission = max(0.0, float(spread or 0)), max(0.0, float(commission or 0))
+    balance0 = float(account_balance) if account_balance not in (None, '', 0) else None
+    if balance0 is not None and balance0 <= 0:
+        raise ValueError('Account balance must be above zero.')
+    risk_percent = float(risk_percent or 1.0)
+    if not 0 < risk_percent <= 100:
+        raise ValueError('Risk per trade must be between 0 and 100 percent.')
     if not 0.2 <= rr <= 20:
         raise ValueError('Reward-to-risk must be between 0.2 and 20.')
     if side not in ('both', 'long', 'short', 'buy', 'sell'):
@@ -981,6 +1187,8 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
     trades, busy_until = [], -1
     for e in _signals(candles, strategy, params):
         if e['i'] <= busy_until or (side != 'both' and e['direction'] != side):
+            continue
+        if from_time and c[e['i']]['t'] < from_time:
             continue
         long = e['direction'] == 'long'
         risk = abs(e['entry'] - e['stop'])
@@ -1007,6 +1215,27 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
         trades.append({**e, 'target': target, 'exit_i': exit_i, 'exit': exit_px, 'r': round(result, 3), 'open': False})
         busy_until = exit_i
     closed = [t for t in trades if not t['open']]
+    dec = _decimals(c[-1]['c'])
+    balance, money_curve, peak_m, dd_m = balance0, [[0, balance0]] if balance0 else [], balance0 or 0.0, 0.0
+    blown = None
+    for t in closed:                                         # costs and money, trade by trade
+        cost_r = spread / abs(t['entry'] - t['stop']) if spread else 0.0
+        t['gross_r'] = t['r']
+        t['r'] = round(t['r'] - cost_r, 3)
+        if balance0 is not None:
+            if blown is not None:                            # an empty account takes no more trades
+                t['risk'], t['pnl'], t['balance'] = 0.0, 0.0, 0.0
+                continue
+            risk_money = float(risk_amount) if risk_amount else (balance if compound else balance0) * risk_percent / 100
+            t['risk'] = round(risk_money, 2)
+            t['pnl'] = round(max(t['r'] * risk_money - commission, -balance), 2)    # cannot lose more than is there
+            balance += t['pnl']
+            if balance <= 0.005:
+                balance, blown = 0.0, len(money_curve)
+            t['balance'] = round(balance, 2)
+            peak_m = max(peak_m, balance)
+            dd_m = max(dd_m, peak_m - balance)
+            money_curve.append([len(money_curve), round(balance, 2)])
     rs = [t['r'] for t in closed]
     wins = [r for r in rs if r > 0]
     losses = [r for r in rs if r <= 0]
@@ -1014,17 +1243,39 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
     for r in rs:
         equity += r; peak = max(peak, equity); dd = max(dd, peak - equity)
         streak = streak + 1 if r <= 0 else 0; worst = max(worst, streak)
-    dec = _decimals(c[-1]['c'])
     when = lambda i: _when(c, i)
+    window = [when(next((i for i in range(n) if c[i]['t'] >= from_time), n - 1)) if from_time else when(0), when(n - 1)]
     stats = {'strategy': strategy, 'instrument': data.get('symbol'), 'interval': data.get('interval'),
-             'source': data.get('source'), 'period': [when(0), when(n - 1)], 'candles': n,
+             'source': data.get('source'), 'period': window, 'candles': n,
+             'proxy_note': data.get('proxy_note') or None, 'requested': data.get('requested'),
              'settings': {'side': side, 'reward_to_risk': rr, 'max_hold_candles': max_hold or None,
+                          'spread': spread or None, 'commission': commission or None,
+                          'account_balance': balance0, 'risk_per_trade': (f'{risk_amount} per trade' if risk_amount else
+                                                                          f'{risk_percent}%' + (' compounding' if compound else '')) if balance0 else None,
                           **{k: v for k, v in params.items() if v is not None}},
              'closed_trades': len(rs), 'wins': len(wins), 'losses': len(losses),
              'win_rate_percent': round(100 * len(wins) / len(rs), 1) if rs else None,
              'total_r': round(sum(rs), 2), 'average_r_per_trade': round(sum(rs) / len(rs), 3) if rs else None,
              'profit_factor': round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) else None,
              'max_drawdown_r': round(dd, 2), 'longest_losing_streak': worst,
+             'equity_curve_r': _curve(rs),
+             'money': ({'start_balance': balance0, 'end_balance': round(balance, 2),
+                        'net_pnl': round(balance - balance0, 2), 'return_percent': round(100 * (balance - balance0) / balance0, 2),
+                        'gross_profit': round(sum(t['pnl'] for t in closed if t['pnl'] > 0), 2),
+                        'gross_loss': round(sum(t['pnl'] for t in closed if t['pnl'] <= 0), 2),
+                        'largest_win': max((t['pnl'] for t in closed if t['pnl'] > 0), default=0),
+                        'largest_loss': min((t['pnl'] for t in closed if t['pnl'] <= 0), default=0),
+                        'max_drawdown': round(dd_m, 2), 'curve': money_curve[:301],
+                        'account_blown_at_trade': blown,
+                        'risk_warning': (f'Risking {risk_amount} on a {balance0:g} account is {100 * float(risk_amount) / balance0:.0f}% '
+                                         'per trade; one loss can empty it.' if risk_amount and float(risk_amount) >= balance0 * .1 else None)}
+                       if balance0 is not None else None),
+             'trades': [{'n': k, 'direction': t['direction'], 'entry_time': when(t['i']), 'exit_time': when(t['exit_i']),
+                         'entry': round(t['entry'], dec), 'stop': round(t['stop'], dec), 'target': round(t['target'], dec),
+                         'exit': round(t['exit'], dec), 'r': t['r'],
+                         'result': 'win' if t['r'] > 0 else 'loss',
+                         **({'pnl': t['pnl'], 'balance': t['balance']} if 'pnl' in t else {})}
+                        for k, t in enumerate(closed, 1)],
              'longs': sum(1 for t in closed if t['direction'] == 'long'),
              'shorts': sum(1 for t in closed if t['direction'] == 'short'),
              'open_trade': next(({'direction': t['direction'], 'entry': round(t['entry'], dec), 'stop': round(t['stop'], dec),
@@ -1033,7 +1284,8 @@ def backtest(data: dict, strategy: str, side='both', rr=2.0, max_hold=0, **param
                               'stop': round(t['stop'], dec), 'exit_time': when(t['exit_i']), 'r': t['r']} for t in closed[-8:]],
              'reliability': ('Too few trades to judge; aim for 30+ before trusting the numbers.' if len(rs) < 30 else
                              'Enough trades for a first read; still check other symbols and periods.'),
-             'assumptions': 'Results in R (1R = amount risked). No spread, commission, slippage or swap. '
+             'assumptions': 'Results in R (1R = amount risked)' + (f', after a spread of {spread}' if spread else ', no spread')
+                            + (f' and {commission} commission per trade' if commission else '') + '. No slippage or swap. '
                             'If stop and target fall in the same candle the stop is counted. Past results do not predict future ones.'}
     return stats
 

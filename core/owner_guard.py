@@ -30,8 +30,12 @@ MODELS = BASE / 'models' / 'owner'
 STORE = BASE / 'memory' / 'owner'
 CONFIG = BASE / 'config' / 'owner-guard.json'
 DEFAULTS = {'face_guard': False, 'check_minutes': 10, 'voice_guard': True, 'owner_name': ''}
-FACE_MATCH, FACE_STRANGER = 0.42, 0.28        # SFace cosine: OpenCV's published same-person threshold is 0.363
-VOICE_MATCH, VOICE_STRANGER = 0.55, 0.35      # WeSpeaker cosine
+FACE_MATCH, FACE_STRANGER = 0.40, 0.25        # SFace cosine: OpenCV's published same-person threshold is 0.363
+VOICE_MATCH, VOICE_STRANGER = 0.55, 0.30      # WeSpeaker cosine. VOICE_MATCH is the most the owner threshold asks for;
+VOICE_FLOOR = 0.45                            # it is tuned down to how consistent the owner's own samples are, never below this
+VOICE_JUDGE_SECONDS = 2.5                     # a 'stranger' verdict needs this much speech; shorter is only 'uncertain'
+VOICE_ALARM = 0.20                            # one turn this far from the owner raises the alarm at once; otherwise two in a row
+PROFILE_MAX = 40                              # samples kept per profile (it keeps learning from confident matches)
 
 
 def settings() -> dict:
@@ -72,6 +76,49 @@ def _cos(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
+def _unit(a):
+    a = np.asarray(a, dtype=np.float32)
+    return a / (np.linalg.norm(a, axis=-1, keepdims=True) + 1e-9)
+
+
+def match_score(profile, emb) -> float:
+    """How well one signature matches a profile of several.
+
+    The best single sample (the old rule) is noisy: one lucky or unlucky sample decides. This
+    uses the mean of the three closest samples, or the profile's centre, whichever is higher, so
+    a match has to agree with several moments of the person, not one."""
+    o, e = _unit(profile), _unit(emb)
+    sims = np.sort(o @ e)[::-1]
+    top = float(sims[:min(3, len(sims))].mean())
+    return max(top, float(_unit(o.mean(0)) @ e))
+
+
+def owner_threshold(profile, ceiling=VOICE_MATCH, floor=VOICE_FLOOR) -> float:
+    """The score the owner must reach, tuned to how alike the owner's own samples are.
+
+    Someone whose samples agree at 0.9 can be held to the ceiling; a profile whose samples agree
+    at 0.6 (different mics, rooms, moods) gets a lower bar, so the owner is not turned away. It
+    never drops below the floor, which sits well above how strangers score (about 0.0-0.3)."""
+    o = _unit(profile)
+    if len(o) < 3:
+        return ceiling
+    loo = [match_score(np.delete(o, i, 0), o[i]) for i in range(len(o))]
+    return round(float(min(ceiling, max(floor, np.percentile(loo, 20) - 0.08))), 3)
+
+
+def _learn(profile, emb, near=0.97):
+    """Add a confident new sample, unless it repeats one already there; drop the most redundant past the cap."""
+    o, e = _unit(profile), _unit(emb)
+    if float(np.max(o @ e)) >= near:
+        return None
+    o = np.vstack([o, e[None]])
+    if len(o) > PROFILE_MAX:
+        sims = o @ o.T
+        np.fill_diagonal(sims, -1)
+        o = np.delete(o, int(np.argmax(sims.max(1)[:-1])), 0)   # the newest sample always stays
+    return o
+
+
 # ── face ────────────────────────────────────────────────────────────────────
 
 class Face:
@@ -91,18 +138,44 @@ class Face:
         aligned = self.rec.alignCrop(img, face)
         return self.rec.feature(aligned).ravel()
 
-    def frames(self, count=6, gap=0.25):
+    def good(self, img, face) -> bool:
+        """Only clear faces count: big enough, confidently found, sharp, and neither too dark nor blown out."""
+        x, y, w, h = (int(v) for v in face[:4])
+        if w < 80 or h < 80 or float(face[-1]) < 0.85:
+            return False
+        crop = img[max(0, y):y + h, max(0, x):x + w]
+        if crop.size == 0:
+            return False
+        grey = self.cv2.cvtColor(crop, self.cv2.COLOR_BGR2GRAY)
+        light = float(grey.mean())
+        return 45 <= light <= 215 and float(self.cv2.Laplacian(grey, self.cv2.CV_64F).var()) >= 25
+
+    def frames(self, count=6, gap=0.25, _borrowed=False):
         """Grab frames from the webcam, holding the shared camera lock for the shortest time."""
         from core import camera_access
         from actions.screen_processor import _load_config, _cv2_backend
         out = []
+        busy_with_gestures = 'gesture' in (camera_access._owner or '')
+        if busy_with_gestures and not _borrowed:  # hand tracking holds the camera: borrow it, then give it back
+            from core.hand_gestures import controller
+            with controller.paused():
+                return self.frames(count, gap, _borrowed=True)
         with camera_access.claim('owner recognition'):
             cap = self.cv2.VideoCapture(int(_load_config().get('camera_index', 0)), _cv2_backend())
             try:
                 if not cap.isOpened():
                     raise RuntimeError('The camera could not be opened (check camera permission for Mark LVI).')
-                for _ in range(5):        # let exposure settle
-                    cap.read()
+                # let auto-exposure settle: the first frames from a Mac camera are dark, and a dark face
+                # scores like a stranger. Wait until brightness stops changing (at most ~2 s).
+                started, last = time.monotonic(), None
+                while time.monotonic() - started < 2.0:
+                    ok, img = cap.read()
+                    if not ok or img is None:
+                        continue
+                    light = float(img.mean())
+                    if last is not None and abs(light - last) < 2.0 and time.monotonic() - started > 0.7:
+                        break
+                    last = light
                 for _ in range(count):
                     ok, img = cap.read()
                     if ok and img is not None:
@@ -123,37 +196,61 @@ def _face_engine() -> Face:
     return _face
 
 
-def enroll_face(samples: int = 14) -> dict:
+def enroll_face(samples: int = 24) -> dict:
+    """About 8 seconds of frames. Turning the head a little and changing expression while it runs gives
+    a profile that still recognises you from a slight angle or in other light."""
     eng = _face_engine()
     embs = []
-    for img in eng.frames(samples, 0.3):
+    for img in eng.frames(samples, 0.33):
         found = eng.faces(img)
-        if len(found) == 1:
-            embs.append(eng.embed(img, found[0]))
-    if len(embs) < 5:
-        raise RuntimeError(f'Only {len(embs)} clear single-face frames. Sit facing the camera, alone, in good light, and retry.')
+        if len(found) == 1 and eng.good(img, found[0]):
+            e = _unit(eng.embed(img, found[0]))
+            if not embs or float(np.max(np.array(embs) @ e)) < 0.985:     # skip near-identical frames
+                embs.append(e)
+    if len(embs) < 6:
+        raise RuntimeError(f'Only {len(embs)} clear single-face frames. Sit facing the camera, alone, about an arm\'s '
+                           'length away, in good even light, and retry.')
     embs = np.array(embs)
     _save_vec('face.npy', embs)
-    spread = float(np.mean([_cos(e, embs.mean(0)) for e in embs]))
-    return {'enrolled': True, 'frames_used': len(embs), 'consistency': round(spread, 3)}
+    return {'enrolled': True, 'frames_used': len(embs), 'consistency': round(float(np.mean(embs @ _unit(embs.mean(0)))), 3),
+            'tip': 'Accuracy improves further as JARVIS adds confident matches over the next days.'}
 
 
-def check_face(frames: int = 4) -> dict:
+def check_face(frames: int = 6) -> dict:
     owner = _load_vec('face.npy')
     if owner is None:
         return {'result': 'not_enrolled'}
     eng = _face_engine()
-    best, people = -1.0, 0
-    for img in eng.frames(frames, 0.2):
+    scores, people, seen, best_emb = [], 0, 0, None
+    for img in eng.frames(frames, 0.22):
         found = eng.faces(img)
         people = max(people, len(found))
+        frame_best = None
         for f in found[:3]:
+            seen += 1
+            if not eng.good(img, f):
+                continue
             e = eng.embed(img, f)
-            best = max(best, max(_cos(e, o) for o in owner))
+            sc = match_score(owner, e)
+            if frame_best is None or sc > frame_best[0]:
+                frame_best = (sc, e)
+        if frame_best:
+            scores.append(frame_best[0])
+            if best_emb is None or frame_best[0] > best_emb[0]:
+                best_emb = frame_best
     if people == 0:
         return {'result': 'no_face', 'people': 0}
-    result = 'owner' if best >= FACE_MATCH else 'stranger' if best < FACE_STRANGER else 'uncertain'
-    return {'result': result, 'score': round(best, 3), 'people': people}
+    if len(scores) < 2:
+        return {'result': 'unclear', 'people': people,
+                'hint': 'A face is there but not clearly: too dark, too far, blurred or turned away.'}
+    scores.sort(reverse=True)
+    steady = scores[1]                                  # the second-best frame: one lucky frame is not enough
+    result = 'owner' if steady >= FACE_MATCH else 'stranger' if scores[0] < FACE_STRANGER else 'uncertain'
+    if result == 'owner' and steady >= FACE_MATCH + 0.1 and best_emb is not None:
+        grown = _learn(owner, best_emb[1])              # keep learning the owner's face in new light
+        if grown is not None:
+            _save_vec('face.npy', grown)
+    return {'result': result, 'score': round(steady, 3), 'best': round(scores[0], 3), 'frames': len(scores), 'people': people}
 
 
 # ── voice ───────────────────────────────────────────────────────────────────
@@ -229,8 +326,10 @@ class VoiceGuard:
         self.enrolling: list[np.ndarray] | None = None
         self.enroll_target = 5
         self.owner = _load_vec('voice.npy')
+        self.threshold = owner_threshold(self.owner) if self.owner is not None else VOICE_MATCH
         self.last = None              # {'result', 'score', 'at'}
         self.strangers = 0
+        self.noise = 0.004            # running estimate of the room's background level
         self._lock = threading.Lock()
         threading.Thread(target=self._worker, daemon=True, name='jarvis-voice-guard').start()
 
@@ -240,15 +339,39 @@ class VoiceGuard:
         except queue.Full:
             pass
 
+    def _speech(self, block):
+        """Keep only the 20 ms frames that are speech, judged against the room's own background level,
+        so fans, typing and silence do not blur the voice signature."""
+        n = block.size // 320
+        if n == 0:
+            return block[:0]
+        frames = block[:n * 320].reshape(n, 320)
+        rms = np.sqrt(np.mean((frames.astype(np.float32) / 32768) ** 2, axis=1))
+        quiet = float(rms.min())
+        # the background estimate falls quickly to a quieter block but rises only slowly, so speech
+        # (which is never quiet for long) cannot drag it up
+        self.noise = 0.99 * self.noise + 0.01 * quiet if quiet > self.noise else 0.6 * self.noise + 0.4 * quiet
+        return frames[rms > max(0.005, self.noise * 2.5)].ravel()
+
     def _worker(self):
         while True:
-            block = self.q.get()
-            level = float(np.sqrt(np.mean((block.astype(np.float32) / 32768) ** 2)))
-            if level > 0.008:                     # keep speech, drop silence so signatures are about the voice
+            speech = self._speech(self.q.get())
+            if speech.size:
                 with self._lock:
-                    self.buf.append(block)
-                    if len(self.buf) > 160:       # ~10 s
-                        self.buf = self.buf[-160:]
+                    self.buf.append(speech)
+                    total = sum(b.size for b in self.buf)
+                    while total > 16000 * 10 and len(self.buf) > 1:      # keep the last ~10 s of speech
+                        total -= self.buf.pop(0).size
+
+    def verdict(self, emb, seconds) -> dict:
+        score = match_score(self.owner, emb)
+        if score >= self.threshold:
+            result = 'owner'
+        elif score < VOICE_STRANGER and seconds >= VOICE_JUDGE_SECONDS:
+            result = 'stranger'
+        else:
+            result = 'uncertain'                  # too short to judge, or in between: never an alarm
+        return {'result': result, 'score': round(score, 3), 'threshold': self.threshold, 'seconds': round(seconds, 1)}
 
     def check_now(self) -> dict | None:
         """Verdict on the speech heard so far this turn, without consuming it (used to gate sensitive actions)."""
@@ -261,13 +384,22 @@ class VoiceGuard:
         emb = _speaker_engine().embed(audio[-16000 * 8:])
         if emb is None:
             return None
-        score = max(_cos(emb, o) for o in self.owner)
-        return {'result': 'owner' if score >= VOICE_MATCH else 'stranger' if score < VOICE_STRANGER else 'uncertain',
-                'score': round(score, 3)}
+        return self.verdict(emb, min(audio.size, 16000 * 8) / 16000)
 
-    def start_enrolment(self, utterances=5) -> dict:
-        self.enrolling, self.enroll_target = [], utterances
-        return {'enrolling': True, 'say': f'Speak normally for your next {utterances} sentences; I will learn your voice.'}
+    def start_enrolment(self, utterances=6) -> dict:
+        self.enrolling, self.enroll_target = [], max(3, min(int(utterances), 12))
+        return {'enrolling': True, 'say': f'Speak normally for your next {self.enroll_target} sentences, each a full sentence '
+                                          'of a couple of seconds; I will learn your voice.'}
+
+    def _finish_enrolment(self):
+        arr = _unit(np.array(self.enrolling))
+        if len(arr) >= 5:                         # drop a sample that does not sound like the rest (a cough, someone else)
+            fit = np.array([match_score(np.delete(arr, i, 0), arr[i]) for i in range(len(arr))])
+            arr = arr[fit >= np.median(fit) - 0.15]
+        _save_vec('voice.npy', arr)
+        self.owner, self.enrolling = arr, None
+        self.threshold = owner_threshold(arr)
+        return {'enrolled': True, 'samples': len(arr), 'threshold': self.threshold}
 
     def end_turn(self) -> dict | None:
         """Call when the user's spoken turn is complete. Returns a verdict, an enrolment update, or None."""
@@ -282,22 +414,55 @@ class VoiceGuard:
             return {'error': str(exc)[:160]}
         if emb is None:
             return None
+        seconds = min(audio.size, 16000 * 8) / 16000
         if self.enrolling is not None:
+            if seconds < 2.0:
+                return {'enrolling': True, 'collected': len(self.enrolling), 'of': self.enroll_target,
+                        'note': 'That was short; say a full sentence.'}
             self.enrolling.append(emb)
             if len(self.enrolling) >= self.enroll_target:
-                arr = np.array(self.enrolling)
-                _save_vec('voice.npy', arr)
-                self.owner, self.enrolling = arr, None
-                return {'enrolled': True, 'samples': len(arr)}
+                return self._finish_enrolment()
             return {'enrolling': True, 'collected': len(self.enrolling), 'of': self.enroll_target}
         if self.owner is None or not settings()['voice_guard']:
             return None
-        score = max(_cos(emb, o) for o in self.owner)
-        result = 'owner' if score >= VOICE_MATCH else 'stranger' if score < VOICE_STRANGER else 'uncertain'
-        self.strangers = self.strangers + 1 if result == 'stranger' else 0
-        self.last = {'result': result, 'score': round(score, 3), 'at': time.time()}
-        return dict(self.last, consecutive_strangers=self.strangers)
+        v = self.verdict(emb, seconds)
+        self.last_emb, self.last_score = emb, float(v.get('score', 0))
+        if v['result'] == 'stranger':
+            self.strangers += 1
+        elif v['result'] == 'owner':
+            self.strangers = 0
+            if v['score'] >= self.threshold + 0.05 and seconds >= VOICE_JUDGE_SECONDS:
+                grown = _learn(self.owner, emb)  # keep learning the owner's voice: new rooms, moods, mics
+                if grown is not None:
+                    _save_vec('voice.npy', grown)
+                    self.owner = grown
+                    self.threshold = owner_threshold(grown)
+        # one clearly different voice, or two strangers in a row, raise the alarm; a single borderline turn does not
+        alarm = v['result'] == 'stranger' and (self.strangers >= 2 or v['score'] < VOICE_ALARM)
+        self.last = dict(v, at=time.time())
+        return dict(self.last, consecutive_strangers=self.strangers, alarm=alarm)
 
+
+def _owner_confirmed(self, people: int = 1) -> bool:
+    """The camera showed the owner, alone, while their voice was judged a stranger: the voice check was wrong.
+
+    Clear the stranger streak and learn this sample, so the same room, mic or mood is recognised next time.
+    A clearly different voice (below VOICE_ALARM) or more than one face is never learned: that could be a guest."""
+    emb, score = getattr(self, 'last_emb', None), float(getattr(self, 'last_score', 0.0))
+    self.strangers = 0
+    self.last_emb = None
+    if emb is None or self.owner is None or people != 1 or score < VOICE_ALARM:
+        return False
+    grown = _learn(self.owner, emb)
+    if grown is None:
+        return False
+    _save_vec('voice.npy', grown)
+    self.owner = grown
+    self.threshold = owner_threshold(grown)
+    return True
+
+
+VoiceGuard.owner_confirmed = _owner_confirmed
 
 _voice: VoiceGuard | None = None
 

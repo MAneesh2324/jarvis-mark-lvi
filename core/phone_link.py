@@ -35,7 +35,7 @@ BASE = Path(__file__).resolve().parent.parent
 CONFIG = BASE / 'config' / 'phone-link.json'
 API = 'https://api.telegram.org/bot{token}/{method}'
 FILE = 'https://api.telegram.org/file/bot{token}/{path}'
-DEFAULTS = {'token': '', 'chat_id': None, 'enabled': True, 'alerts': True, 'quiet_start': 23, 'quiet_end': 7,
+DEFAULTS = {'token': '', 'chat_id': None, 'enabled': True, 'alerts': True, 'remote': True, 'quiet_start': 23, 'quiet_end': 7,
             'alert_kinds': ['research', 'security', 'wellbeing', 'trading', 'reminder']}
 
 
@@ -66,6 +66,16 @@ def _call(token, method, timeout=20, timeout_s=None, **params):
     return data['result']
 
 
+def _upload(token, method, field, filename, data, timeout=120, **params):
+    """Multipart upload (photos, documents): Telegram does not take files as JSON."""
+    r = requests.post(API.format(token=token, method=method), data={k: str(v) for k, v in params.items()},
+                      files={field: (filename, data)}, timeout=timeout)
+    out = r.json()
+    if not out.get('ok'):
+        raise RuntimeError(out.get('description') or f'Telegram {method} failed')
+    return out['result']
+
+
 class PhoneLink:
     """Long-polls Telegram on a background thread. on_text(text, reply) is called for paired messages."""
 
@@ -80,6 +90,7 @@ class PhoneLink:
         self.last_error = ''
         self._stt = None
         self._thread: threading.Thread | None = None
+        self._file_choices: list[dict] = []
 
     # ── setup ───────────────────────────────────────────────────────────────
     def set_token(self, token: str) -> dict:
@@ -117,11 +128,11 @@ class PhoneLink:
     def status(self) -> dict:
         return {'configured': bool(self.cfg.get('token')), 'paired': bool(self.cfg.get('chat_id')),
                 'bot': ('@' + self.bot_name) if self.bot_name else None, 'running': self.running,
-                'alerts': self.cfg.get('alerts'), 'quiet_hours': [self.cfg['quiet_start'], self.cfg['quiet_end']],
+                'alerts': self.cfg.get('alerts'), 'remote_commands': self.cfg.get('remote', True), 'quiet_hours': [self.cfg['quiet_start'], self.cfg['quiet_end']],
                 'pairing_open': bool(self.pair_code and time.time() < self.pair_expires), 'last_error': self.last_error or None}
 
     def configure(self, **changes) -> dict:
-        for k in ('enabled', 'alerts'):
+        for k in ('enabled', 'alerts', 'remote'):
             if changes.get(k) is not None:
                 self.cfg[k] = bool(changes[k])
         for k in ('quiet_start', 'quiet_end'):
@@ -140,6 +151,26 @@ class PhoneLink:
         for i in range(0, len(text), 3900):
             _call(self.cfg['token'], 'sendMessage', chat_id=self.cfg['chat_id'], text=text[i:i + 3900],
                   disable_web_page_preview=True)
+        return True
+
+    def _paired(self) -> bool:
+        return bool(self.cfg.get('token') and self.cfg.get('chat_id') and self.cfg.get('enabled'))
+
+    def send_photo(self, data: bytes, caption: str = '', chat_id=None) -> bool:
+        if not (chat_id or self._paired()) or not data:
+            return False
+        _upload(self.cfg['token'], 'sendPhoto', 'photo', 'jarvis.jpg', data,
+                chat_id=chat_id or self.cfg['chat_id'], caption=caption[:1000])
+        return True
+
+    def send_document(self, path, caption: str = '', chat_id=None) -> bool:
+        """Send a file from this Mac; the never-send list and size limit are enforced here."""
+        from core.remote_armour import allowed_path
+        p = allowed_path(path)
+        if not (chat_id or self._paired()):
+            return False
+        _upload(self.cfg['token'], 'sendDocument', 'document', p.name, p.read_bytes(),
+                chat_id=chat_id or self.cfg['chat_id'], caption=caption[:1000])
         return True
 
     def _quiet(self) -> bool:
@@ -218,8 +249,18 @@ class PhoneLink:
             self._reply(chat, 'This JARVIS is private.')
             return
         if text in ('/start', '/help'):
-            self._reply(chat, 'Talk to JARVIS here: type, or send a voice note. /status shows the link, /alerts on|off.')
+            self._reply(chat, 'Talk to JARVIS here: type, or send a voice note. /status shows the link, /alerts on|off, '
+                              '/armour lists the remote commands.')
             return
+        from core import remote_armour
+        if remote_armour.is_command(text):
+            self._remote(chat, text)
+            return
+        if msg.get('photo') or msg.get('document'):
+            self._incoming(chat, msg)
+            if not (msg.get('caption') or '').strip():
+                return
+            text = msg['caption'].strip()
         if text.startswith('/alerts'):
             on = 'off' not in text
             self.configure(alerts=on)
@@ -243,6 +284,103 @@ class PhoneLink:
             self.on_text(text, lambda answer: self._reply(chat, answer))
         else:
             self._reply(chat, 'JARVIS is not listening right now.')
+
+    # ── virtual armour ──────────────────────────────────────────────────────
+    def _remote(self, chat, text: str):
+        """A fixed menu of remote commands from the paired chat. Never a shell."""
+        from core import notify, remote_armour as ra
+        word, _, arg = text.partition(' ')
+        word, arg = word.lower(), arg.strip()
+        if word == '/armour':
+            self._reply(chat, ra.help_text() + ('' if self.cfg.get('remote', True) else '\n\n⛔ Remote commands are OFF. '
+                                                'Turn them back on from the Mac ("JARVIS, enable remote commands").'))
+            return
+        if word == '/remote':
+            if arg.lower() == 'off':
+                self.configure(remote=False)
+                self._reply(chat, '⛔ Remote commands off. Only the Mac can turn them back on.')
+                notify.send('remote', 'Remote phone commands were switched off from your phone.', speak=False)
+            else:
+                self._reply(chat, 'Remote commands are ' + ('ON' if self.cfg.get('remote', True) else 'OFF')
+                            + '. Send /remote off to disable; re-enabling is only possible on the Mac.')
+            return
+        if not self.cfg.get('remote', True):
+            self._reply(chat, '⛔ Remote commands are off. Turn them on from the Mac.')
+            return
+        try:
+            if word == '/screen':
+                self.send_photo(ra.screenshot(), '🖥 Screen ' + time.strftime('%H:%M:%S'), chat_id=chat)
+                notify.send('remote', 'Your phone took a screenshot of this Mac.', speak=False)
+            elif word == '/cam':
+                self.send_photo(ra.camera(), '📷 Camera ' + time.strftime('%H:%M:%S'), chat_id=chat)
+                notify.send('remote', 'Your phone took a camera photo on this Mac.', speak=False)
+            elif word == '/file':
+                if arg.isdigit() and self._file_choices:
+                    i = int(arg) - 1
+                    if not 0 <= i < len(self._file_choices):
+                        raise ValueError(f'Pick 1–{len(self._file_choices)}.')
+                    chosen = self._file_choices[i]
+                    self.send_document(chosen['path'], '📄 ' + chosen['name'], chat_id=chat)
+                    notify.send('remote', f"Sent {chosen['name']} to your phone.", speak=False)
+                    return
+                found = ra.find_files(arg)
+                self._file_choices = found
+                if not found:
+                    self._reply(chat, f'No sendable file matched "{arg}".')
+                elif len(found) == 1:
+                    self.send_document(found[0]['path'], '📄 ' + found[0]['name'], chat_id=chat)
+                    notify.send('remote', f"Sent {found[0]['name']} to your phone.", speak=False)
+                else:
+                    self._reply(chat, 'Which one? Send /file <number>:\n' + '\n'.join(
+                        f"{n}. {f['name']} · {f['size_mb']} MB · {f['modified']}" for n, f in enumerate(found, 1)))
+            elif word == '/clip':
+                if arg:
+                    ra.clipboard_set(arg)
+                    self._reply(chat, '📋 Copied to the Mac clipboard.')
+                else:
+                    clip = ra.clipboard_get()
+                    self._reply(chat, '📋 ' + (clip[:3800] if clip.strip() else '(clipboard is empty or not text)'))
+            elif word == '/lock':
+                self._reply(chat, '🔒 ' + ra.lock())
+            elif word == '/sys':
+                self._reply(chat, ra.system_report())
+            elif word == '/home':
+                from core import home_bridge
+                parts = arg.split()
+                if parts and parts[0].lower() in ('on', 'off') and len(parts) == 2:
+                    r = home_bridge.control(parts[1], parts[0].lower() == 'on')
+                    self._reply(chat, f"🏠 {r['entity']}: asked {r['requested']}, now {r['observed']}"
+                                + (' ✅' if r['verified'] else ' (not confirmed)'))
+                else:
+                    data = home_bridge.states()
+                    if not data.get('configured'):
+                        self._reply(chat, '🏠 ' + data.get('note', 'Home Assistant is not set up.'))
+                    else:
+                        self._reply(chat, '🏠\n' + ('\n'.join(f"{r['name']} ({r['entity']}): {r['state']}"
+                                                              for r in data['states']) or 'No allowed devices.')
+                                    + '\n\n/home on|off <entity>')
+        except Exception as exc:
+            self._reply(chat, f'⚠️ {word[1:]} failed: {str(exc)[:300]}')
+
+    def _incoming(self, chat, msg: dict):
+        """A photo or file sent from the phone lands in ~/Downloads/From Phone."""
+        from core import remote_armour as ra
+        if msg.get('photo'):
+            media, name = msg['photo'][-1], f"photo-{time.strftime('%Y%m%d-%H%M%S')}.jpg"   # largest size
+        else:
+            media, name = msg['document'], msg['document'].get('file_name') or 'file'
+        if (media.get('file_size') or 0) > 20_000_000:
+            self._reply(chat, 'Telegram only lets bots download files up to 20 MB.')
+            return
+        try:
+            info = _call(self.cfg['token'], 'getFile', file_id=media['file_id'])
+            data = requests.get(FILE.format(token=self.cfg['token'], path=info['file_path']), timeout=60).content
+            dest = ra.save_incoming(name, data)
+            self._reply(chat, f'📥 Saved to Downloads/From Phone/{dest.name}')
+            from core import notify
+            notify.send('phone', f'Your phone sent {dest.name}; it is in Downloads, From Phone.', speak=True)
+        except Exception as exc:
+            self._reply(chat, f'⚠️ Could not save that: {str(exc)[:200]}')
 
     def _location(self, msg: dict, live_update: bool = False):
         """A location (or live-location update) shared from the paired phone: GPS-accurate position for JARVIS."""

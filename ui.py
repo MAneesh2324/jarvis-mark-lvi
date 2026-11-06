@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import math
 import os
 import platform
@@ -545,6 +546,64 @@ class HudCanvas(QWidget):
         except Exception:
             pass
 
+    def set_feeling(self, feeling: str, level: float = 0.5, focus: dict | None = None) -> None:
+        """JARVIS's feeling (core/companion.py) and any focus session. Plain attribute stores: safe from any thread."""
+        try:
+            from core.companion import FEELINGS
+            info = FEELINGS.get(feeling) or FEELINGS['warm']
+            self._feel = (feeling, float(level), info['label'])
+            self._feel_color = info['color']
+            if focus and focus.get('active'):
+                self._focus = (str(focus.get('task', ''))[:40], time.monotonic() + float(focus.get('seconds_left', 0)),
+                               max(60.0, float(focus.get('minutes', 25)) * 60))
+            else:
+                self._focus = None
+            if self._avatar is not None:
+                self._avatar.set_feeling(feeling, level)
+        except Exception as exc:
+            print(f'[HUD] feeling: {exc}')
+
+    def _paint_heart(self, p, cx, head_cy, r, status_y):
+        """A small chip under the face saying how JARVIS feels, and a ring counting down a focus session."""
+        feel = getattr(self, '_feel', None)
+        focus = getattr(self, '_focus', None)
+        if not feel and not focus:
+            return
+        p.save()
+        col = QColor(getattr(self, '_feel_color', None) or C.PRI)
+        f = QFont('Courier New', 8)
+        f.setBold(True)
+        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.5)
+        p.setFont(f)
+        y = 12.0                                          # top of the face screen, clear of the face and chest
+        if focus:
+            task, ends, total = focus
+            left = max(0.0, ends - time.monotonic())
+            ring = QRectF(cx - r * 1.12, head_cy - r * 1.12, r * 2.24, r * 2.24)
+            p.setPen(QPen(QColor(0, 255, 156, 40), 3))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(ring)
+            p.setPen(QPen(QColor('#00ff9c'), 3, cap=Qt.PenCapStyle.RoundCap))
+            p.drawArc(ring, 90 * 16, int(-360 * 16 * (left / total)))
+            text = f'FOCUS · {task.upper()} · {int(left // 60):02d}:{int(left % 60):02d}'
+            p.setPen(QColor('#00ff9c'))
+            p.drawText(QRectF(cx - 200, y + 22, 400, 16), Qt.AlignmentFlag.AlignCenter, text)
+        if feel:
+            name, level, label = feel
+            pulse = 0.5 + 0.5 * math.sin(time.monotonic() * (1.2 + level))
+            w = 22 + len(label) * 8.5
+            chip = QRectF(cx - w / 2, y, w, 18)
+            fill = QColor(col)
+            fill.setAlpha(int(28 + 30 * level))
+            p.setBrush(fill)
+            edge = QColor(col)
+            edge.setAlpha(int(120 + 100 * pulse * level))
+            p.setPen(QPen(edge, 1))
+            p.drawRoundedRect(chip, 9, 9)
+            p.setPen(col)
+            p.drawText(chip, Qt.AlignmentFlag.AlignCenter, '♥ ' + label)
+        p.restore()
+
     def set_audio_level(self, level: float) -> None:
         """Thread-safe entry point for the audio threads. Stores the louder of
         the incoming level and the current value so brief gaps between chunks
@@ -896,8 +955,10 @@ class HudCanvas(QWidget):
                 elif self.state == "LISTENING":
                     _acc = qcol(C.GREEN)
                 else:
-                    _acc = qcol(C.PRI)
+                    _feel_col = getattr(self, '_feel_color', None)
+                    _acc = QColor(_feel_col) if _feel_col else qcol(C.PRI)   # at rest, the face takes on its feeling
             self._avatar.paint(p, cx, _head_cy, _r_head*self.gesture_zoom, _main, _acc, qcol(C.BG))
+            self._paint_heart(p, cx, _head_cy, _r_head, _sy_status)
 
         # reactor core — the other centrepiece, and the fallback if the head
         # could not be built. There is no third path: the old face.png branch
@@ -4377,11 +4438,13 @@ class MainWindow(QMainWindow):
     _state_sig      = pyqtSignal(str)
     _hand_gesture_sig = pyqtSignal(object)
     _gesture_control_sig = pyqtSignal(str)
+    _voice_mute_sig = pyqtSignal(bool)
     _portable_sig = pyqtSignal()
     _camera_permission_sig = pyqtSignal()
     _screen_permission_sig = pyqtSignal()
     _missions_sig = pyqtSignal()
     _earth_sig = pyqtSignal(object)
+    _sim_sig = pyqtSignal(object)        # simulation result → holographic board (None closes)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
@@ -4667,10 +4730,12 @@ class MainWindow(QMainWindow):
         self._state_sig.connect(self._apply_state)
         self._content_sig.connect(self._show_content)
         self._earth_sig.connect(self._show_earth)
+        self._sim_sig.connect(self._show_simulation)
         self._missions_sig.connect(self._open_missions)
         self._portable_sig.connect(self._open_portable_memory)
         self._hand_gesture_sig.connect(self._apply_hand_gesture)
         self._gesture_control_sig.connect(self._gesture_control)
+        self._voice_mute_sig.connect(self._set_voice_muted)
         self._screen_permission_sig.connect(self._show_screen_permissions)
         self._camera_permission_sig.connect(self._show_camera_permissions)
         self._reconfig_sig.connect(self._show_setup)
@@ -4705,6 +4770,8 @@ class MainWindow(QMainWindow):
 
         sc_mute = QShortcut(QKeySequence("F4"), self)
         sc_mute.activated.connect(self._toggle_mute)
+        sc_voice = QShortcut(QKeySequence("F5"), self)
+        sc_voice.activated.connect(self._toggle_voice_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
@@ -4811,8 +4878,15 @@ class MainWindow(QMainWindow):
         self._video_split = bool(audio_source)
         self._set_video_muted(bool(muted))
 
-        url = (QUrl.fromLocalFile(source) if Path(source).exists()
-               else QUrl(source))
+        # A stream URL is not a path: asking the disk about a 1,000-character
+        # googlevideo address raises "File name too long" and the video never opens.
+        if source.startswith(('http://', 'https://')):
+            url = QUrl(source)
+        else:
+            try:
+                url = QUrl.fromLocalFile(source) if Path(source).exists() else QUrl(source)
+            except OSError:
+                url = QUrl(source)
         self._video_player.setSource(url)
         if self._video_split:
             self._video_sound.setSource(QUrl(audio_source))
@@ -5628,6 +5702,17 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
 
+        # JARVIS's own voice: muted, it still listens and works, and replies appear here as text
+        self._voice_muted = False
+        self._voice_btn = QPushButton("🔊  JARVIS VOICE ON")
+        self._voice_btn.setFixedHeight(30)
+        self._voice_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._voice_btn.setToolTip("Mute JARVIS's voice (F5). It keeps listening and replies in the activity log.")
+        self._voice_btn.clicked.connect(self._toggle_voice_mute)
+        self._style_voice_btn()
+        lay.addWidget(self._voice_btn)
+
         return w
 
     def _build_quick_drawer(self) -> QWidget:
@@ -5865,6 +5950,28 @@ class MainWindow(QMainWindow):
         self._earth_panel.apply({k:v for k,v in options.items() if k not in ('toggle','close')})
         self._earth_btn.setText('RETURN TO ASSISTANT')
 
+    def _show_simulation(self, result):
+        """Slot — Qt main thread. The holographic simulation board takes the face's place until RETURN."""
+        board = getattr(self, '_sim_board', None)
+        if result is None:
+            if board is not None and self._hud_cam_stack.currentWidget() is board:
+                self._hud_cam_stack.setCurrentIndex(0)
+            return
+        if board is None:
+            try:
+                from core.simulation_view import SimulationHologram
+                board = SimulationHologram({k: getattr(C, k) for k in ('BG', 'PRI', 'TEXT', 'TEXT_DIM', 'WHITE',
+                                                                         'ACC', 'ACC2', 'GREEN', 'RED')})
+                board.closed.connect(lambda: self._hud_cam_stack.setCurrentIndex(0))
+                board.gesture_request.connect(lambda a: self._gesture_control('start' if a.endswith('start') else 'stop'))
+                self._hud_cam_stack.addWidget(board)
+                self._sim_board = board
+            except Exception as exc:
+                self._log.append_log('SYS: Simulation board could not open: ' + str(exc))
+                return
+        self._hud_cam_stack.setCurrentWidget(board)
+        board.set_result(dict(result))
+
     def _open_portable_memory(self):
         self._open_missions()
         self._mission_panel.show_page('Portable memory')
@@ -5909,10 +6016,13 @@ class MainWindow(QMainWindow):
             if action=='stop' or action=='toggle' and controller.status()['enabled']:controller.stop()
             elif action in ('start','toggle'):
                 controller.start(self._hand_gesture_sig.emit)
-                self._log.append_log('SYS: Local hand gestures enabled. Camera frames stay on this Mac. Pinch + drag to rotate; two open hands to zoom; hold a fist to reset. Stop with Hand Gestures in Controls.')
+                self._log.append_log('SYS: Local hand gestures enabled. Camera frames stay on this Mac. Simulation board: pinch and drag to spin the model or scrub the timeline, pinch both hands to zoom. Face/Earth: pinch + drag to rotate; two open hands to zoom; hold a fist to reset. Stop with Hand Gestures in Controls.')
         except PermissionError as exc:
             self._log.append_log('SYS: '+str(exc));self._show_camera_permissions()
         except Exception as exc:self._log.append_log('SYS: Hand gestures: '+str(exc))
+        board=getattr(self,'_sim_board',None)
+        if board is not None:
+            board.gesture_state(controller.status())
         self._refresh_screen_controls()
 
     def _apply_hand_gesture(self,event):
@@ -5933,6 +6043,9 @@ class MainWindow(QMainWindow):
                 self._hand_preview_status.show()
             except (ValueError,TypeError):pass
             return
+        board=getattr(self,'_sim_board',None)
+        if board is not None and self._hud_cam_stack.currentWidget() is board:
+            board.hand(event);return                         # the simulation board has its own smooth controls
         if event.get('kind')=='idle':return
         earth=getattr(self,'_earth_panel',None)
         if earth is not None and self._hud_cam_stack.currentWidget() is earth and earth.ready:
@@ -6592,7 +6705,7 @@ class MainWindow(QMainWindow):
             l.setStyleSheet(f"color: {color}; background: transparent;")
             return l
 
-        lay.addWidget(_fl("[F4] Mute  ·  [F11] Fullscreen"))
+        lay.addWidget(_fl("[F4] Mute mic  ·  [F5] Mute JARVIS  ·  [F11] Fullscreen"))
         lay.addStretch()
         lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
         return w
@@ -7264,11 +7377,44 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ background: #001f10; }}
             """)
 
+    def _toggle_voice_mute(self):
+        self._set_voice_muted(not self._voice_muted)
+
+    def _set_voice_muted(self, muted: bool):
+        muted = bool(muted)
+        if muted == self._voice_muted:
+            return
+        self._voice_muted = muted
+        self._style_voice_btn()
+        self._log.append_log("SYS: JARVIS's voice muted. I'm still listening; my replies will appear here."
+                             if muted else "SYS: JARVIS's voice is back on.")
+        if muted and self.on_interrupt and self.hud.speaking:
+            self.on_interrupt()                  # stop the sentence that is playing now
+
+    def _style_voice_btn(self):
+        if self._voice_muted:
+            self._voice_btn.setText("🔇  JARVIS VOICE MUTED")
+            self._voice_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #140006; color: {C.MUTED_C};
+                    border: 1px solid {C.MUTED_C}; border-radius: 3px;
+                }}
+            """)
+        else:
+            self._voice_btn.setText("🔊  JARVIS VOICE ON")
+            self._voice_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #00101a; color: {C.PRI};
+                    border: 1px solid {C.PRI}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ background: #001a26; }}
+            """)
+
     def _send(self):
         txt = self._input.text().strip()
         if not txt: return
         self._input.clear()
-        shown = '/phonelink token ••••••' if txt.lower().startswith('/phonelink token') else txt   # never echo a secret
+        shown = re.sub(r'\b\d{6,12}:[A-Za-z0-9_-]{25,50}\b', '[telegram token ••••]', txt)   # never echo a secret
         self._log.append_log(f"You: {shown}")
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
@@ -7344,6 +7490,15 @@ class JarvisUI:
     def muted(self, v: bool):
         if v != self._win._muted:
             self._win._toggle_mute()
+
+    @property
+    def voice_muted(self) -> bool:
+        """JARVIS's own voice is muted: it listens and works, replies show as text. Read from any thread."""
+        return bool(getattr(self._win, '_voice_muted', False))
+
+    def set_voice_muted(self, muted: bool) -> None:
+        """Thread-safe: mute or unmute JARVIS's voice."""
+        self._win._voice_mute_sig.emit(bool(muted))
 
     @property
     def current_file(self) -> str | None:
@@ -7438,6 +7593,21 @@ class JarvisUI:
     def wake_get_state(self, cb):
         self._win.wake_get_state = cb
 
+    def express(self, name: str, strength: float = 1.0) -> bool:
+        """Thread-safe: play an animated expression on the face (nod, laugh, wink, surprise ...)."""
+        try:
+            av = self._win.hud._avatar
+            return bool(av is not None and av.play(name, strength))
+        except Exception:
+            return False
+
+    def set_feeling(self, feeling: str, level: float = 0.5, focus: dict | None = None) -> None:
+        """Thread-safe: JARVIS's current feeling and focus session, shown on its face."""
+        try:
+            self._win.hud.set_feeling(feeling, level, focus)
+        except Exception:
+            pass
+
     def set_audio_level(self, level: float) -> None:
         """Thread-safe: feed a 0.0–1.0 live audio level to the HUD waveform.
         Called from the audio threads; a plain float store is atomic under the
@@ -7511,9 +7681,13 @@ class JarvisUI:
     def show_earth(self,options):
         self._win._earth_sig.emit(dict(options))
 
+    def show_simulation(self, result: dict | None):
+        """Thread-safe: play a scenario result on the holographic board; None returns to the face."""
+        self._win._sim_sig.emit(None if result is None else dict(result))
+
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
-        self._win._content_sig.emit(title[:48], text[:4000])
+        self._win._content_sig.emit(title[:48], text[:24000])   # room for a full backtest trade list
 
     def show_quiz(self, topic: str, questions, grade=None) -> None:
         """Thread-safe: put an interactive quiz on the board.

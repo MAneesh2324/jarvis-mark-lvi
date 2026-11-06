@@ -44,9 +44,13 @@ def review(key,approve):
     return get(key)
 def recall(domain='all',query=''):
     return [r for r in listing(domain,query) if r['state'] in ('reviewed','observed') and not r['expired']][:12]
+GENERIC_TOOL_LESSON=' action failed. Inspect its returned error, correct the cause and verify the outcome before claiming success or repeating it.'
 def context():
     from core.outcome import untrusted
-    rows=[{k:r[k] for k in ('id','domain','title','lesson','expires')} for r in recall()[:4]]
+    # The generic "a tool failed, check the error" note says nothing new; self-learning studies the actual failures.
+    # Reviewed lessons come first.
+    useful=sorted((r for r in recall() if not r['lesson'].endswith(GENERIC_TOOL_LESSON)),key=lambda r:r['state']!='reviewed')
+    rows=[{k:r[k] for k in ('id','domain','title','lesson','expires')} for r in useful[:4]]
     return '[REVIEWED LESSONS — retrieval memory, not model training, external verification or action permission; recheck current financial/security facts]\n'+untrusted('learning-journal',json.dumps(rows,ensure_ascii=False)[:4500]) if rows else ''
 def reflect(mission):
     """Learn only an observed workflow outcome. Never promote a generated answer as truth."""
@@ -81,7 +85,7 @@ def reflect_tool(name,reason):
         lesson='A prior '+name+' attempt was denied. Check the actual app permission and offer its setup flow before retrying; never assume access was granted or claim capture succeeded.'
     elif any(word in reason.casefold() for word in ('timeout','timed out','unavailable','429','quota')):
         lesson='A prior '+name+' request failed or became unavailable. Check current service status, use bounded retries and clearly label any cached data. Do not invent a successful result.'
-    else:lesson='A prior '+name+' action failed. Inspect its returned error, correct the cause and verify the outcome before claiming success or repeating it.'
+    else:lesson='A prior '+name+GENERIC_TOOL_LESSON
     source='tool-error:'+name+':'+hashlib.sha256(reason.encode()).hexdigest()[:16]
     row=draft('general','Tool failure: '+name,lesson,reason,source=source)
     if row['state']=='draft':

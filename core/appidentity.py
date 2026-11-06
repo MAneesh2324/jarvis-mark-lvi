@@ -206,6 +206,63 @@ def launcher_name(spoken: str) -> str:
     return spoken
 
 
+# What speech recognition hears instead of an app's real name. Unlike ALIASES this is about EARS, not
+# operating systems: Zoho's browser "Ulaa" is transcribed as "Ola" nearly every time.
+HEARD_AS: dict[str, str] = {
+    "ola": "Ulaa", "ulla": "Ulaa", "oola": "Ulaa", "ula": "Ulaa", "ulaa browser": "Ulaa", "ola browser": "Ulaa",
+    "zoho browser": "Ulaa", "trading view": "TradingView", "what's app": "WhatsApp", "whats app": "WhatsApp",
+    "vs code": "Visual Studio Code", "chat gpt": "ChatGPT", "face time": "FaceTime", "i message": "Messages",
+    "imessage": "Messages", "app store": "App Store", "system preferences": "System Settings",
+    "settings": "System Settings", "you tube": "YouTube",
+}
+
+
+def heard_as(spoken: str) -> str:
+    """The app name the user meant, when the transcript is a known mishearing; otherwise unchanged."""
+    key = re.sub(r"\s+", " ", (spoken or "").lower().strip().rstrip("."))
+    for prefix in ("the ", "my "):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+    for suffix in (" app", " application"):
+        if key.endswith(suffix) and key[: -len(suffix)] in HEARD_AS:
+            key = key[: -len(suffix)]
+    return HEARD_AS.get(key, spoken)
+
+
+def _sys_helper(name: str) -> bool:
+    low = name.lower()
+    return any(k in low for k in ("crashpad_handler", "crash_handler", "crashreporter"))
+
+
+def running_app_names() -> list[str]:
+    """Names of the macOS apps running now (from their bundle paths; no permissions needed)."""
+    names: list[str] = []
+    if not _PSUTIL:
+        return names
+    import psutil
+    for p in psutil.process_iter(["exe"]):
+        exe = (p.info.get("exe") or "")
+        if ".app/Contents/MacOS/" in exe:
+            name = exe.split(".app/Contents/MacOS/")[0].rsplit("/", 1)[-1]
+            if "Helper" not in name and name not in names:
+                names.append(name)
+    return names
+
+
+def closest_running(spoken: str) -> list[str]:
+    """Running apps whose name sounds like what was heard ("Ola" → "Ulaa"), best first."""
+    import difflib
+    def fold(s):
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+    want = fold(spoken)
+    if not want:
+        return []
+    names = running_app_names()
+    folded = {fold(n): n for n in names}
+    hits = difflib.get_close_matches(want, list(folded), n=3, cutoff=0.5)
+    return [folded[h] for h in hits]
+
+
 def spelling_variants(spoken: str) -> list[str]:
     """Every folded spelling this request could reasonably be running under.
 
@@ -523,6 +580,10 @@ def running(spoken: str, include_self: bool = False) -> list[Match]:
             pid = proc.info.get("pid")
             name = proc.info.get("name") or ""
             if not pid or not name:
+                continue
+            # Crash reporters and helpers are not the app: every Chromium-based app (Ulaa, Claude,
+            # TradingView) runs a "chrome_crashpad_handler", which made "chrome" look like it was running.
+            if _sys_helper(name):
                 continue
             titles = titles_by_pid.get(pid, [])
             best = max((_score(q, name, titles) for q in queries), default=0)

@@ -15,8 +15,12 @@ class RecoveryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.patch = patch.object(journal, 'DB_PATH', Path(self.tmp.name) / 'journal.db')
         self.patch.start()
+        from core import self_learning      # recorded turns also feed self-learning; keep them out of the real database
+        self.sl_patch = patch.object(self_learning, 'DB_PATH', Path(self.tmp.name) / 'self-learning.db')
+        self.sl_patch.start()
 
     def tearDown(self):
+        self.sl_patch.stop()
         self.patch.stop()
         self.tmp.cleanup()
 

@@ -18,7 +18,7 @@ from datetime import datetime
 import requests
 
 PHONE_FRESH_SECONDS = 15 * 60
-CACHE_SECONDS = 120
+CACHE_SECONDS = 600         # a Mac rarely moves far in ten minutes; ask with refresh for a new fix
 _phone_fix: dict | None = None
 _cache: dict | None = None
 _lock = threading.Lock()
@@ -39,7 +39,7 @@ def set_phone_fix(lat: float, lon: float, accuracy: float | None = None, live: b
 
 # ── macOS Location Services ─────────────────────────────────────────────────
 
-def _corelocation(timeout: float = 12.0) -> dict:
+def _corelocation(timeout: float = 8.0) -> dict:
     """One fix from CoreLocation on a private run loop. Returns a fix, or {'error', 'permission'}."""
     import objc
     from CoreLocation import CLLocationManager, CLGeocoder, kCLLocationAccuracyBest
@@ -78,8 +78,10 @@ def _corelocation(timeout: float = 12.0) -> dict:
                 loc = box.pop('fix')
                 if best is None or loc.horizontalAccuracy() < best.horizontalAccuracy():
                     best = loc
-                if best.horizontalAccuracy() <= 65:   # good enough: stop early
+                if best.horizontalAccuracy() <= 100:  # good enough: stop early
                     break
+                # Wi-Fi rarely gets much better than its first answer; give it a moment, not the whole timeout.
+                deadline = min(deadline, time.monotonic() + 1.5)
             if int(mgr.authorizationStatus()) in (1, 2):
                 return {'error': 'Location access was declined for Mark LVI.', 'permission': 'denied'}
             if best is None and box.get('error') and int(mgr.authorizationStatus()) in (3, 4) and time.monotonic() > deadline - 4:
@@ -108,7 +110,7 @@ def _corelocation(timeout: float = 12.0) -> dict:
         def handler(placemarks, error):
             done['p'] = placemarks[0] if placemarks else None
         geo.reverseGeocodeLocation_completionHandler_(best, handler)
-        end = time.monotonic() + 6
+        end = time.monotonic() + 3
         while 'p' not in done and time.monotonic() < end:
             loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.2))
         p = done.get('p')

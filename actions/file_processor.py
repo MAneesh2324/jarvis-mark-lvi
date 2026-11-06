@@ -781,6 +781,45 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
 
     return f"Unknown PPTX action: '{action}'. Try: summarize, extract_text, analyze"
 
+
+def _to_pdf(path: Path, file_type: str, output_path=None) -> Path:
+    """HTML, Markdown, text, code or Word → a PDF next to it (or at output_path). Uses Qt, which is always here."""
+    import html as _html
+    from PyQt6.QtGui import QPageSize, QPdfWriter, QTextDocument
+    from PyQt6.QtCore import QMarginsF
+    from PyQt6.QtGui import QPageLayout
+    ext = path.suffix.lower().lstrip(".")
+    if ext in ("html", "htm"):
+        markup = path.read_text(encoding="utf-8", errors="replace")
+    elif file_type == "docx":
+        markup = subprocess.run(["textutil", "-convert", "html", "-stdout", str(path)],
+                                capture_output=True, text=True, timeout=60, check=True).stdout
+    elif ext == "md":
+        try:
+            import markdown
+            markup = markdown.markdown(path.read_text(encoding="utf-8", errors="replace"), extensions=["tables"])
+        except ImportError:
+            markup = "<pre>" + _html.escape(path.read_text(encoding="utf-8", errors="replace")) + "</pre>"
+    else:
+        markup = ("<pre style=\"font-family: Menlo, monospace; font-size: 9pt; white-space: pre-wrap;\">"
+                  + _html.escape(path.read_text(encoding="utf-8", errors="replace")) + "</pre>")
+    out = Path(os.path.expanduser(str(output_path))) if output_path else path.with_suffix(".pdf")
+    if out.suffix.lower() != ".pdf":
+        out = out.with_suffix(".pdf")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    writer = QPdfWriter(str(out))
+    writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+    writer.setPageMargins(QMarginsF(15, 15, 15, 15), QPageLayout.Unit.Millimeter)
+    writer.setTitle(path.stem)
+    doc = QTextDocument()
+    doc.setHtml(markup)
+    doc.print(writer)
+    del writer                          # finishes and closes the file
+    if not out.exists() or out.stat().st_size == 0:
+        raise RuntimeError("the PDF came out empty")
+    return out
+
+
 from core import outcome
 
 
@@ -789,9 +828,11 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     if not file_path_str:
         return "No file path provided."
 
-    path = Path(file_path_str)
+    file_path_str = file_path_str.strip('"').strip("'")
+    from core import paths
+    path = paths.resolve(file_path_str)   # "~/…", "Desktop/x", or just a file name the user has somewhere
     if not path.exists():
-        return f"File not found: {file_path_str}"
+        return f"File not found: {path}"
     if not path.is_file():
         return f"Path is not a file: {file_path_str}"
 
@@ -830,6 +871,14 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
         "archive": _process_archive,
         "pptx":    _process_pptx,
     }
+
+    if action == "convert" and str(params.get("format") or "").lower().lstrip(".") == "pdf" \
+            and file_type in ("code", "text", "docx"):
+        try:
+            out = _to_pdf(path, file_type, params.get("output_path"))
+        except Exception as e:
+            return outcome.failed("file_processor", f"could not make the PDF: {e}", file=path.name)
+        return outcome.done("file_processor", converted=path.name, pdf=str(out), verified=out.exists())
 
     handler = dispatch.get(file_type)
     if not handler:

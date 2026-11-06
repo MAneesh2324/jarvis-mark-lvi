@@ -1,0 +1,3 @@
+{"name":"jarvis-sim3d","private":true,"version":"1.0.0","description":"3D scenes for the JARVIS simulation board (bundled to vendor/sim3d.bundle.js)",
+ "scripts":{"build":"esbuild src/main.js --bundle --minify --format=iife --global-name=Sim3DBundle --target=es2020 --outfile=vendor/sim3d.bundle.js"},
+ "dependencies":{"three":"0.170.0"},"devDependencies":{"esbuild":"0.24.0"}}
